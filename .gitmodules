@@ -1,0 +1,6 @@
+[submodule "dependencies/godot-network-audio"]
+	path = dependencies/godot-network-audio
+	url = https://github.com/hiinaspace/godot-network-audio.git
+[submodule "dependencies/godot-libmpv-zero"]
+	path = dependencies/godot-libmpv-zero
+	url = https://github.com/hiinaspace/godot-libmpv-zero.git

@@ -1,0 +1,11 @@
+.local/
+target/
+dist/
+project/.godot/
+project/addons/
+project/bin/
+project/private_lobby.json
+*.log
+*.pyc
+result
+result-*
