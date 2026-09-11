@@ -16,6 +16,13 @@ connecting. Allow the application through the firewall when prompted.
   controller's trigger activates its laser pointer. Select smooth turning and
   its speed in the menu, or leave snap turning enabled.
 
+The playback bar supports clicking or dragging to an absolute position, with a
+short debounce. Remote voices are HRTF-rendered at their avatar heads. Turning
+pivots around the headset's ground position, including room-scale offsets, and
+tracked controllers have box placeholders when the runtime supplies no visible
+models. Movie speakers retain full volume through 3 m and fall by 6 dB for each
+additional 3 m; the volume slider remains an independent overall adjustment.
+
 First test a familiar URL or local file alone, including pause, seek, subtitles,
 movie volume and closing/reopening the menu. Then have one person press Connect
 and wait for the lobby to publish (initial discovery can take tens of seconds).

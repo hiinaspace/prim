@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Create friend-test archives, accepting reproducible-build epoch timestamps."""
-import hashlib, subprocess, zipfile
+import argparse, hashlib, subprocess, zipfile
 from pathlib import Path
-root=Path(__file__).resolve().parents[1]/'dist'
+parser=argparse.ArgumentParser()
+parser.add_argument('--output-directory',type=Path,default=Path(__file__).resolve().parents[1]/'dist')
+root=parser.parse_args().output_directory.resolve()
 with zipfile.ZipFile(root/'prim-windows.zip','w',zipfile.ZIP_DEFLATED,compresslevel=3,strict_timestamps=False) as archive:
     for path in sorted((root/'prim-windows').rglob('*')):
         if path.is_file(): archive.write(path,path.relative_to(root))

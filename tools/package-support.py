@@ -4,9 +4,10 @@ import argparse, io, json, shutil, subprocess, tarfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser()
+p.add_argument('--output-directory',type=Path,default=root/'dist')
 p.add_argument('--windows-build',type=Path,default=root/'.local/windows')
-a=p.parse_args(); build=a.windows_build
-source=root/'dist/prim-source';source.mkdir(parents=True,exist_ok=True)
+a=p.parse_args(); build=a.windows_build; output=a.output_directory
+source=output/'prim-source';source.mkdir(parents=True,exist_ok=True)
 def copy(source, destination):
     destination=Path(destination)
     if destination.exists(): destination.chmod(destination.stat().st_mode | 0o200)
@@ -34,7 +35,7 @@ for name in ['mpv','libplacebo']:
  'Build recipes, pinned dependency versions and source URLs are included in prim/docs/BUILDING.md and the dependency Nix files.\n'
  'No lobby secret or machine configuration is included.\n')
 for platform in ['linux','windows']:
-    package=root/'dist'/('prim-'+platform)
+    package=output/('prim-'+platform)
     copy(root/'docs/TESTING.md',package/'README.md')
     (package/'build-revisions.json').write_text(json.dumps(revisions,indent=2)+'\n')
     notices=package/'notices';notices.mkdir(exist_ok=True)
@@ -51,6 +52,6 @@ for platform in ['linux','windows']:
     (package/'SOURCES.txt').write_text('Project source reference archive: prim-source.tar.gz, supplied beside these private builds.\n'
         'Godot/libmpv/libplacebo/Steam Audio patches and source pins are included there.\n'
         'Third-party package versions and notices are under notices/.\n')
-with tarfile.open(root/'dist/prim-source.tar.gz','w:gz',compresslevel=3) as archive:
+with tarfile.open(output/'prim-source.tar.gz','w:gz',compresslevel=3) as archive:
     archive.add(source,arcname='prim-source')
 print('Attached build revisions, notices and tracked source reference archive.')
