@@ -39,6 +39,7 @@ mismatched local files are not solved by synchronization.
 - Linux/Windows-under-Wine pair: video synchronization, bilateral voice, pose,
   pause/seek/resume, mute/unmute and process-scoped main-thread stall recovery.
 - Packaged Linux and Windows-under-Wine video rendering, speed/pause observations and clean exit.
+- Real YouTube URL playback through bundled yt-dlp/Deno on Linux and Windows under Wine.
 - Desktop menu ray selection, text entry, smooth-turn setting and head-pivot turning.
 
 Still manual: native Windows startup/devices, both PCVR runtimes, headset laser

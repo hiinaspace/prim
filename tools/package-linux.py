@@ -47,6 +47,9 @@ while queue:
             dependencies[dependency.name]=dependency;queue.append(dependency)
 for name,source in dependencies.items():copy(source,lib/name)
 for source,destination in seeds.items():copy(source,destination)
+# Original build outputs retain debug information for crash investigation.
+for path in (out/'bin/linux').glob('*.so'):
+    subprocess.run(['strip','--strip-debug',str(path)],check=True)
 for path in out.rglob('*'):
     if not path.is_file() or path.name.startswith('ld-linux'):continue
     with path.open('rb') as f:magic=f.read(4)

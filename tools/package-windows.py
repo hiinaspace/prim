@@ -8,6 +8,7 @@ p.add_argument('--build-directory', type=Path, default=root/'.local/windows')
 p.add_argument('--godot', required=True, help='Host editor used for PCK export')
 p.add_argument('--out', type=Path, default=root/'dist/prim-windows')
 p.add_argument('--objdump', default='x86_64-w64-mingw32-objdump')
+p.add_argument('--strip', default='x86_64-w64-mingw32-strip')
 p.add_argument('--runtime-directory', type=Path, action='append', default=[])
 a = p.parse_args(); build=a.build_directory.resolve(); out=a.out.resolve(); out.mkdir(parents=True,exist_ok=True)
 seeds = {
@@ -33,6 +34,9 @@ while queue:
         dependency=index.get(name.lower())
         if dependency: queue.append(dependency)
         else: external.add(name.lower())
+# Keep full debug information in build outputs; ship the smaller runtime DLLs.
+for name in seeds.values():
+    subprocess.run([a.strip,'--strip-debug',str(out/name)],check=True)
 (out/'bin/windows').mkdir(parents=True,exist_ok=True)
 shutil.copy2(out/'libmpv-2.dll',out/'bin/windows/libmpv-2.dll')
 for source,name in [('yt-dlp.exe','yt-dlp.exe'),('windows/deno.exe','deno.exe'),('VC_redist.x64.exe','VC_redist.x64.exe')]:
