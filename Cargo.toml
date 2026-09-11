@@ -1,0 +1,26 @@
+[package]
+name = "prim_native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+path = "native/src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+bytes = "1"
+godot = { version = "0.5.5", features = ["api-4-7", "experimental-threads"] }
+godot_network_audio = { path = "dependencies/godot-network-audio/gdext", default-features = false }
+iroh = "1.1.0"
+iroh-base = "1.1.0"
+pkarr = { version = "5", default-features = false, features = ["dht"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tinyvec = { version = "1.13", features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+
+[patch.crates-io]
+neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "69c6ccb08afe56d0d1b1cd9e5a7de011679fa152" }
