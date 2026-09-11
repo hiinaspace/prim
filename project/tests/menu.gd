@@ -37,6 +37,7 @@ func run() -> void:
 	var previous: bool = app.smooth_turn
 	await click(app.menu.smooth)
 	check(app.smooth_turn != previous, "world ray toggles smooth turn")
+	app.save_setting("comfort", "smooth_turn", previous)
 	app.toggle_menu()
 	check(not app.menu.visible and not app.menu.text_focused(), "closing menu releases text focus")
 	app.toggle_menu()
@@ -45,6 +46,43 @@ func run() -> void:
 	app.rotate_about_head(0.5)
 	check(camera_position.distance_to(app.camera.global_position) < 0.001, "turn pivots around head")
 	app.rotate_about_head(-0.5)
+	app.camera.position = Vector3(2.0, 1.6, 1.0)
+	camera_position = app.camera.global_position
+	for i in range(12):
+		app.rotate_about_head(0.5)
+		app.move_body(Vector3.ZERO)
+	check(camera_position.distance_to(app.camera.global_position) < 0.001, "room-scale turns preserve offset head through bounds handling")
+	app.move_body(Vector3(0.1, 0, 0))
+	check((camera_position + Vector3(0.1, 0, 0)).distance_to(app.camera.global_position) < 0.001, "movement translates the offset body")
+	app.move_body(Vector3(100, 0, 100))
+	check(absf(app.to_local(app.camera.global_position).x - 4.3) < 0.001 and absf(app.to_local(app.camera.global_position).z - 4.3) < 0.001, "movement bounds constrain body rather than playspace origin")
+	check(app.movie_attenuation_db(0) == 0 and app.movie_attenuation_db(3) == 0, "movie speakers retain full near-field volume")
+	check(app.movie_attenuation_db(6) == -6 and app.movie_attenuation_db(9) == -12, "movie speakers decay exponentially beyond three meters")
+	app.rig.transform = Transform3D(Basis(), Vector3(0, 0, 3))
+	app.camera.position = Vector3(0, 1.6, 0)
+	app.playback.set_process(false)
+	app.menu.update_playback(30, 120, true)
+	var requested: Array[float] = []
+	app.menu.seek_requested.connect(func(value): requested.append(value))
+	app.menu.timeline.value = 50
+	app.menu.timeline.value = 60
+	await create_timer(0.3).timeout
+	check(requested.size() == 1 and requested[0] == 60, "scrubbing debounces to one absolute seek")
+	app.menu.update_playback(0, 0, false)
+	await create_timer(0.3).timeout
+	check(requested.size() == 1 and not app.menu.timeline.editable, "unavailable duration resets without seeking")
+	var visual := preload("res://xr/controller_visual.gd").new()
+	var fake := Node3D.new()
+	var mesh := MeshInstance3D.new()
+	mesh.mesh = BoxMesh.new()
+	fake.add_child(mesh)
+	root.add_child(fake)
+	visual.models.append(fake)
+	check(visual.has_visible_model(), "controller fallback recognizes a supplied mesh")
+	mesh.visible = false
+	check(not visual.has_visible_model(), "controller fallback survives absent or hidden provider geometry")
+	fake.free()
+	visual.free()
 	await create_timer(0.5).timeout
 	var output := OS.get_environment("PRIM_TEST_OUTPUT")
 	if not output.is_empty(): root.get_texture().get_image().save_png(output + ".png")

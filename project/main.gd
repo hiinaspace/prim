@@ -26,6 +26,8 @@ var pose_elapsed := 0.0
 var sequence := 0
 var laser: MeshInstance3D
 var pointer: MeshInstance3D
+var controller_visuals: Array[Node3D] = []
+var video_volume_db := 0.0
 var status_text := "Singleplayer"
 
 func _ready() -> void:
@@ -41,7 +43,12 @@ func _ready() -> void:
 	if xr:
 		camera = $XROrigin3D/XRCamera3D
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
-		rig.add_child(OpenXRRenderModelManager.new())
+		for controller in [left, right]:
+			var visuals := preload("res://xr/controller_visual.gd").new()
+			visuals.controller = controller
+			visuals.hand = OpenXRRenderModelManager.RENDER_MODEL_TRACKER_LEFT_HAND if controller == left else OpenXRRenderModelManager.RENDER_MODEL_TRACKER_RIGHT_HAND
+			rig.add_child(visuals)
+			controller_visuals.append(visuals)
 	else:
 		camera = Camera3D.new()
 		rig.add_child(camera)
@@ -93,8 +100,8 @@ func _ready() -> void:
 		turn_speed = value
 		save_setting("comfort", "turn_speed", value))
 	menu.volume_changed.connect(func(value):
-		$EmissiveScreen/LeftSpeaker.volume_db = value
-		$EmissiveScreen/RightSpeaker.volume_db = value)
+		video_volume_db = value
+		update_video_volume())
 	session.status_changed.connect(func(message): status_text = message)
 	session.network_error.connect(func(message): status_text = message)
 	session.host_changed.connect(func(_peer): playback.host_changed())
@@ -211,7 +218,7 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventKey and event.pressed and event.physical_keycode == KEY_ESCAPE:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED else Input.MOUSE_MODE_CAPTURED
 	elif not xr and event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		rig.rotate_y(-event.relative.x * 0.002)
+		rotate_about_head(-event.relative.x * 0.002)
 		camera.rotation.x = clampf(camera.rotation.x - event.relative.y * 0.002, -1.45, 1.45)
 
 func toggle_menu() -> void:
@@ -243,9 +250,8 @@ func _process(delta: float) -> void:
 	forward.y = 0
 	var lateral := camera.global_basis.x
 	lateral.y = 0
-	rig.global_position += (forward.normalized() * movement.y + lateral.normalized() * movement.x) * 2.0 * delta
-	rig.position.x = clampf(rig.position.x, -4.3, 4.3)
-	rig.position.z = clampf(rig.position.z, -1.0, 4.3)
+	move_body((forward.normalized() * movement.y + lateral.normalized() * movement.x) * 2.0 * delta)
+	update_video_volume()
 	var origin := right.global_position if xr else camera.global_position
 	var direction := -right.global_basis.z if xr else -camera.global_basis.z
 	var pressed := right.get_float("trigger") > 0.6 if xr else Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
@@ -272,8 +278,26 @@ func _process(delta: float) -> void:
 	if sender.has_method("get_input_peak_db"): menu.meter.value = sender.get_input_peak_db()
 
 func rotate_about_head(angle: float) -> void:
-	var before := camera.global_position
-	rig.rotate_y(angle)
-	var correction := before - camera.global_position
+	var pivot := camera.global_position
+	var turn := Basis(Vector3.UP, angle)
+	rig.global_transform = Transform3D(turn, pivot - turn * pivot) * rig.global_transform
+
+func move_body(displacement: Vector3) -> void:
+	if displacement.is_zero_approx(): return
+	# Bounds apply to the body under the HMD, never to the tracking origin.
+	# Clamping the origin after a turn undoes its room-scale pivot correction.
+	var target := to_local(camera.global_position + displacement)
+	target.x = clampf(target.x, -4.3, 4.3)
+	target.z = clampf(target.z, -1.0, 4.3)
+	var correction := to_global(target) - camera.global_position
 	correction.y = 0
 	rig.global_position += correction
+
+func update_video_volume() -> void:
+	for speaker in [$EmissiveScreen/LeftSpeaker, $EmissiveScreen/RightSpeaker]:
+		var distance: float = camera.global_position.distance_to(speaker.global_position)
+		speaker.volume_db = video_volume_db + movie_attenuation_db(distance)
+
+static func movie_attenuation_db(distance: float) -> float:
+	# Linear dB beyond the near field is exponential amplitude falloff.
+	return -6.0 * maxf(0.0, distance - 3.0) / 3.0

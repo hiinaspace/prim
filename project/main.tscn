@@ -139,13 +139,13 @@ mesh = SubResource("QuadMesh_k1670")
 surface_material_override/0 = SubResource("StandardMaterial3D_daip5")
 
 [node name="LeftSpeaker" type="SteamAudioPlayer" parent="EmissiveScreen" unique_id=356905389]
-distance_attenuation = true
+distance_attenuation = false
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -2, 0, 0)
 attenuation_model = 3
 panning_strength = 0.0
 
 [node name="RightSpeaker" type="SteamAudioPlayer" parent="EmissiveScreen" unique_id=998347492]
-distance_attenuation = true
+distance_attenuation = false
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0, 0)
 attenuation_model = 3
 panning_strength = 0.0
