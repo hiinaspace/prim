@@ -57,10 +57,14 @@ func run() -> void:
 	await create_timer(1.5).timeout
 	await ask("paused")
 	check(replies.get("paused", {}).get("paused", false), "pause reaches client")
-	app.playback.request_action("seek", 12.0)
+	app.playback.request_action("seek_to", 15.0)
 	await create_timer(2.0).timeout
 	await ask("seek")
 	check(absf(float(replies.get("seek", {}).get("position", -100)) - float(app.player.get_playback_position())) < 0.2, "paused seek within 200 ms")
+	app.session.send_control(peer, JSON.stringify({"type":"test_scrub", "position":8.0}))
+	await create_timer(1.5).timeout
+	await ask("client_scrub")
+	check(absf(app.player.get_playback_position() - 8.0) < 0.2 and absf(float(replies.get("client_scrub", {}).get("position", -100)) - 8.0) < 0.2, "client absolute scrub is ordered by host")
 	app.playback.request_action("toggle")
 	await create_timer(2.0).timeout
 	var before: int = app.sender.get_captured_input_frames()
@@ -79,6 +83,7 @@ func run() -> void:
 	for remote in app.avatars:
 		check(app.avatars[remote].last_sequence > 10, "remote poses applied")
 		check(app.session.receive_stream(remote).get_stats().get("non_silent_output_frames", 0) > 10000, "each remote voice mixed")
+	await verify_spatial_voice()
 	app.set_muted(true)
 	var stopped: int = app.sender.get_captured_input_frames()
 	await create_timer(0.5).timeout
@@ -120,6 +125,8 @@ func receive(id: String, raw: String) -> void:
 		replies[message.phase + "/" + id] = message
 		if message.phase in ["playing", "resumed"]:
 			check(message.loaded and not message.paused and absf(float(message.drift)) < 0.4, "peer running playback converges")
+	elif message.get("type") == "test_scrub":
+		app.playback.request_action("seek_to", message.position)
 	elif message.get("type") == "test_finish":
 		app.set_muted(true)
 		finish()
@@ -132,3 +139,36 @@ func finish() -> void:
 	file.store_string(JSON.stringify(report, "  "))
 	print("INTEGRATION_RESULT ", JSON.stringify(report))
 	quit(0 if failures.is_empty() else 1)
+
+func voice_energy(capture: AudioEffectCapture) -> Vector2:
+	await create_timer(0.4).timeout
+	capture.clear_buffer()
+	await create_timer(0.3).timeout
+	var frames := capture.get_buffer(capture.get_frames_available())
+	var energy := Vector2.ZERO
+	for frame in frames:
+		energy += Vector2(frame.x * frame.x, frame.y * frame.y)
+	return energy / maxf(1, frames.size())
+
+func verify_spatial_voice() -> void:
+	var avatar = app.avatars[peer]
+	var stream = app.session.receive_stream(peer)
+	check(avatar.voice.get_inner_stream() == stream, "network voice retains Steam Audio processing wrapper")
+	check(avatar.voice.get_parent() == avatar.head, "voice emitter follows remote head")
+	var index := AudioServer.bus_count
+	AudioServer.add_bus()
+	AudioServer.set_bus_name(index, "SpatialVoiceTest")
+	var capture := AudioEffectCapture.new()
+	capture.buffer_length = 1.0
+	AudioServer.add_bus_effect(index, capture)
+	avatar.voice.bus = "SpatialVoiceTest"
+	avatar.set_process(false)
+	avatar.head.global_position = app.camera.global_position + Vector3(-2, 0, -1)
+	var left_energy: Vector2 = await voice_energy(capture)
+	avatar.head.global_position = app.camera.global_position + Vector3(2, 0, -1)
+	var right_energy: Vector2 = await voice_energy(capture)
+	print("SPATIAL_ENERGY ", left_energy, " / ", right_energy)
+	check(left_energy.x > left_energy.y * 1.05 and right_energy.y > right_energy.x * 1.05, "Steam Audio moves decoded voice between ears with head position")
+	avatar.voice.bus = "Master"
+	avatar.set_process(true)
+	AudioServer.remove_bus(index)

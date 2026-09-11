@@ -24,11 +24,14 @@ func setup(display_name: String, stream: AudioStream) -> void:
 	voice = ClassDB.instantiate("SteamAudioPlayer")
 	voice.name = "Voice"
 	voice.distance_attenuation = true
+	voice.min_attenuation_distance = 1.0
+	voice.ambisonics = true
+	voice.occlusion = false
 	voice.panning_strength = 0.0
 	voice.attenuation_model = AudioStreamPlayer3D.ATTENUATION_DISABLED
 	head.add_child(voice)
-	voice.stream = stream
-	voice.play()
+	# Preserve SteamAudioStream: assigning .stream here bypasses its HRTF wrapper.
+	voice.play_stream(stream)
 	visible = false
 
 func box(size: Vector3, color: Color) -> Node3D:
