@@ -85,7 +85,16 @@ try:
         if role!='host': env['PRIM_TEST_HOST']=endpoint.read_text()
         log=open(OUT/(role+'.log'),'w')
         logs.append(log)
-        process=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT)
+        launch = command
+        windows = base.get('PRIM_TEST_WINDOWS_EXE')
+        if role != 'host' and windows:
+            launch = ['wine', windows, '--rendering-driver', 'vulkan', '--xr-mode', 'off', '--disable-vsync', '--max-fps', '60', '--', '--desktop']
+            env['PRIM_TEST_OUTPUT'] = 'Z:' + str(OUT/role).replace('/', '\\')
+            env.pop('LIBMPV_ZERO_MPV_LIBRARY', None)
+            env.pop('LIBMPV_ZERO_VULKAN_LIBRARY', None)
+            env['WINEDLLOVERRIDES'] = 'winemenubuilder.exe,mscoree,mshtml=;vulkan-1=b'
+            env['WINEDEBUG'] = '-all'
+        process=subprocess.Popen(launch,env=env,stdout=log,stderr=subprocess.STDOUT)
         processes.append(process)
         if role=='host': wait_file(endpoint,process)
     for process in processes[1:]:

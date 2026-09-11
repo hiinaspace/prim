@@ -55,6 +55,9 @@ func _ready() -> void:
 	sender.capture_on_worker = true
 	add_child(sender)
 	sender.stop_capture()
+	sender.encoder_error.connect(func(message):
+		status_text = "Microphone: " + message
+		set_muted.call_deferred(true))
 	menu = Menu.new()
 	add_child(menu)
 	menu.display_name.text = display_name
@@ -265,7 +268,7 @@ func _process(delta: float) -> void:
 		var tracking := int(left.get_has_tracking_data()) | (int(right.get_has_tracking_data()) << 1) if xr else 0
 		session.send_pose(Pose.encode(sequence, poses, tracking))
 	menu.connection_button.text = "Disconnect" if session.is_active() else "Connect to friends"
-	menu.status.text = "%s • %d/6 people • %s" % ["Hosting" if session.is_host() else status_text, avatars.size() + 1, "mic muted" if muted else "MIC LIVE"]
+	menu.status.text = "%s • %d/6 people • %s" % [status_text, avatars.size() + 1, "mic muted" if muted else "MIC LIVE"]
 	if sender.has_method("get_input_peak_db"): menu.meter.value = sender.get_input_peak_db()
 
 func rotate_about_head(angle: float) -> void:

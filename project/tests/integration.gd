@@ -16,7 +16,7 @@ func check(condition: bool, message: String) -> void:
 	print("CHECK ", message, ": ", condition)
 	if not condition: failures.append(message)
 
-func wait_for(predicate: Callable, seconds: float = 15.0) -> bool:
+func wait_for(predicate: Callable, seconds: float = 40.0) -> bool:
 	var deadline := Time.get_ticks_msec() + int(seconds * 1000)
 	while not predicate.call() and Time.get_ticks_msec() < deadline:
 		await process_frame
@@ -27,6 +27,8 @@ func run() -> void:
 	root.add_child(app)
 	check(not app.sender.is_capturing(), "microphone starts muted")
 	app.session.message_received.connect(receive)
+	app.session.status_changed.connect(func(value): print("NETWORK ", value))
+	app.session.network_error.connect(func(value): print("NETWORK_ERROR ", value))
 	app.session.endpoint_ready.connect(func():
 		if role == "host":
 			var file := FileAccess.open(output + ".endpoint", FileAccess.WRITE)
@@ -36,7 +38,7 @@ func run() -> void:
 	if app.avatars.is_empty(): finish(); return
 	peer = app.avatars.keys()[0]
 	check(app.avatars.size() == expected_peers, "full mesh formed")
-	app.select_device(OS.get_environment("PULSE_SOURCE"))
+	app.select_device("Default" if OS.get_name() == "Windows" else OS.get_environment("PULSE_SOURCE"))
 	app.set_muted(false)
 	check(app.sender.is_capturing(), "virtual microphone starts")
 	if role != "host":
