@@ -81,6 +81,14 @@ func run() -> void:
 	var stopped: int = app.sender.get_captured_input_frames()
 	await create_timer(0.5).timeout
 	check(not app.sender.is_capturing() and app.sender.get_captured_input_frames() == stopped, "mute stops capture")
+	await ask("muted")
+	check(replies.get("muted", {}).get("voice_paused", false), "mute drains to intentional silence")
+	var old_frames: float = replies.get("muted", {}).get("voice_frames", 0)
+	app.set_muted(false)
+	await create_timer(1.2).timeout
+	await ask("unmuted")
+	check(replies.get("unmuted", {}).get("voice_frames", 0) - old_frames > 20000, "unmute resumes fresh voice immediately")
+	app.set_muted(true)
 	root.get_texture().get_image().save_png(output + ".png")
 	app.session.broadcast_control(JSON.stringify({"type":"test_finish"}))
 	await create_timer(0.5).timeout
@@ -104,7 +112,7 @@ func receive(id: String, raw: String) -> void:
 	if message.get("type") == "test_probe":
 		var stream = app.session.receive_stream(id)
 		var stats: Dictionary = stream.get_stats()
-		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0)}))
+		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false)}))
 	elif message.get("type") == "test_reply":
 		replies[message.phase] = message
 		replies[message.phase + "/" + id] = message

@@ -84,7 +84,9 @@ func set_source(value: String, kind: String) -> void:
 func load_local(path: String) -> void:
 	loaded = false
 	awaiting_seek = true
+	player.pause()
 	if path.is_empty():
+		player.stop()
 		status = "This room is watching %s. Open your local copy to synchronize." % source
 		return
 	status = "Loading…"
