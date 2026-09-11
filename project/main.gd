@@ -27,6 +27,8 @@ var sequence := 0
 var laser: MeshInstance3D
 var pointer: MeshInstance3D
 var controller_visuals: Array[Node3D] = []
+const WALK_MIN := Vector2(-8.6, -3.65)
+const WALK_MAX := Vector2(8.6, 6.95)
 var video_volume_db := 0.0
 var status_text := "Singleplayer"
 
@@ -287,8 +289,8 @@ func move_body(displacement: Vector3) -> void:
 	# Bounds apply to the body under the HMD, never to the tracking origin.
 	# Clamping the origin after a turn undoes its room-scale pivot correction.
 	var target := to_local(camera.global_position + displacement)
-	target.x = clampf(target.x, -4.3, 4.3)
-	target.z = clampf(target.z, -1.0, 4.3)
+	target.x = clampf(target.x, WALK_MIN.x, WALK_MAX.x)
+	target.z = clampf(target.z, WALK_MIN.y, WALK_MAX.y)
 	var correction := to_global(target) - camera.global_position
 	correction.y = 0
 	rig.global_position += correction

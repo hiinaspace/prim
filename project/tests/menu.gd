@@ -55,7 +55,7 @@ func run() -> void:
 	app.move_body(Vector3(0.1, 0, 0))
 	check((camera_position + Vector3(0.1, 0, 0)).distance_to(app.camera.global_position) < 0.001, "movement translates the offset body")
 	app.move_body(Vector3(100, 0, 100))
-	check(absf(app.to_local(app.camera.global_position).x - 4.3) < 0.001 and absf(app.to_local(app.camera.global_position).z - 4.3) < 0.001, "movement bounds constrain body rather than playspace origin")
+	check(absf(app.to_local(app.camera.global_position).x - 8.6) < 0.001 and absf(app.to_local(app.camera.global_position).z - 6.95) < 0.001, "movement bounds constrain body rather than playspace origin")
 	check(app.movie_attenuation_db(0) == 0 and app.movie_attenuation_db(3) == 0, "movie speakers retain full near-field volume")
 	check(app.movie_attenuation_db(6) == -6 and app.movie_attenuation_db(9) == -12, "movie speakers decay exponentially beyond three meters")
 	app.rig.transform = Transform3D(Basis(), Vector3(0, 0, 3))
