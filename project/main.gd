@@ -74,7 +74,7 @@ func _ready() -> void:
 	add_child(playback)
 	menu.source_requested.connect(playback.request_source)
 	menu.playback_toggled.connect(func(): playback.request_action("toggle"))
-	menu.seek_requested.connect(func(seconds): playback.request_action("seek", seconds))
+	menu.seek_requested.connect(func(seconds): playback.request_action("seek_to", seconds))
 	menu.connection_toggled.connect(toggle_connection)
 	menu.microphone_toggled.connect(toggle_microphone)
 	menu.device_selected.connect(select_device)

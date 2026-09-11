@@ -29,6 +29,12 @@ var gain: HSlider
 var smooth: CheckButton
 var speed: HSlider
 var volume: HSlider
+var timeline: HSlider
+var playback_time: Label
+var scrub_timer: Timer
+var scrubbing := false
+var seek_pending := false
+var updating_timeline := false
 var last_pressed := false
 var last_position := Vector2.ZERO
 var has_hit := false
@@ -75,6 +81,7 @@ func _ready() -> void:
 	status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	var row := horizontal(column)
 	connection_button = button(row, "Connect to friends", func(): connection_toggled.emit())
+	label(row, "Username")
 	display_name = LineEdit.new()
 	display_name.placeholder_text = "Your name"
 	display_name.max_length = 32
@@ -94,8 +101,25 @@ func _ready() -> void:
 	button(row, "Open", func(): source_requested.emit(url.text))
 	row = horizontal(column)
 	play_button = button(row, "Play", func(): playback_toggled.emit())
-	button(row, "−10 s", func(): seek_requested.emit(-10))
-	button(row, "+10 s", func(): seek_requested.emit(10))
+	timeline = slider(row, 0, 1, 0, 0.1)
+	timeline.custom_minimum_size.y = 46
+	timeline.editable = false
+	timeline.drag_started.connect(func(): scrubbing = true)
+	timeline.drag_ended.connect(func(_changed):
+		scrubbing = false
+		flush_seek())
+	timeline.value_changed.connect(func(_value):
+		if updating_timeline: return
+		seek_pending = true
+		scrub_timer.start()
+		update_time_label())
+	scrub_timer = Timer.new()
+	scrub_timer.one_shot = true
+	scrub_timer.wait_time = 0.2
+	scrub_timer.timeout.connect(flush_seek)
+	add_child(scrub_timer)
+	playback_time = label(row, "0:00 / 0:00")
+	row = horizontal(column)
 	label(row, "Video volume")
 	volume = slider(row, -40, 6, 0, 1)
 	volume.value_changed.connect(func(value): volume_changed.emit(value))
@@ -223,3 +247,31 @@ func point(origin: Vector3, direction: Vector3, pressed: bool) -> Vector3:
 		viewport.push_input(click, true)
 		last_pressed = active
 	return target
+
+func flush_seek() -> void:
+	if not seek_pending or not timeline.editable: return
+	seek_pending = false
+	scrub_timer.stop()
+	seek_requested.emit(timeline.value)
+
+func update_playback(position: float, duration: float, available: bool) -> void:
+	var valid := available and is_finite(duration) and duration > 0
+	timeline.editable = valid
+	if not valid:
+		scrubbing = false
+		seek_pending = false
+		scrub_timer.stop()
+	if not scrubbing and not seek_pending:
+		updating_timeline = true
+		timeline.max_value = maxf(1.0, duration) if valid else 1.0
+		timeline.set_value_no_signal(clampf(position, 0, duration) if valid else 0.0)
+		updating_timeline = false
+	update_time_label()
+
+func update_time_label() -> void:
+	playback_time.text = "%s / %s" % [format_time(timeline.value), format_time(timeline.max_value if timeline.editable else 0)]
+
+static func format_time(seconds: float) -> String:
+	var total := maxi(0, int(seconds))
+	if total >= 3600: return "%d:%02d:%02d" % [total / 3600, (total / 60) % 60, total % 60]
+	return "%d:%02d" % [total / 60, total % 60]

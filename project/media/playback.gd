@@ -111,8 +111,8 @@ func apply_action(action: String, value: float) -> void:
 	if action == "toggle":
 		desired_paused = not desired_paused
 		player.set_paused(desired_paused)
-	elif action == "seek" and is_finite(value):
-		var position := maxf(0.0, float(player.get_playback_position()) + clampf(value, -3600, 3600))
+	elif action in ["seek", "seek_to"] and is_finite(value):
+		var position := maxf(0.0, value if action == "seek_to" else float(player.get_playback_position()) + clampf(value, -3600, 3600))
 		if player.get_duration() > 0: position = minf(position, player.get_duration())
 		player.seek(position)
 	else: return
@@ -200,7 +200,7 @@ func message_received(peer: String, message: Dictionary) -> void:
 					local_path = ""
 					value = value.get_file()
 				set_source(value, message.kind)
-			elif message.get("action") in ["toggle", "seek"]:
+			elif message.get("action") in ["toggle", "seek", "seek_to"]:
 				var value: Variant = message.get("value", 0.0)
 				if value is float or value is int: apply_action(message.action, value)
 		"snapshot":
@@ -246,6 +246,7 @@ func _process(delta: float) -> void:
 	if correction_elapsed >= 0.25:
 		correction_elapsed = 0
 		correct()
+	menu.update_playback(player.get_playback_position(), player.get_duration(), loaded)
 	menu.play_button.disabled = source.is_empty()
 	menu.play_button.text = "Play" if source.is_empty() or player.is_paused() else "Pause"
 	menu.media_status.text = "%s  •  %.1f / %.1f s%s" % [status, player.get_playback_position(), player.get_duration(), "  • sync %+.0f ms" % (drift_seconds * 1000) if clock_ready else ""]
