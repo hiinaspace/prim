@@ -1,0 +1,276 @@
+extends Node3D
+
+const Menu = preload("res://ui/world_menu.gd")
+const Avatar = preload("res://net/avatar.gd")
+const Pose = preload("res://net/pose.gd")
+const Playback = preload("res://media/playback.gd")
+@onready var rig: XROrigin3D = $XROrigin3D
+@onready var left: XRController3D = $XROrigin3D/LeftController
+@onready var right: XRController3D = $XROrigin3D/RightController
+@onready var player = $MPVPlayer
+var camera: Camera3D
+var menu: PrimMenu
+var session
+var sender
+var playback
+var avatars := {}
+var settings := ConfigFile.new()
+var xr := false
+var muted := true
+var display_name := "Friend"
+var smooth_turn := false
+var turn_speed := 60.0
+var snap_ready := true
+var menu_ready := true
+var pose_elapsed := 0.0
+var sequence := 0
+var laser: MeshInstance3D
+var pointer: MeshInstance3D
+var status_text := "Singleplayer"
+
+func _ready() -> void:
+	settings.load("user://settings.cfg")
+	display_name = settings.get_value("user", "name", "Friend")
+	smooth_turn = settings.get_value("comfort", "smooth_turn", false)
+	turn_speed = settings.get_value("comfort", "turn_speed", 60.0)
+	rig.position = Vector3(0, 0, 3)
+	var interface := XRServer.find_interface("OpenXR")
+	if "--desktop" not in OS.get_cmdline_user_args() and "--flat" not in OS.get_cmdline_user_args() and interface:
+		xr = interface.is_initialized() or interface.initialize()
+	get_viewport().use_xr = xr
+	if xr:
+		camera = $XROrigin3D/XRCamera3D
+		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+		rig.add_child(OpenXRRenderModelManager.new())
+	else:
+		camera = Camera3D.new()
+		rig.add_child(camera)
+		camera.position.y = 1.6
+		$XROrigin3D/XRCamera3D/SteamAudioListener.reparent(camera)
+		camera.make_current()
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	session = ClassDB.instantiate("PrimSession")
+	add_child(session)
+	sender = ClassDB.instantiate("NetworkAudioSender")
+	sender.capture_on_worker = true
+	add_child(sender)
+	sender.stop_capture()
+	menu = Menu.new()
+	add_child(menu)
+	menu.display_name.text = display_name
+	menu.smooth.set_pressed_no_signal(smooth_turn)
+	menu.speed.set_value_no_signal(turn_speed)
+	menu.gain.set_value_no_signal(settings.get_value("audio", "gain", 0.0))
+	AudioServer.input_device = settings.get_value("audio", "device", "Default")
+	menu.refresh_devices()
+	menu.open_at(camera)
+	playback = Playback.new()
+	playback.player = player
+	playback.session = session
+	playback.menu = menu
+	add_child(playback)
+	menu.source_requested.connect(playback.request_source)
+	menu.playback_toggled.connect(func(): playback.request_action("toggle"))
+	menu.seek_requested.connect(func(seconds): playback.request_action("seek", seconds))
+	menu.connection_toggled.connect(toggle_connection)
+	menu.microphone_toggled.connect(toggle_microphone)
+	menu.device_selected.connect(select_device)
+	menu.gain_changed.connect(func(value):
+		if sender.has_method("set_input_gain_db"): sender.set_input_gain_db(value)
+		save_setting("audio", "gain", value))
+	menu.name_changed.connect(func(value):
+		display_name = value.strip_edges().left(32)
+		if display_name.is_empty(): display_name = "Friend"
+		save_setting("user", "name", display_name)
+		session.broadcast_control(JSON.stringify({"type":"name", "name":display_name})))
+	menu.smooth_turn_changed.connect(func(value):
+		smooth_turn = value
+		save_setting("comfort", "smooth_turn", value))
+	menu.turn_speed_changed.connect(func(value):
+		turn_speed = value
+		save_setting("comfort", "turn_speed", value))
+	menu.volume_changed.connect(func(value):
+		$EmissiveScreen/LeftSpeaker.volume_db = value
+		$EmissiveScreen/RightSpeaker.volume_db = value)
+	session.status_changed.connect(func(message): status_text = message)
+	session.network_error.connect(func(message): status_text = message)
+	session.host_changed.connect(func(_peer): playback.host_changed())
+	session.peer_connected.connect(peer_connected)
+	session.peer_disconnected.connect(peer_disconnected)
+	session.left_room.connect(left_room)
+	session.message_received.connect(message_received)
+	session.pose_received.connect(pose_received)
+	player.video_size_changed.connect(func(width, height):
+		if width > 0 and height > 0:
+			var size := Vector2(2.0 * width / height, 2.0)
+			$EmissiveScreen.mesh.size = size
+			$EmissiveScreen/AreaLight3D.area_size = size)
+	laser = MeshInstance3D.new()
+	laser.mesh = ImmediateMesh.new()
+	var material := StandardMaterial3D.new()
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.albedo_color = Color("86e3cc")
+	laser.material_override = material
+	add_child(laser)
+	pointer = MeshInstance3D.new()
+	var sphere := SphereMesh.new()
+	sphere.radius = 0.006
+	sphere.height = 0.012
+	pointer.mesh = sphere
+	pointer.material_override = material
+	add_child(pointer)
+	var source := OS.get_environment("PRIM_MEDIA")
+	if not source.is_empty(): playback.request_source(source)
+	if OS.get_environment("PRIM_AUTOJOIN") == "1": toggle_connection()
+
+func save_setting(section: String, key: String, value: Variant) -> void:
+	settings.set_value(section, key, value)
+	settings.save("user://settings.cfg")
+
+func toggle_connection() -> void:
+	if session.is_active():
+		set_muted(true)
+		session.leave_room()
+		return
+	var config: Variant = JSON.parse_string(FileAccess.get_file_as_string("res://private_lobby.json")) if FileAccess.file_exists("res://private_lobby.json") else null
+	if not config is Dictionary or not config.get("secret", "") is String:
+		status_text = "Private room configuration is missing from this build."
+		return
+	set_muted(true)
+	var test_host := OS.get_environment("PRIM_TEST_HOST")
+	if session.join_room(config.secret, display_name, test_host):
+		session.attach_sender(sender)
+		status_text = "Connecting…"
+
+func toggle_microphone() -> void:
+	if not session.is_active():
+		status_text = "Connect to friends before enabling the microphone."
+		return
+	set_muted(not muted)
+
+func set_muted(value: bool) -> void:
+	muted = value
+	if muted:
+		sender.stop_capture()
+	else:
+		if sender.has_method("set_input_gain_db"): sender.set_input_gain_db(menu.gain.value)
+		sender.start_capture()
+		muted = not sender.is_capturing()
+	menu.mic_button.text = "Unmute microphone" if muted else "Mute microphone"
+
+func select_device(device: String) -> void:
+	var was_muted := muted
+	set_muted(true)
+	AudioServer.input_device = device
+	save_setting("audio", "device", device)
+	if not was_muted: set_muted(false)
+
+func peer_connected(peer: String, peer_name: String) -> void:
+	if avatars.has(peer): return
+	var avatar := Avatar.new()
+	add_child(avatar)
+	avatar.setup(peer_name, session.receive_stream(peer))
+	avatars[peer] = avatar
+	playback.peer_joined(peer)
+
+func peer_disconnected(peer: String) -> void:
+	if avatars.has(peer):
+		avatars[peer].retire()
+		avatars.erase(peer)
+
+func left_room() -> void:
+	set_muted(true)
+	for peer in avatars.keys(): peer_disconnected(peer)
+	playback.left_room()
+	status_text = "Singleplayer — disconnected"
+
+func message_received(peer: String, json: String) -> void:
+	var message: Variant = JSON.parse_string(json)
+	if not message is Dictionary: return
+	if message.get("type") == "name" and message.get("name") is String and avatars.has(peer):
+		avatars[peer].nameplate.text = message.name.left(32)
+	else:
+		playback.message_received(peer, message)
+
+func pose_received(peer: String, bytes: PackedByteArray) -> void:
+	if not avatars.has(peer): return
+	var pose := Pose.decode(bytes)
+	if not pose.is_empty(): avatars[peer].apply_pose(pose.sequence, pose.poses, pose.tracked)
+
+func _input(event: InputEvent) -> void:
+	if menu == null: return
+	if event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_TAB:
+		toggle_menu()
+		get_viewport().set_input_as_handled()
+	elif menu.text_focused() and event is InputEventKey:
+		menu.forward_key(event)
+		get_viewport().set_input_as_handled()
+	elif event is InputEventKey and event.pressed and event.physical_keycode == KEY_ESCAPE:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED else Input.MOUSE_MODE_CAPTURED
+	elif not xr and event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not menu.text_focused():
+		rig.rotate_y(-event.relative.x * 0.002)
+		camera.rotation.x = clampf(camera.rotation.x - event.relative.y * 0.002, -1.45, 1.45)
+
+func toggle_menu() -> void:
+	if menu.visible:
+		menu.visible = false
+		var focus := menu.viewport.gui_get_focus_owner()
+		if focus: focus.release_focus()
+	else:
+		menu.open_at(camera)
+
+func _process(delta: float) -> void:
+	if camera == null: return
+	var movement := Vector2.ZERO
+	if xr:
+		movement = left.get_vector2("primary")
+		if movement.length() < 0.2: movement = Vector2.ZERO
+		var turn := right.get_vector2("primary").x
+		if absf(turn) < 0.25: snap_ready = true
+		elif smooth_turn: rotate_about_head(-turn * deg_to_rad(turn_speed) * delta)
+		elif snap_ready:
+			rotate_about_head(-signf(turn) * deg_to_rad(30))
+			snap_ready = false
+		var menu_down := left.is_button_pressed("by_button") or right.is_button_pressed("by_button")
+		if menu_down and menu_ready: toggle_menu()
+		menu_ready = not menu_down
+	elif not menu.text_focused():
+		movement = Vector2(float(Input.is_physical_key_pressed(KEY_D)) - float(Input.is_physical_key_pressed(KEY_A)), float(Input.is_physical_key_pressed(KEY_W)) - float(Input.is_physical_key_pressed(KEY_S))).limit_length()
+	var forward := -camera.global_basis.z
+	forward.y = 0
+	var lateral := camera.global_basis.x
+	lateral.y = 0
+	rig.global_position += (forward.normalized() * movement.y + lateral.normalized() * movement.x) * 2.0 * delta
+	rig.position.x = clampf(rig.position.x, -4.3, 4.3)
+	rig.position.z = clampf(rig.position.z, -1.0, 4.3)
+	var origin := right.global_position if xr else camera.global_position
+	var direction := -right.global_basis.z if xr else -camera.global_basis.z
+	var pressed := right.get_float("trigger") > 0.6 if xr else Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	var target := menu.point(origin, direction, pressed)
+	laser.visible = menu.visible and xr
+	pointer.visible = menu.visible
+	pointer.global_position = target
+	var mesh := laser.mesh as ImmediateMesh
+	mesh.clear_surfaces()
+	if laser.visible:
+		mesh.surface_begin(Mesh.PRIMITIVE_LINES)
+		mesh.surface_add_vertex(origin)
+		mesh.surface_add_vertex(target)
+		mesh.surface_end()
+	pose_elapsed += delta
+	if session.is_active() and pose_elapsed >= 0.05:
+		pose_elapsed = 0
+		sequence += 1
+		var poses: Array[Transform3D] = [camera.global_transform, left.global_transform, right.global_transform]
+		var tracking := int(left.get_has_tracking_data()) | (int(right.get_has_tracking_data()) << 1) if xr else 0
+		session.send_pose(Pose.encode(sequence, poses, tracking))
+	menu.connection_button.text = "Disconnect" if session.is_active() else "Connect to friends"
+	menu.status.text = "%s • %d/6 people • %s" % ["Hosting" if session.is_host() else status_text, avatars.size() + 1, "mic muted" if muted else "MIC LIVE"]
+	if sender.has_method("get_input_peak_db"): menu.meter.value = sender.get_input_peak_db()
+
+func rotate_about_head(angle: float) -> void:
+	var before := camera.global_position
+	rig.rotate_y(angle)
+	var correction := before - camera.global_position
+	correction.y = 0
+	rig.global_position += correction
