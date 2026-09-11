@@ -38,6 +38,7 @@ func _ready() -> void:
 	viewport.size = PIXELS
 	viewport.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
 	viewport.gui_disable_input = false
+	viewport.gui_embed_subwindows = true
 	add_child(viewport)
 	var quad := MeshInstance3D.new()
 	var mesh := QuadMesh.new()

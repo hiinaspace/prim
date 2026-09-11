@@ -111,7 +111,11 @@ pub struct Shared {
 }
 impl Shared {
     fn event(&self, event: Event) {
-        let _ = self.events.try_send(event);
+        // Overflow cannot silently lose membership or host transitions. Retire the
+        // session; the Godot owner will observe worker completion and reset.
+        if self.events.try_send(event).is_err() {
+            self.stop();
+        }
     }
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
@@ -418,8 +422,10 @@ fn connect(endpoint: Endpoint, address: Address, state: Arc<Shared>, secret: [u8
             establish(endpoint, connection, true, state.clone(), secret).await
         })
         .await;
-        if let Ok(Err(err)) = result {
-            state.event(Event::Error(format!("Connect: {err:#}")));
+        match result {
+            Ok(Ok(())) => (),
+            Ok(Err(err)) => state.event(Event::Error(format!("Connect: {err:#}"))),
+            Err(_) => state.event(Event::Error("Connection timed out".into())),
         }
     });
 }
@@ -548,9 +554,11 @@ async fn discover(endpoint: Endpoint, state: Arc<Shared>, secret: [u8; 32]) -> R
     state.set_host(endpoint.id().to_string());
     state.event(Event::Status("Hosting friends lobby".into()));
     while !state.stopped.load(Ordering::Acquire) && state.is_host() {
+        let mut address = Address::from_endpoint(&endpoint);
+        address.direct.truncate(4); // Keep the signed DNS packet comfortably bounded.
         let record = Record {
             version: 1,
-            address: Address::from_endpoint(&endpoint),
+            address,
             expires: now_secs() + 90,
         };
         let json = serde_json::to_string(&record)?;
@@ -558,7 +566,7 @@ async fn discover(endpoint: Endpoint, state: Arc<Shared>, secret: [u8; 32]) -> R
             .txt(".".try_into()?, json.as_str().try_into()?, 30)
             .sign(&key)?;
         match tokio::time::timeout(Duration::from_secs(15), client.publish(&packet, None)).await {
-            Ok(Ok(())) => (),
+            Ok(Ok(())) => state.event(Event::Status("Friends lobby published".into())),
             _ => state.event(Event::Status("Hosting; lobby publication retrying…".into())),
         }
         for _ in 0..200 {
@@ -678,5 +686,41 @@ mod tests {
         assert_eq!(json.as_object().unwrap().len(), 3);
         assert!(json.get("secret").is_none());
         assert!(json.get("lobby_code").is_none());
+    }
+    #[test]
+    #[ignore = "uses public Iroh relay and mainline DHT"]
+    fn public_dht_discovers_host_without_address_exchange() {
+        let nonce = format!("{:?}", std::time::SystemTime::now());
+        let secret = *blake3::hash(nonce.as_bytes()).as_bytes();
+        let host = Handle::start(secret, "Host".into(), None, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(100);
+        let mut published = false;
+        while Instant::now() < deadline {
+            if let Ok(Event::Status(status)) = host.events.recv_timeout(Duration::from_secs(1)) {
+                if status == "Friends lobby published" {
+                    published = true;
+                    break;
+                }
+            }
+        }
+        assert!(published, "public DHT publication did not complete");
+        let client = Handle::start(secret, "Client".into(), None, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(70);
+        while Instant::now() < deadline {
+            // Drain the host's state events just as the Godot owner does.
+            for _ in host.events.try_iter() {}
+            for _ in client.events.try_iter() {}
+            if host.shared.peers.read().unwrap().len() == 1
+                && client.shared.peers.read().unwrap().len() == 1
+            {
+                assert_eq!(
+                    *client.shared.host.read().unwrap(),
+                    *host.shared.local.read().unwrap()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("DHT client did not join published host");
     }
 }

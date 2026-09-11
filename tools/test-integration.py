@@ -78,10 +78,11 @@ try:
     command = [godot,'--path',str(ROOT/'project'),'--display-driver','x11','--xr-mode','off','--disable-vsync','--max-fps','60','--script','res://tests/integration.gd','--','--desktop']
     endpoint=OUT/'host.endpoint'
     endpoint.unlink(missing_ok=True)
-    for role in ('host','client'):
+    roles = ['host'] + ['client'+str(i) for i in range(int(os.environ.get('PRIM_TEST_PEERS','1')))]
+    for role in roles:
         (OUT/(role+'.json')).unlink(missing_ok=True)
         env=base | {'PRIM_TEST_ROLE':role,'PRIM_TEST_OUTPUT':str(OUT/role),'XDG_DATA_HOME':str(OUT/('profile-'+role))}
-        if role=='client': env['PRIM_TEST_HOST']=endpoint.read_text()
+        if role!='host': env['PRIM_TEST_HOST']=endpoint.read_text()
         log=open(OUT/(role+'.log'),'w')
         logs.append(log)
         process=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT)
@@ -89,7 +90,7 @@ try:
         if role=='host': wait_file(endpoint,process)
     for process in processes[1:]:
         process.wait(timeout=65)
-    reports=[json.loads((OUT/(role+'.json')).read_text()) for role in ('host','client')]
+    reports=[json.loads((OUT/(role+'.json')).read_text()) for role in roles]
     print(json.dumps(reports,indent=2))
     if any(report['failures'] for report in reports): raise SystemExit(1)
 finally:

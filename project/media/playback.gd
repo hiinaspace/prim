@@ -244,5 +244,6 @@ func _process(delta: float) -> void:
 	if correction_elapsed >= 0.25:
 		correction_elapsed = 0
 		correct()
-	menu.play_button.text = "Play" if player.is_paused() else "Pause"
+	menu.play_button.disabled = source.is_empty()
+	menu.play_button.text = "Play" if source.is_empty() or player.is_paused() else "Pause"
 	menu.media_status.text = "%s  •  %.1f / %.1f s%s" % [status, player.get_playback_position(), player.get_duration(), "  • sync %+.0f ms" % (drift_seconds * 1000) if clock_ready else ""]

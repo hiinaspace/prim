@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+# Rust supplies explicit exports. Disable MinGW's fallback auto-export, which
+# otherwise exceeds PE's ordinal limit for Iroh's intermediate cdylib.
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

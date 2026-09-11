@@ -7,6 +7,7 @@ var failures: Array[String] = []
 var replies := {}
 var output := OS.get_environment("PRIM_TEST_OUTPUT")
 var done := false
+var expected_peers := maxi(1, int(OS.get_environment("PRIM_TEST_PEERS")))
 
 func _initialize() -> void:
 	call_deferred("run")
@@ -31,13 +32,14 @@ func run() -> void:
 			var file := FileAccess.open(output + ".endpoint", FileAccess.WRITE)
 			file.store_string(app.session.get_endpoint_info()))
 	app.toggle_connection()
-	check(await wait_for(func(): return not app.avatars.is_empty()), "peer connected")
+	check(await wait_for(func(): return app.avatars.size() == expected_peers), "peer connected")
 	if app.avatars.is_empty(): finish(); return
 	peer = app.avatars.keys()[0]
+	check(app.avatars.size() == expected_peers, "full mesh formed")
 	app.select_device(OS.get_environment("PULSE_SOURCE"))
 	app.set_muted(false)
 	check(app.sender.is_capturing(), "virtual microphone starts")
-	if role == "client":
+	if role != "host":
 		await create_timer(50.0).timeout
 		if not done:
 			check(false, "host completed test")
@@ -72,13 +74,15 @@ func run() -> void:
 	var stats: Dictionary = stream.get_stats()
 	check(stats.get("non_silent_output_frames", 0) > 10000, "received voice decoded and mixed")
 	check(replies.get("resumed", {}).get("voice_frames", 0) > 10000, "remote voice decoded and mixed")
-	check(app.avatars[peer].last_sequence > 10, "remote poses applied")
+	for remote in app.avatars:
+		check(app.avatars[remote].last_sequence > 10, "remote poses applied")
+		check(app.session.receive_stream(remote).get_stats().get("non_silent_output_frames", 0) > 10000, "each remote voice mixed")
 	app.set_muted(true)
 	var stopped: int = app.sender.get_captured_input_frames()
 	await create_timer(0.5).timeout
 	check(not app.sender.is_capturing() and app.sender.get_captured_input_frames() == stopped, "mute stops capture")
 	root.get_texture().get_image().save_png(output + ".png")
-	app.session.send_control(peer, JSON.stringify({"type":"test_finish"}))
+	app.session.broadcast_control(JSON.stringify({"type":"test_finish"}))
 	await create_timer(0.5).timeout
 	app.toggle_connection()
 	check(await wait_for(func(): return not app.session.is_active(), 5), "leave completes")
@@ -86,8 +90,13 @@ func run() -> void:
 	finish()
 
 func ask(phase: String) -> void:
-	app.session.send_control(peer, JSON.stringify({"type":"test_probe", "phase":phase}))
-	check(await wait_for(func(): return replies.has(phase), 5), "reply " + phase)
+	app.session.broadcast_control(JSON.stringify({"type":"test_probe", "phase":phase}))
+	check(await wait_for(func(): return phase_complete(phase), 5), "reply " + phase)
+
+func phase_complete(phase: String) -> bool:
+	for remote in app.avatars:
+		if not replies.has(phase + "/" + remote): return false
+	return true
 
 func receive(id: String, raw: String) -> void:
 	var message: Variant = JSON.parse_string(raw)
@@ -98,6 +107,9 @@ func receive(id: String, raw: String) -> void:
 		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0)}))
 	elif message.get("type") == "test_reply":
 		replies[message.phase] = message
+		replies[message.phase + "/" + id] = message
+		if message.phase in ["playing", "resumed"]:
+			check(message.loaded and not message.paused and absf(float(message.drift)) < 0.4, "peer running playback converges")
 	elif message.get("type") == "test_finish":
 		app.set_muted(true)
 		finish()

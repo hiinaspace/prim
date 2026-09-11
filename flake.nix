@@ -15,7 +15,7 @@
   in {
     devShells.x86_64-linux.default = pkgs.mkShell {
       packages = with pkgs; [ cargo rustWithTools rustfmt clippy pkg-config cmake ninja
-        python3 scons clang lld patchelf binutils ffmpeg libpulseaudio ];
+        (python3.withPackages (ps: [ ps.jinja2 ps.mako ])) scons clang lld patchelf binutils ffmpeg libpulseaudio meson zstd nasm vulkan-headers ];
       buildInputs = with pkgs; [ opus openssl alsa-lib ];
       LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
       LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.opus ];
