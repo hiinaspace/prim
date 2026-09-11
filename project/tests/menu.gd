@@ -38,6 +38,17 @@ func run() -> void:
 	await click(app.menu.smooth)
 	check(app.smooth_turn != previous, "world ray toggles smooth turn")
 	app.save_setting("comfort", "smooth_turn", previous)
+	var previous_receive := Vector3(app.voice_volume_percent, app.voice_near_radius, app.voice_far_radius)
+	await click(app.menu.receive_volume)
+	check(app.voice_volume_percent == app.menu.receive_volume.value, "world ray adjusts receive volume")
+	app.menu.voice_far.value = 1.0
+	check(app.voice_far_radius > app.voice_near_radius, "shrinking outer radius keeps a valid falloff interval")
+	app.menu.voice_near.value = 12.0
+	check(app.voice_far_radius >= 12.5, "growing inner radius expands outer radius")
+	var saved := ConfigFile.new()
+	saved.load("user://settings.cfg")
+	check(saved.get_value("audio", "voice_near_radius") == app.voice_near_radius and saved.get_value("audio", "receive_volume") == app.voice_volume_percent, "receive preferences are saved locally")
+	app.set_voice_settings(previous_receive.x, previous_receive.y, previous_receive.z)
 	app.toggle_menu()
 	check(not app.menu.visible and not app.menu.text_focused(), "closing menu releases text focus")
 	app.toggle_menu()

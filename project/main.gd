@@ -30,6 +30,9 @@ var controller_visuals: Array[Node3D] = []
 const WALK_MIN := Vector2(-8.6, -3.65)
 const WALK_MAX := Vector2(8.6, 6.95)
 var video_volume_db := 0.0
+var voice_volume_percent := 150.0
+var voice_near_radius := 3.0
+var voice_far_radius := 15.0
 var status_text := "Singleplayer"
 
 func _ready() -> void:
@@ -37,6 +40,9 @@ func _ready() -> void:
 	display_name = settings.get_value("user", "name", "Friend")
 	smooth_turn = settings.get_value("comfort", "smooth_turn", false)
 	turn_speed = settings.get_value("comfort", "turn_speed", 60.0)
+	voice_volume_percent = clampf(settings.get_value("audio", "receive_volume", 150.0), 0, 300)
+	voice_near_radius = clampf(settings.get_value("audio", "voice_near_radius", 3.0), 0.5, 12)
+	voice_far_radius = clampf(settings.get_value("audio", "voice_far_radius", 15.0), voice_near_radius + 0.5, 40)
 	rig.position = Vector3(0, 0, 3)
 	var interface := XRServer.find_interface("OpenXR")
 	if "--desktop" not in OS.get_cmdline_user_args() and "--flat" not in OS.get_cmdline_user_args() and interface:
@@ -75,6 +81,7 @@ func _ready() -> void:
 	menu.gain.set_value_no_signal(settings.get_value("audio", "gain", 0.0))
 	AudioServer.input_device = settings.get_value("audio", "device", "Default")
 	menu.refresh_devices()
+	menu.set_voice_settings(voice_volume_percent, voice_near_radius, voice_far_radius)
 	menu.open_at(camera)
 	playback = Playback.new()
 	playback.player = player
@@ -90,6 +97,7 @@ func _ready() -> void:
 	menu.gain_changed.connect(func(value):
 		if sender.has_method("set_input_gain_db"): sender.set_input_gain_db(value)
 		save_setting("audio", "gain", value))
+	menu.voice_settings_changed.connect(set_voice_settings)
 	menu.name_changed.connect(func(value):
 		display_name = value.strip_edges().left(32)
 		if display_name.is_empty(): display_name = "Friend"
@@ -183,6 +191,7 @@ func peer_connected(peer: String, peer_name: String) -> void:
 	add_child(avatar)
 	avatar.setup(peer_name, session.receive_stream(peer))
 	avatars[peer] = avatar
+	update_voice_volumes()
 	playback.peer_joined(peer)
 
 func peer_disconnected(peer: String) -> void:
@@ -254,6 +263,7 @@ func _process(delta: float) -> void:
 	lateral.y = 0
 	move_body((forward.normalized() * movement.y + lateral.normalized() * movement.x) * 2.0 * delta)
 	update_video_volume()
+	update_voice_volumes()
 	var origin := right.global_position if xr else camera.global_position
 	var direction := -right.global_basis.z if xr else -camera.global_basis.z
 	var pressed := right.get_float("trigger") > 0.6 if xr else Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
@@ -303,3 +313,18 @@ func update_video_volume() -> void:
 static func movie_attenuation_db(distance: float) -> float:
 	# Linear dB beyond the near field is exponential amplitude falloff.
 	return -6.0 * maxf(0.0, distance - 3.0) / 3.0
+
+func set_voice_settings(percent: float, near_radius: float, far_radius: float) -> void:
+	voice_volume_percent = clampf(percent, 0, 300)
+	voice_near_radius = clampf(near_radius, 0.5, 12)
+	voice_far_radius = clampf(far_radius, voice_near_radius + 0.5, 40)
+	menu.set_voice_settings(voice_volume_percent, voice_near_radius, voice_far_radius)
+	update_voice_volumes()
+	settings.set_value("audio", "receive_volume", voice_volume_percent)
+	settings.set_value("audio", "voice_near_radius", voice_near_radius)
+	settings.set_value("audio", "voice_far_radius", voice_far_radius)
+	settings.save("user://settings.cfg")
+
+func update_voice_volumes() -> void:
+	for avatar in avatars.values():
+		avatar.update_voice_volume(camera.global_position, voice_volume_percent, voice_near_radius, voice_far_radius)

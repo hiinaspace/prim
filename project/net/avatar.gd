@@ -23,8 +23,8 @@ func setup(display_name: String, stream: AudioStream) -> void:
 	head.add_child(nameplate)
 	voice = ClassDB.instantiate("SteamAudioPlayer")
 	voice.name = "Voice"
-	voice.distance_attenuation = true
-	voice.min_attenuation_distance = 1.0
+	voice.distance_attenuation = false
+	voice.volume_linear = 0.0
 	voice.ambisonics = true
 	voice.occlusion = false
 	voice.panning_strength = 0.0
@@ -73,3 +73,13 @@ func retire() -> void:
 		voice.stop()
 		voice.stream = null
 	queue_free()
+
+func update_voice_volume(listener: Vector3, percent: float, near_radius: float, far_radius: float) -> void:
+	if voice == null: return
+	var distance := head.global_position.distance_to(listener)
+	voice.volume_linear = maxf(0.0, percent) / 100.0 * voice_falloff(distance, near_radius, far_radius)
+
+static func voice_falloff(distance: float, near_radius: float, far_radius: float) -> float:
+	# Full volume near the speaker, with a smooth fade to actual silence.
+	# Keep decoding while inaudible so coming back into range resumes live audio.
+	return 1.0 - smoothstep(near_radius, maxf(near_radius + 0.5, far_radius), distance)

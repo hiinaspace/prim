@@ -169,6 +169,31 @@ func verify_spatial_voice() -> void:
 	var right_energy: Vector2 = await voice_energy(capture)
 	print("SPATIAL_ENERGY ", left_energy, " / ", right_energy)
 	check(left_energy.x > left_energy.y * 1.05 and right_energy.y > right_energy.x * 1.05, "Steam Audio moves decoded voice between ears with head position")
+	var previous_volume: float = app.voice_volume_percent
+	var previous_near: float = app.voice_near_radius
+	var previous_far: float = app.voice_far_radius
+	var mic_gain: float = app.menu.gain.value
+	var movie_volume: float = app.video_volume_db
+	app.set_voice_settings(previous_volume * 0.5, previous_near, previous_far)
+	var quieter: Vector2 = await voice_energy(capture)
+	var ratio := (quieter.x + quieter.y) / maxf(0.00000001, right_energy.x + right_energy.y)
+	check(ratio > 0.15 and ratio < 0.35, "receive volume halves decoded voice amplitude")
+	app.set_voice_settings(0, previous_near, previous_far)
+	var before_frames: float = stream.get_stats().get("non_silent_output_frames", 0)
+	var silent: Vector2 = await voice_energy(capture)
+	check(silent.length_squared() < 0.000000000001, "zero receive volume silences output")
+	check(stream.get_stats().get("non_silent_output_frames", 0) > before_frames + 10000, "receive mute keeps decoder advancing")
+	for other in app.avatars.values():
+		check(other.voice.volume_linear == 0, "receive volume applies to every remote voice")
+	check(app.menu.gain.value == mic_gain and app.video_volume_db == movie_volume, "receive controls leave microphone and movie levels alone")
+	app.set_voice_settings(previous_volume, 3, 6)
+	avatar.head.global_position = app.camera.global_position + Vector3(7, 0, 0)
+	var distant: Vector2 = await voice_energy(capture)
+	check(distant.length_squared() < 0.000000000001, "outer voice radius silences distant speaker")
+	avatar.head.global_position = app.camera.global_position + Vector3(2, 0, -1)
+	var returned: Vector2 = await voice_energy(capture)
+	check(returned.x + returned.y > (right_energy.x + right_energy.y) * 0.7, "returning inside inner radius restores live full-volume voice")
+	app.set_voice_settings(previous_volume, previous_near, previous_far)
 	avatar.voice.bus = "Master"
 	avatar.set_process(true)
 	AudioServer.remove_bus(index)

@@ -23,6 +23,14 @@ tracked controllers have box placeholders when the runtime supplies no visible
 models. Movie speakers retain full volume through 3 m and fall by 6 dB for each
 additional 3 m; the volume slider remains an independent overall adjustment.
 
+Received voice volume and falloff are local listening preferences, saved between
+runs. Defaults are 150% volume, full level within 3 m, and a smooth fade to silence
+at 15 m. Set received volume to 0% to silence all remote voices without muting your
+microphone or the movie. The two radius sliders maintain a valid inner/outer
+interval. The floor is 20×20 m, and movement bounds are twice their original width
+and depth around the same center; the screen, seats and other geometry retain
+their original size and placement.
+
 First test a familiar URL or local file alone, including pause, seek, subtitles,
 movie volume and closing/reopening the menu. Then have one person press Connect
 and wait for the lobby to publish (initial discovery can take tens of seconds).

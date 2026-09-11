@@ -12,9 +12,10 @@ signal name_changed(value: String)
 signal smooth_turn_changed(enabled: bool)
 signal turn_speed_changed(speed: float)
 signal volume_changed(db: float)
+signal voice_settings_changed(percent: float, near_radius: float, far_radius: float)
 
-const PIXELS := Vector2i(1200, 950)
-const METERS := Vector2(1.5, 1.1875)
+const PIXELS := Vector2i(1200, 1080)
+const METERS := Vector2(1.5, 1.35)
 var viewport: SubViewport
 var url: LineEdit
 var display_name: LineEdit
@@ -29,6 +30,12 @@ var gain: HSlider
 var smooth: CheckButton
 var speed: HSlider
 var volume: HSlider
+var receive_volume: HSlider
+var voice_near: HSlider
+var voice_far: HSlider
+var receive_volume_label: Label
+var voice_near_label: Label
+var voice_far_label: Label
 var timeline: HSlider
 var playback_time: Label
 var scrub_timer: Timer
@@ -150,6 +157,27 @@ func _ready() -> void:
 	meter.show_percentage = false
 	meter.custom_minimum_size = Vector2(280, 34)
 	row.add_child(meter)
+	row = horizontal(column)
+	label(row, "Received voices")
+	receive_volume = slider(row, 0, 300, 150, 5)
+	receive_volume_label = label(row, "150%")
+	receive_volume_label.custom_minimum_size.x = 80
+	row = horizontal(column)
+	label(row, "Full volume within")
+	voice_near = slider(row, 0.5, 12, 3, 0.5)
+	voice_near_label = label(row, "3.0 m")
+	voice_near_label.custom_minimum_size.x = 85
+	label(row, "Silent beyond")
+	voice_far = slider(row, 1, 40, 15, 0.5)
+	voice_far_label = label(row, "15.0 m")
+	voice_far_label.custom_minimum_size.x = 85
+	receive_volume.value_changed.connect(func(_value): emit_voice_settings())
+	voice_near.value_changed.connect(func(value):
+		voice_far.set_value_no_signal(maxf(voice_far.value, value + 0.5))
+		emit_voice_settings())
+	voice_far.value_changed.connect(func(value):
+		voice_near.set_value_no_signal(minf(voice_near.value, value - 0.5))
+		emit_voice_settings())
 	label(column, "Use headphones. Voice starts muted whenever you join.")
 	column.add_child(HSeparator.new())
 	label(column, "COMFORT")
@@ -275,3 +303,18 @@ static func format_time(seconds: float) -> String:
 	var total := maxi(0, int(seconds))
 	if total >= 3600: return "%d:%02d:%02d" % [total / 3600, (total / 60) % 60, total % 60]
 	return "%d:%02d" % [total / 60, total % 60]
+
+func set_voice_settings(percent: float, near_radius: float, far_radius: float) -> void:
+	receive_volume.set_value_no_signal(percent)
+	voice_near.set_value_no_signal(near_radius)
+	voice_far.set_value_no_signal(far_radius)
+	refresh_voice_labels()
+
+func refresh_voice_labels() -> void:
+	receive_volume_label.text = "%d%%" % int(receive_volume.value)
+	voice_near_label.text = "%.1f m" % voice_near.value
+	voice_far_label.text = "%.1f m" % voice_far.value
+
+func emit_voice_settings() -> void:
+	refresh_voice_labels()
+	voice_settings_changed.emit(receive_volume.value, voice_near.value, voice_far.value)
