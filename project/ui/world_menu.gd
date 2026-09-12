@@ -12,10 +12,11 @@ signal name_changed(value: String)
 signal smooth_turn_changed(enabled: bool)
 signal turn_speed_changed(speed: float)
 signal volume_changed(db: float)
+signal movie_settings_changed(near_radius: float, far_radius: float)
 signal voice_settings_changed(percent: float, near_radius: float, far_radius: float)
 
-const PIXELS := Vector2i(1200, 1140)
-const METERS := Vector2(1.5, 1.425)
+const PIXELS := Vector2i(1200, 1200)
+const METERS := Vector2(1.5, 1.5)
 var viewport: SubViewport
 var url: LineEdit
 var current_source: LineEdit
@@ -32,6 +33,10 @@ var gain: HSlider
 var smooth: CheckButton
 var speed: HSlider
 var volume: HSlider
+var movie_near: HSlider
+var movie_far: HSlider
+var movie_near_label: Label
+var movie_far_label: Label
 var receive_volume: HSlider
 var voice_near: HSlider
 var voice_far: HSlider
@@ -139,6 +144,21 @@ func _ready() -> void:
 	label(row, "Video volume")
 	volume = slider(row, -40, 6, 0, 1)
 	volume.value_changed.connect(func(value): volume_changed.emit(value))
+	row = horizontal(column)
+	label(row, "Full volume within")
+	movie_near = slider(row, 0.5, 12, 6, 0.5)
+	movie_near_label = label(row, "6.0 m")
+	movie_near_label.custom_minimum_size.x = 85
+	label(row, "Silent beyond")
+	movie_far = slider(row, 1, 40, 18, 0.5)
+	movie_far_label = label(row, "18.0 m")
+	movie_far_label.custom_minimum_size.x = 85
+	movie_near.value_changed.connect(func(value):
+		movie_far.set_value_no_signal(maxf(movie_far.value, value + 0.5))
+		emit_movie_settings())
+	movie_far.value_changed.connect(func(value):
+		movie_near.set_value_no_signal(minf(movie_near.value, value - 0.5))
+		emit_movie_settings())
 	media_status = label(column, "Choose a video to begin.")
 	media_status.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	media_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -198,7 +218,7 @@ func _ready() -> void:
 	label(row, "Turn speed (°/s)")
 	speed = slider(row, 15, 150, 60, 5)
 	speed.value_changed.connect(func(value): turn_speed_changed.emit(value))
-	xr_controls = label(column, "VR: Y/B opens menu • trigger selects • sticks move / turn")
+	xr_controls = label(column, "VR: Y/B menu • A/X mic • trigger selects • sticks move / turn")
 	label(column, "Desktop: WASD + mouse • Tab menu • click selects • Esc cursor")
 
 func horizontal(parent: Node) -> HBoxContainer:
@@ -327,3 +347,16 @@ func refresh_voice_labels() -> void:
 func emit_voice_settings() -> void:
 	refresh_voice_labels()
 	voice_settings_changed.emit(receive_volume.value, voice_near.value, voice_far.value)
+
+func set_movie_settings(near_radius: float, far_radius: float) -> void:
+	movie_near.set_value_no_signal(near_radius)
+	movie_far.set_value_no_signal(far_radius)
+	refresh_movie_labels()
+
+func refresh_movie_labels() -> void:
+	movie_near_label.text = "%.1f m" % movie_near.value
+	movie_far_label.text = "%.1f m" % movie_far.value
+
+func emit_movie_settings() -> void:
+	refresh_movie_labels()
+	movie_settings_changed.emit(movie_near.value, movie_far.value)

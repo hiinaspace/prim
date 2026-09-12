@@ -22,6 +22,7 @@ var smooth_turn := false
 var turn_speed := 60.0
 var snap_ready := true
 var menu_ready := true
+var mute_ready := true
 var pose_elapsed := 0.0
 var sequence := 0
 var laser: MeshInstance3D
@@ -32,6 +33,8 @@ const WALK_MAX := Vector2(8.6, 6.95)
 var movie_bus := -1
 var ignore_pointer_until_release := false
 var video_volume_db := 0.0
+var movie_near_radius := 6.0
+var movie_far_radius := 18.0
 var voice_volume_percent := 150.0
 var voice_near_radius := 3.0
 var voice_far_radius := 15.0
@@ -45,6 +48,8 @@ func _ready() -> void:
 	voice_volume_percent = clampf(settings.get_value("audio", "receive_volume", 150.0), 0, 300)
 	voice_near_radius = clampf(settings.get_value("audio", "voice_near_radius", 3.0), 0.5, 12)
 	voice_far_radius = clampf(settings.get_value("audio", "voice_far_radius", 15.0), voice_near_radius + 0.5, 40)
+	movie_near_radius = clampf(settings.get_value("audio", "movie_near_radius", 6.0), 0.5, 12)
+	movie_far_radius = clampf(settings.get_value("audio", "movie_far_radius", 18.0), movie_near_radius + 0.5, 40)
 	rig.position = Vector3(0, 0, 3)
 	var interface := XRServer.find_interface("OpenXR")
 	if "--desktop" not in OS.get_cmdline_user_args() and "--flat" not in OS.get_cmdline_user_args() and interface:
@@ -71,7 +76,10 @@ func _ready() -> void:
 		movie_bus = AudioServer.bus_count
 		AudioServer.add_bus()
 		AudioServer.set_bus_name(movie_bus, "Movie")
-	for speaker in [$EmissiveScreen/LeftSpeaker, $EmissiveScreen/RightSpeaker]: speaker.bus = "Movie"
+	for speaker in [$EmissiveScreen/LeftSpeaker, $EmissiveScreen/RightSpeaker]:
+		speaker.bus = "Movie"
+		speaker.attenuation_filter_db = 0.0
+		speaker.air_absorption = false
 	session = ClassDB.instantiate("PrimSession")
 	add_child(session)
 	sender = ClassDB.instantiate("NetworkAudioSender")
@@ -90,6 +98,7 @@ func _ready() -> void:
 	AudioServer.input_device = settings.get_value("audio", "device", "Default")
 	menu.refresh_devices()
 	menu.set_voice_settings(voice_volume_percent, voice_near_radius, voice_far_radius)
+	menu.set_movie_settings(movie_near_radius, movie_far_radius)
 	menu.open_at(camera)
 	playback = Playback.new()
 	playback.player = player
@@ -106,6 +115,7 @@ func _ready() -> void:
 		if sender.has_method("set_input_gain_db"): sender.set_input_gain_db(value)
 		save_setting("audio", "gain", value))
 	menu.voice_settings_changed.connect(set_voice_settings)
+	menu.movie_settings_changed.connect(set_movie_settings)
 	menu.name_changed.connect(func(value):
 		display_name = value.strip_edges().left(32)
 		if display_name.is_empty(): display_name = "Friend"
@@ -282,7 +292,7 @@ func _process(delta: float) -> void:
 		movement = Vector2(axes.x, axes.y)
 		if movement.length() < 0.2: movement = Vector2.ZERO
 		var turn := axes.z
-		menu.xr_controls.text = "One controller: stick moves forward/back + turns • trigger selects" if left_active != right_active else "VR: Y/B opens menu • trigger selects • sticks move / turn"
+		menu.xr_controls.text = "One controller: stick moves + turns • A/X mic • trigger selects" if left_active != right_active else "VR: Y/B opens menu • A/X mic • trigger selects • sticks move / turn"
 		if absf(turn) < 0.25: snap_ready = true
 		elif smooth_turn: rotate_about_head(-turn * deg_to_rad(turn_speed) * delta)
 		elif snap_ready:
@@ -291,6 +301,7 @@ func _process(delta: float) -> void:
 		var menu_down := (left_active and left.is_button_pressed("by_button")) or (right_active and right.is_button_pressed("by_button"))
 		if menu_down and menu_ready: toggle_menu()
 		menu_ready = not menu_down
+		update_mute_button((left_active and left.is_button_pressed("ax_button")) or (right_active and right.is_button_pressed("ax_button")))
 	elif not menu.text_focused():
 		movement = Vector2(float(Input.is_physical_key_pressed(KEY_D)) - float(Input.is_physical_key_pressed(KEY_A)), float(Input.is_physical_key_pressed(KEY_W)) - float(Input.is_physical_key_pressed(KEY_S))).limit_length()
 	var forward := -camera.global_basis.z
@@ -343,17 +354,24 @@ func move_body(displacement: Vector3) -> void:
 	correction.y = 0
 	rig.global_position += correction
 
+func update_mute_button(pressed: bool) -> void:
+	if pressed and mute_ready: toggle_microphone()
+	mute_ready = not pressed
+
 func update_video_volume() -> void:
-	# A bus gain is spectrally flat. Player volume also drives Godot's distance
-	# low-pass filter, so reserve the latter for actual source/listener distance.
 	if movie_bus >= 0: AudioServer.set_bus_volume_db(movie_bus, video_volume_db)
 	for speaker in [$EmissiveScreen/LeftSpeaker, $EmissiveScreen/RightSpeaker]:
 		var distance: float = camera.global_position.distance_to(speaker.global_position)
-		speaker.volume_db = movie_attenuation_db(distance)
+		speaker.volume_linear = Avatar.voice_falloff(distance, movie_near_radius, movie_far_radius)
 
-static func movie_attenuation_db(distance: float) -> float:
-	# Linear dB beyond the near field is exponential amplitude falloff.
-	return -6.0 * maxf(0.0, distance - 3.0) / 3.0
+func set_movie_settings(near_radius: float, far_radius: float) -> void:
+	movie_near_radius = clampf(near_radius, 0.5, 12)
+	movie_far_radius = clampf(far_radius, movie_near_radius + 0.5, 40)
+	menu.set_movie_settings(movie_near_radius, movie_far_radius)
+	update_video_volume()
+	settings.set_value("audio", "movie_near_radius", movie_near_radius)
+	settings.set_value("audio", "movie_far_radius", movie_far_radius)
+	settings.save("user://settings.cfg")
 
 func set_voice_settings(percent: float, near_radius: float, far_radius: float) -> void:
 	voice_volume_percent = clampf(percent, 0, 300)

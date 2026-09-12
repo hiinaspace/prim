@@ -58,12 +58,12 @@ func run() -> void:
 	print("MOVIE_BAND_GAIN ", change)
 	check(absf(change.x - db_to_linear(-18)) < 0.02 and absf(change.y - change.x) < 0.015, "movie slider changes low and high frequencies equally")
 	app.video_volume_db = 0
-	speaker.global_position = app.camera.global_position + Vector3(0, 0, -6)
+	speaker.global_position = app.camera.global_position + Vector3(0, 0, -12)
 	app.update_video_volume()
 	var far: Vector2 = await spectrum(capture)
 	var distance_change := far / loud
 	print("MOVIE_DISTANCE_BAND_GAIN ", distance_change)
-	check(distance_change.y < distance_change.x * 0.8, "distance still attenuates high frequencies")
+	check(absf(distance_change.x - 0.5) < 0.03 and absf(distance_change.y - distance_change.x) < 0.03, "distance attenuates both frequencies equally")
 	speaker.stop()
 	AudioServer.remove_bus_effect(0, 0)
 	print("MOVIE_VOLUME_RESULT ", JSON.stringify(failures))
