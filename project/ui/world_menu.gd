@@ -14,10 +14,12 @@ signal turn_speed_changed(speed: float)
 signal volume_changed(db: float)
 signal voice_settings_changed(percent: float, near_radius: float, far_radius: float)
 
-const PIXELS := Vector2i(1200, 1080)
-const METERS := Vector2(1.5, 1.35)
+const PIXELS := Vector2i(1200, 1140)
+const METERS := Vector2(1.5, 1.425)
 var viewport: SubViewport
 var url: LineEdit
+var current_source: LineEdit
+var xr_controls: Label
 var display_name: LineEdit
 var connection_button: Button
 var mic_button: Button
@@ -98,6 +100,13 @@ func _ready() -> void:
 	row.add_child(display_name)
 	column.add_child(HSeparator.new())
 	label(column, "VIDEO")
+	row = horizontal(column)
+	label(row, "Current source")
+	current_source = LineEdit.new()
+	current_source.editable = false
+	current_source.placeholder_text = "No media"
+	current_source.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(current_source)
 	row = horizontal(column)
 	url = LineEdit.new()
 	url.placeholder_text = "Video URL or local file path"
@@ -189,7 +198,7 @@ func _ready() -> void:
 	label(row, "Turn speed (°/s)")
 	speed = slider(row, 15, 150, 60, 5)
 	speed.value_changed.connect(func(value): turn_speed_changed.emit(value))
-	label(column, "VR: Y/B opens menu • trigger selects • sticks move / turn")
+	xr_controls = label(column, "VR: Y/B opens menu • trigger selects • sticks move / turn")
 	label(column, "Desktop: WASD + mouse • Tab menu • click selects • Esc cursor")
 
 func horizontal(parent: Node) -> HBoxContainer:

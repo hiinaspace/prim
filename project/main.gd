@@ -30,6 +30,7 @@ var controller_visuals: Array[Node3D] = []
 const WALK_MIN := Vector2(-8.6, -3.65)
 const WALK_MAX := Vector2(8.6, 6.95)
 var movie_bus := -1
+var ignore_pointer_until_release := false
 var video_volume_db := 0.0
 var voice_volume_percent := 150.0
 var voice_near_radius := 3.0
@@ -225,19 +226,43 @@ func pose_received(peer: String, bytes: PackedByteArray) -> void:
 	var pose := Pose.decode(bytes)
 	if not pose.is_empty(): avatars[peer].apply_pose(pose.sequence, pose.poses, pose.tracked)
 
+func capture_desktop_pointer() -> void:
+	if xr or camera == null: return
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	ignore_pointer_until_release = true
+
+func _notification(what: int) -> void:
+	if xr or camera == null: return
+	if what == NOTIFICATION_WM_WINDOW_FOCUS_IN:
+		capture_desktop_pointer()
+	elif what == NOTIFICATION_WM_WINDOW_FOCUS_OUT:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+
 func _input(event: InputEvent) -> void:
 	if menu == null: return
-	if event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_TAB:
+	if not xr and event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+		capture_desktop_pointer()
+		get_viewport().set_input_as_handled()
+		return
+	if event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_ESCAPE:
+		if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED: Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		else: capture_desktop_pointer()
+		get_viewport().set_input_as_handled()
+	elif event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_TAB:
 		toggle_menu()
 		get_viewport().set_input_as_handled()
 	elif menu.text_focused() and event is InputEventKey:
 		menu.forward_key(event)
 		get_viewport().set_input_as_handled()
-	elif event is InputEventKey and event.pressed and event.physical_keycode == KEY_ESCAPE:
-		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED else Input.MOUSE_MODE_CAPTURED
 	elif not xr and event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		rotate_about_head(-event.relative.x * 0.002)
 		camera.rotation.x = clampf(camera.rotation.x - event.relative.y * 0.002, -1.45, 1.45)
+
+static func locomotion_axes(left_active: bool, right_active: bool, left_stick: Vector2, right_stick: Vector2) -> Vector3:
+	if left_active and right_active: return Vector3(left_stick.x, left_stick.y, right_stick.x)
+	if left_active: return Vector3(0, left_stick.y, left_stick.x)
+	if right_active: return Vector3(0, right_stick.y, right_stick.x)
+	return Vector3.ZERO
 
 func toggle_menu() -> void:
 	if menu.visible:
@@ -251,15 +276,19 @@ func _process(delta: float) -> void:
 	if camera == null: return
 	var movement := Vector2.ZERO
 	if xr:
-		movement = left.get_vector2("primary")
+		var left_active := left.get_has_tracking_data()
+		var right_active := right.get_has_tracking_data()
+		var axes := locomotion_axes(left_active, right_active, left.get_vector2("primary"), right.get_vector2("primary"))
+		movement = Vector2(axes.x, axes.y)
 		if movement.length() < 0.2: movement = Vector2.ZERO
-		var turn := right.get_vector2("primary").x
+		var turn := axes.z
+		menu.xr_controls.text = "One controller: stick moves forward/back + turns • trigger selects" if left_active != right_active else "VR: Y/B opens menu • trigger selects • sticks move / turn"
 		if absf(turn) < 0.25: snap_ready = true
 		elif smooth_turn: rotate_about_head(-turn * deg_to_rad(turn_speed) * delta)
 		elif snap_ready:
 			rotate_about_head(-signf(turn) * deg_to_rad(30))
 			snap_ready = false
-		var menu_down := left.is_button_pressed("by_button") or right.is_button_pressed("by_button")
+		var menu_down := (left_active and left.is_button_pressed("by_button")) or (right_active and right.is_button_pressed("by_button"))
 		if menu_down and menu_ready: toggle_menu()
 		menu_ready = not menu_down
 	elif not menu.text_focused():
@@ -271,12 +300,14 @@ func _process(delta: float) -> void:
 	move_body((forward.normalized() * movement.y + lateral.normalized() * movement.x) * 2.0 * delta)
 	update_video_volume()
 	update_voice_volumes()
-	var origin := right.global_position if xr else camera.global_position
-	var direction := -right.global_basis.z if xr else -camera.global_basis.z
-	var pressed := right.get_float("trigger") > 0.6 if xr else Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	var hand: XRController3D = right if right.get_has_tracking_data() else (left if left.get_has_tracking_data() else null)
+	var origin := hand.global_position if xr and hand != null else camera.global_position
+	var direction := -hand.global_basis.z if xr and hand != null else -camera.global_basis.z
+	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT): ignore_pointer_until_release = false
+	var pressed := hand.get_float("trigger") > 0.6 if xr and hand != null else (not xr and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not ignore_pointer_until_release and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT))
 	var target := menu.point(origin, direction, pressed)
-	laser.visible = menu.visible and xr
-	pointer.visible = menu.visible
+	laser.visible = menu.visible and xr and hand != null
+	pointer.visible = menu.visible and (not xr or hand != null)
 	pointer.global_position = target
 	var mesh := laser.mesh as ImmediateMesh
 	mesh.clear_surfaces()

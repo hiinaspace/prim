@@ -21,6 +21,19 @@ func run() -> void:
 	await create_timer(1.0).timeout
 	# The harness owns the synthetic ray; stop the live mouse ray from competing.
 	app.set_process(false)
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	var recapture := InputEventMouseButton.new()
+	recapture.button_index = MOUSE_BUTTON_LEFT
+	recapture.pressed = true
+	app._input(recapture)
+	check(Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and app.ignore_pointer_until_release, "click recaptures desktop cursor without activating menu")
+	app._notification(Node.NOTIFICATION_WM_WINDOW_FOCUS_OUT)
+	app._notification(Node.NOTIFICATION_WM_WINDOW_FOCUS_IN)
+	check(Input.mouse_mode == Input.MOUSE_MODE_CAPTURED, "window refocus recaptures cursor")
+	check(app.locomotion_axes(true, false, Vector2(0.7, 0.8), Vector2.ZERO) == Vector3(0, 0.8, 0.7), "left-only controller maps forward and turn")
+	check(app.locomotion_axes(false, true, Vector2.ZERO, Vector2(0.7, 0.8)) == Vector3(0, 0.8, 0.7), "right-only controller maps forward and turn")
+	check(app.locomotion_axes(true, true, Vector2(0.7, 0.8), Vector2(-0.5, 0)) == Vector3(0.7, 0.8, -0.5), "two-controller layout retains strafe and independent turn")
+	check(app.locomotion_axes(false, false, Vector2.ONE, Vector2.ONE) == Vector3.ZERO, "inactive controller axes are ignored")
 	check(not app.session.is_active() and app.muted, "singleplayer and muted startup")
 	var panel: Control = app.menu.viewport.get_child(0)
 	check(panel.size.x <= app.menu.PIXELS.x and panel.size.y <= app.menu.PIXELS.y, "menu fits viewport")
