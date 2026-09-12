@@ -10,18 +10,23 @@ connecting. Allow the application through the firewall when prompted.
   [supported runtime download](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
 - **Desktop:** WASD moves; mouse looks; center dot aims at the menu; left click
   activates controls. Tab opens/closes the menu; Esc releases/captures the cursor.
+  Refocusing the window or clicking back inside it recaptures the cursor; that
+  click does not also activate a menu control.
   Click the URL field for typing or use Paste URL. Movement keys are suppressed
   while editing text.
 - **VR:** left stick moves; right stick turns; Y/B toggles the menu; the right
   controller's trigger activates its laser pointer. Select smooth turning and
-  its speed in the menu, or leave snap turning enabled.
+  its speed in the menu, or leave snap turning enabled. With only one tracked
+  controller (either hand), its stick moves forward/back relative to your head
+  and turns horizontally. Its trigger controls the menu laser.
 
 The playback bar supports clicking or dragging to an absolute position, with a
 short debounce. Remote voices are HRTF-rendered at their avatar heads. Turning
 pivots around the headset's ground position, including room-scale offsets, and
 tracked controllers have box placeholders when the runtime supplies no visible
 models. Movie speakers retain full volume through 3 m and fall by 6 dB for each
-additional 3 m; the volume slider remains an independent overall adjustment.
+additional 3 m; distance also muffles high frequencies. The volume slider applies
+flat gain on a separate movie bus, preserving frequency balance at a fixed position.
 
 Received voice volume and falloff are local listening preferences, saved between
 runs. Defaults are 150% volume, full level within 3 m, and a smooth fade to silence
@@ -30,6 +35,12 @@ microphone or the movie. The two radius sliders maintain a valid inner/outer
 interval. The floor is 20×20 m, and movement bounds are twice their original width
 and depth around the same center; the screen, seats and other geometry retain
 their original size and placement.
+
+The read-only Current source field shows the active URL or your selected local
+path separately from the editable URL draft. Source changes are also written to
+stderr/the Godot log with a `[prim media]` prefix. For shared local files without
+a local selection, only the shared filename is available. Joining an idle host
+stops any movie you were playing locally and clears this field.
 
 First test a familiar URL or local file alone, including pause, seek, subtitles,
 movie volume and closing/reopening the menu. Then have one person press Connect
@@ -61,3 +72,15 @@ Still manual: native Windows startup/devices, both PCVR runtimes, headset laser
 and dropdown usability, subjective spatial audio and long-session comfort,
 Internet NAT/relay behavior with friends, and other Linux distributions. Wine
 success is useful coverage but does not establish native Windows PCVR support.
+
+## Latest friend-feedback regression checks
+
+- Six Linux clients and a Linux/Windows-under-Wine pair: pre-join local playback
+  stops for an idle host, then shared source display, video sync and voice pass.
+- Desktop click/refocus capture and either-hand single-controller axis mappings.
+- Movie output spectrum: lowering the slider by 18 dB scales 500 Hz and 6 kHz
+  equally; moving beyond the near field still reduces treble more than bass.
+- Menu rendering and existing scrubbing, voice controls and body-pivot checks.
+
+Please verify single-controller tracking transitions and menu use in a headset,
+and compare movie volume at a fixed seat versus walking away from the screen.
