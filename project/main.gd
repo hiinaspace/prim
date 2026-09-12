@@ -29,6 +29,7 @@ var pointer: MeshInstance3D
 var controller_visuals: Array[Node3D] = []
 const WALK_MIN := Vector2(-8.6, -3.65)
 const WALK_MAX := Vector2(8.6, 6.95)
+var movie_bus := -1
 var video_volume_db := 0.0
 var voice_volume_percent := 150.0
 var voice_near_radius := 3.0
@@ -64,6 +65,12 @@ func _ready() -> void:
 		$XROrigin3D/XRCamera3D/SteamAudioListener.reparent(camera)
 		camera.make_current()
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	movie_bus = AudioServer.get_bus_index("Movie")
+	if movie_bus < 0:
+		movie_bus = AudioServer.bus_count
+		AudioServer.add_bus()
+		AudioServer.set_bus_name(movie_bus, "Movie")
+	for speaker in [$EmissiveScreen/LeftSpeaker, $EmissiveScreen/RightSpeaker]: speaker.bus = "Movie"
 	session = ClassDB.instantiate("PrimSession")
 	add_child(session)
 	sender = ClassDB.instantiate("NetworkAudioSender")
@@ -306,9 +313,12 @@ func move_body(displacement: Vector3) -> void:
 	rig.global_position += correction
 
 func update_video_volume() -> void:
+	# A bus gain is spectrally flat. Player volume also drives Godot's distance
+	# low-pass filter, so reserve the latter for actual source/listener distance.
+	if movie_bus >= 0: AudioServer.set_bus_volume_db(movie_bus, video_volume_db)
 	for speaker in [$EmissiveScreen/LeftSpeaker, $EmissiveScreen/RightSpeaker]:
 		var distance: float = camera.global_position.distance_to(speaker.global_position)
-		speaker.volume_db = video_volume_db + movie_attenuation_db(distance)
+		speaker.volume_db = movie_attenuation_db(distance)
 
 static func movie_attenuation_db(distance: float) -> float:
 	# Linear dB beyond the near field is exponential amplitude falloff.
