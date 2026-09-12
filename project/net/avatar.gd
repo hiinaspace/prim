@@ -6,6 +6,11 @@ var left: Node3D
 var right: Node3D
 var voice: Node
 var nameplate: Label3D
+var talking_indicator: Label3D
+var receive_stream: AudioStream
+var previous_voice_frames := 0
+var talking_hold := 0.0
+var talking := false
 var targets: Array[Transform3D] = []
 var last_sequence := -1
 var last_update := 0
@@ -21,6 +26,16 @@ func setup(display_name: String, stream: AudioStream) -> void:
 	nameplate.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	nameplate.position.y = 0.35
 	head.add_child(nameplate)
+	talking_indicator = Label3D.new()
+	talking_indicator.text = "● Speaking"
+	talking_indicator.font_size = 28
+	talking_indicator.pixel_size = 0.004
+	talking_indicator.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	talking_indicator.position.y = 0.50
+	talking_indicator.modulate = Color("86e3cc")
+	talking_indicator.visible = false
+	head.add_child(talking_indicator)
+	receive_stream = stream
 	voice = ClassDB.instantiate("SteamAudioPlayer")
 	voice.name = "Voice"
 	voice.distance_attenuation = false
@@ -60,6 +75,10 @@ func apply_pose(sequence: int, poses: Array[Transform3D], tracked: int) -> void:
 	right.visible = tracked & 2 != 0
 
 func _process(delta: float) -> void:
+	if receive_stream != null:
+		var frames: int = receive_stream.get_stats().get("non_silent_output_frames", 0)
+		update_talking(frames > previous_voice_frames, delta)
+		previous_voice_frames = frames
 	if Time.get_ticks_msec() - last_update > 3000:
 		visible = false
 	if targets.size() == 3:
@@ -83,3 +102,10 @@ static func voice_falloff(distance: float, near_radius: float, far_radius: float
 	# Full volume near the speaker, with a smooth fade to actual silence.
 	# Keep decoding while inaudible so coming back into range resumes live audio.
 	return 1.0 - smoothstep(near_radius, maxf(near_radius + 0.5, far_radius), distance)
+
+func update_talking(active: bool, delta: float) -> void:
+	# Hold across short speech gaps; activity is measured before local gain/falloff.
+	talking_hold = 0.2 if active else maxf(0.0, talking_hold - delta)
+	talking = talking_hold > 0.0
+	talking_indicator.visible = talking
+	nameplate.modulate = Color("86e3cc") if talking else Color.WHITE

@@ -42,7 +42,10 @@ func run() -> void:
 	peer = app.avatars.keys()[0]
 	check(app.avatars.size() == expected_peers, "full mesh formed")
 	app.select_device("Default" if OS.get_name() == "Windows" else OS.get_environment("PULSE_SOURCE"))
-	app.set_muted(false)
+	app.update_mute_button(true)
+	app.update_mute_button(true)
+	check(not app.muted, "held controller mute button toggles only once")
+	app.update_mute_button(false)
 	check(app.sender.is_capturing(), "virtual microphone starts")
 	if role != "host":
 		check(await wait_for(func(): return app.playback.source.is_empty() and not app.playback.loaded), "joining idle host clears local movie")
@@ -90,8 +93,10 @@ func run() -> void:
 	for remote in app.avatars:
 		check(app.avatars[remote].last_sequence > 10, "remote poses applied")
 		check(app.session.receive_stream(remote).get_stats().get("non_silent_output_frames", 0) > 10000, "each remote voice mixed")
+	check(app.avatars[peer].talking, "decoded remote audio lights talking indicator")
 	await verify_spatial_voice()
-	app.set_muted(true)
+	app.update_mute_button(true)
+	app.update_mute_button(false)
 	var stopped: int = app.sender.get_captured_input_frames()
 	await create_timer(0.5).timeout
 	check(not app.sender.is_capturing() and app.sender.get_captured_input_frames() == stopped, "mute stops capture")
