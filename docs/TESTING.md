@@ -18,20 +18,26 @@ connecting. Allow the application through the firewall when prompted.
   controller's trigger activates its laser pointer. Select smooth turning and
   its speed in the menu, or leave snap turning enabled. With only one tracked
   controller (either hand), its stick moves forward/back relative to your head
-  and turns horizontally. Its trigger controls the menu laser.
+  and turns horizontally. Its trigger controls the menu laser. A/X on either tracked controller toggles
+  microphone mute while connected, including with the menu closed.
 
 The playback bar supports clicking or dragging to an absolute position, with a
 short debounce. Remote voices are HRTF-rendered at their avatar heads. Turning
 pivots around the headset's ground position, including room-scale offsets, and
 tracked controllers have box placeholders when the runtime supplies no visible
-models. Movie speakers retain full volume through 3 m and fall by 6 dB for each
-additional 3 m; distance also muffles high frequencies. The volume slider applies
-flat gain on a separate movie bus, preserving frequency balance at a fixed position.
+models. Movie speakers default to full volume through 6 m and a smooth fade to
+silence at 18 m. The Video section has independent Full volume within / Silent
+beyond sliders, saved locally between runs. Movie distance filtering and air
+absorption are disabled: both distance and the main volume slider reduce level
+without muffling. The two radius sliders keep a valid inner/outer interval.
 
 Received voice volume and falloff are local listening preferences, saved between
 runs. Defaults are 150% volume, full level within 3 m, and a smooth fade to silence
 at 15 m. Set received volume to 0% to silence all remote voices without muting your
-microphone or the movie. The two radius sliders maintain a valid inner/outer
+microphone or the movie. Remote nameplates turn green with a Speaking label
+while decoded voice is active, with a 200 ms hold across speech gaps. This is
+an audio-activity indicator (background noise can trigger it), measured before
+your receive gain or distance attenuation. The two radius sliders maintain a valid inner/outer
 interval. The floor is 20×20 m, and movement bounds are twice their original width
 and depth around the same center; the screen, seats and other geometry retain
 their original size and placement.
@@ -79,8 +85,10 @@ success is useful coverage but does not establish native Windows PCVR support.
   stops for an idle host, then shared source display, video sync and voice pass.
 - Desktop click/refocus capture and either-hand single-controller axis mappings.
 - Movie output spectrum: lowering the slider by 18 dB scales 500 Hz and 6 kHz
-  equally; moving beyond the near field still reduces treble more than bass.
-- Menu rendering and existing scrubbing, voice controls and body-pivot checks.
+  equally; at 12 m the new default distance curve halves both bands equally.
+- Menu rendering, movie radius controls, existing scrubbing, voice controls and
+  body-pivot checks. Controller mute toggles only on the press edge, and decoded
+  remote audio lights the talking indicator in the multiplayer test.
 
 Please verify single-controller tracking transitions and menu use in a headset,
 and compare movie volume at a fixed seat versus walking away from the screen.
