@@ -33,6 +33,9 @@ func run() -> void:
 		if role == "host":
 			var file := FileAccess.open(output + ".endpoint", FileAccess.WRITE)
 			file.store_string(app.session.get_endpoint_info()))
+	if role != "host":
+		app.playback.request_source(OS.get_environment("PRIM_TEST_MEDIA"))
+		check(await wait_for(func(): return app.playback.loaded and not app.player.is_paused()), "client plays local media before joining")
 	app.toggle_connection()
 	check(await wait_for(func(): return app.avatars.size() == expected_peers), "peer connected")
 	if app.avatars.is_empty(): finish(); return
@@ -42,11 +45,15 @@ func run() -> void:
 	app.set_muted(false)
 	check(app.sender.is_capturing(), "virtual microphone starts")
 	if role != "host":
+		check(await wait_for(func(): return app.playback.source.is_empty() and not app.playback.loaded), "joining idle host clears local movie")
+		check(app.menu.current_source.text.is_empty(), "idle host clears current source display")
+		app.session.send_control(app.session.get_host_id(), JSON.stringify({"type":"test_idle_ready"}))
 		await create_timer(50.0).timeout
 		if not done:
 			check(false, "host completed test")
 			finish()
 		return
+	check(await wait_for(func(): return phase_complete("idle")), "all clients adopted idle host state")
 	app.playback.request_source(OS.get_environment("PRIM_TEST_MEDIA"))
 	check(await wait_for(func(): return app.playback.loaded), "host media loaded")
 	await create_timer(4.0).timeout
@@ -119,12 +126,15 @@ func receive(id: String, raw: String) -> void:
 	if message.get("type") == "test_probe":
 		var stream = app.session.receive_stream(id)
 		var stats: Dictionary = stream.get_stats()
-		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false)}))
+		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "displayed_source":app.menu.current_source.text}))
+	elif message.get("type") == "test_idle_ready":
+		replies["idle/" + id] = true
 	elif message.get("type") == "test_reply":
 		replies[message.phase] = message
 		replies[message.phase + "/" + id] = message
 		if message.phase in ["playing", "resumed"]:
 			check(message.loaded and not message.paused and absf(float(message.drift)) < 0.4, "peer running playback converges")
+			check(message.displayed_source == app.playback.source, "remote menu displays authoritative media source")
 	elif message.get("type") == "test_scrub":
 		app.playback.request_action("seek_to", message.position)
 	elif message.get("type") == "test_finish":

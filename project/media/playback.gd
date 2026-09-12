@@ -27,6 +27,7 @@ var snapshot_sequence := 0
 var pending_probes := {}
 var probe_sequence := 0
 var drift_seconds := 0.0
+var last_source_report := ""
 
 static func now() -> float:
 	return Time.get_ticks_usec() / 1000000.0
@@ -82,6 +83,7 @@ func set_source(value: String, kind: String) -> void:
 	broadcast_snapshot()
 
 func load_local(path: String) -> void:
+	show_source(path)
 	loaded = false
 	awaiting_seek = true
 	player.pause()
@@ -94,6 +96,9 @@ func load_local(path: String) -> void:
 	player.load(path)
 
 func file_loaded() -> void:
+	if source.is_empty():
+		player.stop()
+		return
 	loaded = true
 	status = "Ready"
 	if authority():
@@ -153,13 +158,13 @@ func send(peer: String, message: Dictionary) -> void:
 
 func snapshot() -> Dictionary:
 	snapshot_sequence += 1
-	return {"type":"snapshot", "sequence":snapshot_sequence, "generation":generation, "revision":revision, "source":source, "kind":source_kind, "position":player.get_playback_position(), "duration":player.get_duration(), "paused":player.is_paused() or not loaded or not player.is_playing(), "stamp":now()}
+	return {"type":"snapshot", "sequence":snapshot_sequence, "generation":generation, "revision":revision, "source":source, "kind":source_kind, "position":0.0 if source.is_empty() else player.get_playback_position(), "duration":0.0 if source.is_empty() else player.get_duration(), "paused":source.is_empty() or player.is_paused() or not loaded or not player.is_playing(), "stamp":now()}
 
 func send_snapshot(peer: String) -> void:
-	if not source.is_empty(): send(peer, snapshot())
+	send(peer, snapshot())
 
 func broadcast_snapshot() -> void:
-	if session.is_host() and not source.is_empty(): session.broadcast_control(JSON.stringify(snapshot()))
+	if session.is_host(): session.broadcast_control(JSON.stringify(snapshot()))
 
 func probe_clock() -> void:
 	if session.get_host_id().is_empty() or session.is_host(): return
@@ -215,6 +220,9 @@ func message_received(peer: String, message: Dictionary) -> void:
 			source_kind = message.kind
 			desired_paused = message.paused
 			sample = message
+			if source.is_empty():
+				if changed or loaded: clear_local_media()
+				return
 			if changed:
 				if source_kind == "file": local_path = local_files.get(source, "")
 				load_local(source if source_kind == "url" else local_path)
@@ -250,3 +258,24 @@ func _process(delta: float) -> void:
 	menu.play_button.disabled = source.is_empty()
 	menu.play_button.text = "Play" if source.is_empty() or player.is_paused() else "Pause"
 	menu.media_status.text = "%s  •  %.1f / %.1f s%s" % [status, player.get_playback_position(), player.get_duration(), "  • sync %+.0f ms" % (drift_seconds * 1000) if clock_ready else ""]
+
+func clear_local_media() -> void:
+	local_path = ""
+	loaded = false
+	desired_paused = true
+	awaiting_seek = false
+	sample.clear()
+	player.pause()
+	player.stop()
+	player.set_playback_speed(1.0)
+	status = "Host has no media loaded."
+	show_source("")
+
+func show_source(path: String) -> void:
+	var displayed := path if not path.is_empty() else source
+	menu.current_source.text = displayed
+	menu.current_source.tooltip_text = displayed
+	var report := JSON.stringify({"source":source, "kind":source_kind, "local_path":path if source_kind == "file" else ""})
+	if report != last_source_report:
+		last_source_report = report
+		printerr("[prim media] " + report)
