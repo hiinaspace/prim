@@ -1,10 +1,23 @@
 # Friends deployment
 
-Release candidate 2026-09-13: 0.3.5 for both launcher channels, combining host-file
+Published 2026-09-13: https://prim.hiina.space/ — 0.3.5 for both launcher channels, combining host-file
 streaming, voice-driven visemes, and the existing Linux portability fixes.
 Game inputs: `dist/prim-0.3.5-{linux,windows}`. Signed package output:
 `.local/launcher-production-035/{linux,windows}` in the streaming worktree.
 0.3.4 drafts were never published; keep them outside production feeds.
+The verified production output is also retained under the main checkout's
+`.local/launcher-production`, so later releases can generate deltas from 0.3.5.
+
+Source: Prim `0022fcf` on GitHub main, including merged visemes `31ff698`;
+public GNA `d9b61bc`. Previous bootstraps/feeds are backed up on chirashi at
+`/mnt/nvme/prim/.backup-before-0.3.5`. Upload hashes were verified before feeds
+were replaced. Public signature checks, range/cache headers, bootstrap checksums
+and a full Windows-package download hash passed. An isolated Ubuntu launcher
+updated from 0.3.3 to 0.3.5 through the public feed, restarted and verified its
+files with `/nix` hidden. That run used the full package because the isolated
+installation had no cached base; delta packages are available but their
+application was not retested for this release.
+
 
 The checks for this release are in `docs/TESTING.md`. Everyone must update because
 the room hello is now version 3. Packaging Windows requires `--runtime-directory`
