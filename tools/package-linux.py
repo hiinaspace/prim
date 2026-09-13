@@ -15,6 +15,8 @@ def copy(source,destination):
     destination.parent.mkdir(parents=True,exist_ok=True)
     shutil.copy2(source,destination); destination.chmod(0o755)
 seeds={Path(args.godot).resolve():out/'prim.bin',Path(args.mpv).resolve():out/'bin/linux/libmpv.so.2'}
+runtime = root / 'project/bin/linux/libonnxruntime.so'
+if not runtime.is_file(): raise RuntimeError('Run tools/fetch-viseme-runtime.py --platform linux first')
 for path in (root/'project/bin/linux').glob('*.so'):seeds[path]=out/'bin/linux'/path.name
 for path in (root/'project/addons/godot-steam-audio/bin').glob('*.so'):
     if path.name != 'libphonon.so' and '.linux.template_debug.x86_64.so' not in path.name: continue
@@ -88,3 +90,12 @@ for name in ['ATTRIBUTION.md', 'LICENSE_SAMPLES.txt']:
 for addon in ['vrm', 'Godot-MToon-Shader', 'renik']:
     for source in (root / 'project/addons' / addon).glob('LICENSE*'):
         shutil.copy2(source, notices / (addon + '-' + source.name))
+
+viseme_notices = out / 'licenses' / 'visemes'
+viseme_notices.mkdir(parents=True, exist_ok=True)
+for source in (root / 'native/viseme-model').iterdir():
+    if source.name in ['LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md', 'config.json']:
+        shutil.copy2(source, viseme_notices / source.name)
+for source in (root / '.local/viseme-runtime/linux').iterdir():
+    if source.name in ['LICENSE', 'ThirdPartyNotices.txt']:
+        shutil.copy2(source, viseme_notices / ('onnxruntime-' + source.name))

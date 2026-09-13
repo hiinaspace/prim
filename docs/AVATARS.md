@@ -34,6 +34,15 @@ The local camera sees the first-person mesh, the preview sees the complete local
 mesh, and peers see complete remote meshes. Both representations share one
 skeleton. VRM springbones run independently per avatar, including the local body.
 The preview is a camera view of the same live pose, not a second solver.
+
+For a single-player microphone/viseme test, open the **Avatar** tab, enable
+**Face close-up**, click **Unmute microphone**, and speak while watching the
+mirrored preview. No room connection or audio loopback is needed. Choose the
+input device and gain in the main tab if necessary. The microphone stays active
+when changing tabs and can be muted from either tab or the controller button.
+The status reads **MIC LOCAL PREVIEW** while offline. Connecting or disconnecting
+resets capture to muted; in a room, unmuting also sends voice to peers.
+
 Overlapping remote bodies hide within 35 cm of the viewer and return beyond 40 cm;
 their voice anchor and stream remain alive. This handles coincident spawn points.
 
@@ -58,9 +67,14 @@ motion are solved on each receiver. The native handshake version is now 2, so
 all room participants need an updated build.
 
 Deferred: robust arbitrary-proportion fitting, polished seated behavior, gesture
-expressions/emotes, animation menus, visemes, FBT, eye/face tracking, OSC and
+expressions/emotes, animation menus, FBT, eye/face tracking, OSC and
 sender-solved body replication. VRM springs do not implement interactive
 PhysBone grabbing/stretching or inter-avatar collisions.
+
+Voice-driven visemes now run locally from capture and remotely from decoded
+playout using Basis’s streaming OpenLipSync model. Alicia and Vita use their five
+vowels plus conservative consonant mixtures; authored Oculus viseme shapes take
+priority when present. See the [implementation and validation record](VISEME_PLAN.md).
 
 ## Vendored dependencies and assets
 
@@ -124,3 +138,27 @@ reported scaled-basis log spam and horizontal preview mirroring are fixed.
 Native Windows PCVR and multiplayer headset use still need a manual pass: Alicia preview, look down, reach/turn/crouch, controller
 and hand tracking loss/recovery, recenter, and a remote observer. No FBT session is
 part of that gate. Runtime robustness across many avatars remains future work.
+
+## Private VRM comparison (local development only)
+
+```sh
+./run.sh --test-vrm /path/to/model.vrm             # VR
+./run.sh --desktop --test-vrm /path/to/model.vrm   # desktop
+```
+
+The helper builds a disposable project under `.local/private-vrm-preview/project`,
+copies the supplied model there, imports it with the same first/third-person layer
+settings as the bundled avatars, and selects **Private VRM (local test)**. Open
+**Avatar**, enable **Face close-up**, and unmute. **Vowels only (compare)** switches
+between authored visemes and five-vowel approximations on that same model; leave
+it off for the full set. Alicia and Vita remain available in the picker.
+
+The preview has separate settings, no lobby secret and disabled networking. The
+original VRM, normal catalog and normal export inputs are unchanged. Private model
+copies and import caches remain under `.local` only; never distribute this scratch
+project. Exit and run normally to return to the regular game. This development
+helper is not the future user-model loading/distribution feature.
+
+Verified locally with `hiibcot2_v6.vrm`: the importer retains all 15 authored
+visemes and the comparison mode uses five authored vowels plus approximations.
+`testsana.vrm` only has five vowels, so it cannot demonstrate full-set fidelity.

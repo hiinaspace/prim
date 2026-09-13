@@ -5,6 +5,35 @@ The prototype expects the paired Godot build with the three interop/lifetime
 patches in `dependencies/godot-libmpv-zero/patches/godot`; stock Godot is not a
 supported runtime for this build.
 
+## Local build and launch helper
+
+On Linux x86-64 with Nix, run `./build.sh` from this checkout (or invoke it by
+absolute path). It enters the project's development shell, initializes missing
+submodules, builds missing patched Godot/mpv/Steam Audio dependencies, builds
+and stages the C++ and Rust extensions, fetches verified media and viseme
+runtimes, then imports the Godot project. `JOBS=8 ./build.sh` changes C++ build
+parallelism. Existing dependency working trees and lobby secrets are preserved.
+Staged `.local` dependency outputs are reused for fast iteration; use
+`./build.sh --refresh-deps` to rebuild them from the pinned flake after dependency
+changes. A first build or dependency refresh can take substantially longer.
+
+Run `./run.sh` for VR after starting the headset runtime, `./run.sh --desktop`
+for desktop mode, or `./run.sh --editor` for the patched editor. The launcher sets
+libmpv and media-helper paths and enters the same Nix shell. It does not rebuild;
+repeat `./build.sh` after native changes. GDScript changes need only a restart.
+Use `./run.sh --desktop --test-vrm /path/model.vrm` for an isolated offline
+private-avatar comparison; see [avatars](AVATARS.md#private-vrm-comparison-local-development-only).
+Additional arguments go to Godot, for example:
+
+```sh
+./run.sh --desktop --headless --quit-after 90
+```
+
+A new checkout gets a random private lobby secret if none exists. Peers must
+share that same private file to discover each other. These helpers build a local
+Linux development tree; distribution packaging and Windows builds remain the
+separate workflows below.
+
 ## Linux
 
 The video dependency's flake exports `godot-interop`, `mpv`, and `steam-audio`.
@@ -134,3 +163,33 @@ For a mixed integration test, export `tests/integration.gd` instead and set
 `WINEPREFIX`, when running `tools/test-integration.py`. Wine must use its builtin
 Vulkan loader (`WINEDLLOVERRIDES=vulkan-1=b`); the runner sets this for its client.
 Native Windows uses the normal Windows loader.
+
+## Voice viseme runtime and checks
+
+Before packaging either platform, stage the hash-pinned CPU ONNX Runtime:
+
+```sh
+python3 tools/fetch-viseme-runtime.py --platform all
+cargo build
+cp target/debug/libprim_native.so project/bin/linux/
+```
+
+The model is embedded in the native extension. Keep `native/viseme-model` notices
+with distributions; packaging copies these and ONNX Runtime notices automatically.
+The runtime can be overridden for diagnostics with `PRIM_ONNXRUNTIME_LIBRARY`.
+
+```sh
+python3 tools/fetch-viseme-fixture.py # requires ffmpeg; media stays in .local
+PRIM_TEST_SPEECH_PCM="$PWD/.local/viseme/speech.f32" "$GODOT" --headless --path project --xr-mode off --script res://tests/visemes.gd
+PRIM_VISEME_PREVIEW="$PWD/.local/viseme-preview.png" "$GODOT" --path project --xr-mode off --script res://tests/viseme_preview.gd
+cargo build --example viseme_probe
+python3 tools/test-viseme-reference.py .local/viseme/speech.f32 --rate 48000 --runtime project/bin/linux/libonnxruntime.so --out .local/viseme/parity-48000
+```
+
+The reference check requires NumPy and Python ONNX Runtime. Repeat with the
+fixture's 16000 and 44100 Hz files. For the missing-runtime case add
+`PRIM_TEST_NO_ORT=1 PRIM_ONNXRUNTIME_LIBRARY=/nonexistent/onnxruntime.so` to the
+speech test. The regular process integration test also checks live visemes.
+For packaged tests export `tests/visemes.gd` with `export-test-pack.py`, replace
+`prim.pck` in a disposable test bundle, and pass the PCM fixture environment
+variable (a Windows path under Wine). Templates may reject `--main-pack`.

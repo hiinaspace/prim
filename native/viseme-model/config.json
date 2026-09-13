@@ -1,0 +1,144 @@
+{
+  "model": {
+    "name": "viseme_tcn_streaming",
+    "num_visemes": 15,
+    "viseme_names": [
+      "sil",
+      "PP",
+      "FF",
+      "TH",
+      "DD",
+      "kk",
+      "CH",
+      "SS",
+      "nn",
+      "RR",
+      "aa",
+      "E",
+      "ih",
+      "oh",
+      "ou"
+    ],
+    "channels": 256,
+    "receptive_field_frames": 157,
+    "lookahead_frames": 2,
+    "lookahead_ms": 20.0,
+    "multi_label": true,
+    "output_activation": "sigmoid",
+    "normalization": "baked_into_graph",
+    "calibrated": true,
+    "calibration_offsets": [
+      0.30194856192378206,
+      0.9284634215062313,
+      1.7086281007093644,
+      1.0924372369901776,
+      0.6275711289689343,
+      1.123973721613853,
+      1.437463672367377,
+      1.0254354592428103,
+      0.8031524594389663,
+      1.4564248482572109,
+      0.7511057803708603,
+      0.9606943580572056,
+      0.5072432874485779,
+      1.6793665726080995,
+      1.0898903879811326
+    ],
+    "_note": "The graph consumes RAW dB mel and applies CMVN internally. Do NOT normalize in C#. The previous model was trained on per-utterance normalized mel that C# never applied, costing 12.7 points of accuracy."
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "n_fft": 1024,
+    "window_length_samples": 400,
+    "hop_length_samples": 160,
+    "n_mels": 80,
+    "fmin": 50.0,
+    "fmax": 8000.0,
+    "fps": 100.0,
+    "window": "hann_symmetric",
+    "mel_scale": "htk",
+    "bin_edges": "(n_fft+1)*hz/sr",
+    "log": "10*log10(max(power,1e-10))",
+    "normalization": "none - the model does it"
+  },
+  "streaming": {
+    "input": "audio_features (1,1,80) + cache_i",
+    "output": "viseme_logits (1,1,15) + cache_out_i",
+    "num_caches": 10,
+    "cache_shapes": [
+      [
+        1,
+        256,
+        2
+      ],
+      [
+        1,
+        256,
+        4
+      ],
+      [
+        1,
+        256,
+        8
+      ],
+      [
+        1,
+        256,
+        16
+      ],
+      [
+        1,
+        256,
+        32
+      ],
+      [
+        1,
+        256,
+        64
+      ],
+      [
+        1,
+        256,
+        2
+      ],
+      [
+        1,
+        256,
+        4
+      ],
+      [
+        1,
+        256,
+        8
+      ],
+      [
+        1,
+        256,
+        16
+      ]
+    ],
+    "macs_per_frame": 2653440
+  },
+  "metrics": {
+    "acc": 0.8047916471246559,
+    "macro_f1": 0.7823456632796285,
+    "macro_f1_nosil": 0.7727920709676799,
+    "per_viseme_f1": {
+      "sil": 0.9160959556469096,
+      "PP": 0.802608561126251,
+      "FF": 0.8093188482069017,
+      "TH": 0.6829390842137275,
+      "DD": 0.7642030605434355,
+      "kk": 0.8268433884079193,
+      "CH": 0.8189914643369812,
+      "SS": 0.8788855884461743,
+      "nn": 0.7874846702442606,
+      "RR": 0.8305792860169282,
+      "aa": 0.7104192731090586,
+      "E": 0.7591184481401252,
+      "ih": 0.7774613688504834,
+      "oh": 0.6297321364106762,
+      "ou": 0.7405038154945959
+    }
+  }
+}

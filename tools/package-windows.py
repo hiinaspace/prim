@@ -12,6 +12,7 @@ p.add_argument('--strip', default='x86_64-w64-mingw32-strip')
 p.add_argument('--runtime-directory', type=Path, action='append', default=[])
 a = p.parse_args(); build=a.build_directory.resolve(); out=a.out.resolve(); out.mkdir(parents=True,exist_ok=True)
 seeds = {
+    root/'project/bin/windows/onnxruntime.dll': 'onnxruntime.dll',
     build/'godot/bin/godot.windows.template_debug.x86_64.exe': 'prim.exe',
     build/'rust-build/x86_64-pc-windows-gnu/debug/prim_native.dll': 'prim_native.dll',
     build/'video-build/bin/libmpv_zero.windows.template_debug.x86_64.dll': 'libmpv_zero.windows.template_debug.x86_64.dll',
@@ -55,3 +56,12 @@ for name in ['ATTRIBUTION.md', 'LICENSE_SAMPLES.txt']:
 for addon in ['vrm', 'Godot-MToon-Shader', 'renik']:
     for source in (root / 'project/addons' / addon).glob('LICENSE*'):
         shutil.copy2(source, notices / (addon + '-' + source.name))
+
+viseme_notices = out / 'licenses' / 'visemes'
+viseme_notices.mkdir(parents=True, exist_ok=True)
+for source in (root / 'native/viseme-model').iterdir():
+    if source.name in ['LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md', 'config.json']:
+        shutil.copy2(source, viseme_notices / source.name)
+for source in (root / '.local/viseme-runtime/windows').iterdir():
+    if source.name in ['LICENSE', 'ThirdPartyNotices.txt']:
+        shutil.copy2(source, viseme_notices / ('onnxruntime-' + source.name))

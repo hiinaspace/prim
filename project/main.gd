@@ -12,6 +12,7 @@ const Playback = preload("res://media/playback.gd")
 @onready var left: XRController3D = $XROrigin3D/LeftController
 @onready var right: XRController3D = $XROrigin3D/RightController
 @onready var player = $MPVPlayer
+var visemes: Node
 var local_avatar: PrimAvatarDriver
 var avatar_id := "alicia"
 var avatar_height := 1.6
@@ -110,6 +111,9 @@ func _ready() -> void:
 	sender.capture_on_worker = true
 	add_child(sender)
 	sender.stop_capture()
+	visemes = ClassDB.instantiate("PrimVisemes")
+	add_child(visemes)
+	visemes.attach_local(sender)
 	sender.encoder_error.connect(func(message):
 		status_text = "Microphone: " + message
 		set_muted.call_deferred(true))
@@ -210,15 +214,14 @@ func toggle_connection() -> void:
 		status_text = "Connecting…"
 
 func toggle_microphone() -> void:
-	if not session.is_active():
-		status_text = "Connect to friends before enabling the microphone."
-		return
 	set_muted(not muted)
 
 func set_muted(value: bool) -> void:
 	muted = value
 	if muted:
 		sender.stop_capture()
+		if visemes: visemes.reset_source("local")
+		if local_avatar: local_avatar.reset_visemes()
 	else:
 		if sender.has_method("set_input_gain_db"): sender.set_input_gain_db(menu.gain.value)
 		sender.start_capture()
@@ -237,12 +240,14 @@ func peer_connected(peer: String, peer_name: String) -> void:
 	var avatar := Avatar.new()
 	add_child(avatar)
 	avatar.setup(peer_name, session.receive_stream(peer))
+	visemes.attach_remote(peer, session.receive_stream(peer))
 	avatars[peer] = avatar
 	session.send_control(peer, JSON.stringify(local_avatar_state()))
 	update_voice_volumes()
 	playback.peer_joined(peer)
 
 func peer_disconnected(peer: String) -> void:
+	visemes.remove_source(peer)
 	if avatars.has(peer):
 		avatars[peer].retire()
 		avatars.erase(peer)
@@ -365,12 +370,16 @@ func _process(delta: float) -> void:
 	if head_valid and not local_avatar.visible: local_avatar.ready_pose = false
 	local_avatar.visible = head_valid
 	local_avatar.apply_frame(avatar_frame.poses, avatar_frame.tracked, avatar_frame.fingers, avatar_frame.masks, avatar_frame.curls)
+	local_avatar.apply_visemes(visemes.get_weights("local"), delta)
+	for peer in avatars:
+		if avatars[peer].body: avatars[peer].body.apply_visemes(visemes.get_weights(peer), delta)
 	update_calibration(delta)
-	var preview_target := camera.global_position - Vector3.UP * avatar_height * 0.45
+	var close_up: bool = menu.avatar_close_up.button_pressed
+	var preview_target := camera.global_position - Vector3.UP * avatar_height * (0.035 if close_up else 0.45)
 	var preview_forward := -camera.global_basis.z
 	preview_forward.y = 0
 	if preview_forward.length_squared() < 0.01: preview_forward = Vector3.FORWARD
-	menu.avatar_camera.global_position = preview_target + preview_forward.normalized() * avatar_height * 1.8
+	menu.avatar_camera.global_position = preview_target + preview_forward.normalized() * avatar_height * (0.4 if close_up else 1.8)
 	menu.avatar_camera.look_at(preview_target)
 	menu.avatar_preview.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE if menu.visible else SubViewport.UPDATE_DISABLED
 	pose_elapsed += delta
@@ -379,7 +388,10 @@ func _process(delta: float) -> void:
 		sequence = (sequence + 1) & 0xffffffff
 		session.send_pose(Pose.encode(sequence, avatar_frame.poses, avatar_frame.tracked, avatar_frame.fingers, avatar_frame.masks, avatar_frame.curls, avatar_epoch, avatar_reset_epoch))
 	menu.connection_button.text = "Disconnect" if session.is_active() else "Connect to friends"
-	menu.status.text = "%s • %d/6 people • %s" % [status_text, avatars.size() + 1, "mic muted" if muted else "MIC LIVE"]
+	menu.avatar_mic_button.text = "Unmute microphone" if muted else "Mute microphone"
+	menu.avatar_mic_status.text = "Speak to animate your avatar. Local preview only." if not session.is_active() else "Microphone audio is shared with this room when unmuted."
+	var mic_status := "mic muted" if muted else ("MIC LIVE" if session.is_active() else "MIC LOCAL PREVIEW")
+	menu.status.text = "%s • %d/6 people • %s" % [status_text, avatars.size() + 1, mic_status]
 	if sender.has_method("get_input_peak_db"): menu.meter.value = sender.get_input_peak_db()
 
 func rotate_about_head(angle: float) -> void:

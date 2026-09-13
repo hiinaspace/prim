@@ -1,6 +1,9 @@
 class_name PrimAvatarDriver
 extends Node3D
 
+const Expressions = preload("res://avatars/expressions.gd")
+var expressions: PrimAvatarExpressions
+
 const Catalog = preload("res://avatars/catalog.gd")
 const Spine = preload("res://addons/renik/renik_spine.gd")
 const Limb = preload("res://addons/renik/renik_limb.gd")
@@ -42,6 +45,8 @@ func configure(id: String, height: float, local_body: bool) -> bool:
 	model.scale = Vector3.ONE * model_scale
 	prepare_meshes(model, local_body)
 	add_child(model)
+	expressions = Expressions.new()
+	expressions.configure(model)
 	head_target = marker("HeadTarget", head_rest)
 	hips_target = marker("HipsTarget", skeleton.get_bone_global_rest(skeleton.find_bone("Hips")))
 	for side in ["Left", "Right"]:
@@ -155,3 +160,9 @@ func reset_springs() -> void:
 		for i in range(secondary.spring_bones_internal.size()):
 			var center: int = secondary.springs_centers[i]
 			secondary.spring_bones_internal[i].setup(secondary.center_transforms_inv[center], true)
+
+func apply_visemes(weights: PackedFloat32Array, delta: float) -> void:
+	if expressions: expressions.apply(weights, delta)
+
+func reset_visemes() -> void:
+	if expressions: expressions.reset()

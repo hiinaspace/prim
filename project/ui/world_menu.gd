@@ -27,6 +27,9 @@ var height_label: Label
 var avatar_status: Label
 var avatar_preview: SubViewport
 var avatar_camera: Camera3D
+var avatar_mic_button: Button
+var avatar_mic_status: Label
+var avatar_close_up: CheckButton
 var viewport: SubViewport
 var url: LineEdit
 var current_source: LineEdit
@@ -405,6 +408,13 @@ func build_avatar_menu(tabs: TabContainer) -> void:
 	button(column, "Measure / recalibrate standing height", func(): calibration_requested.emit())
 	avatar_status = label(column, "Stand upright and look forward when measuring. Headset and hands only.")
 	avatar_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	row = horizontal(column)
+	avatar_mic_button = button(row, "Unmute microphone", func(): microphone_toggled.emit())
+	avatar_close_up = CheckButton.new()
+	avatar_close_up.text = "Face close-up"
+	row.add_child(avatar_close_up)
+	avatar_mic_status = label(column, "Speak to animate your avatar. Local preview only.")
+	avatar_mic_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	avatar_preview = SubViewport.new()
 	avatar_preview.size = Vector2i(700,700)
 	avatar_preview.transparent_bg = false

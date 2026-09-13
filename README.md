@@ -14,6 +14,20 @@ adjusts standing eye height. RenIK uses the headset and hands; articulated finge
 and springbones run locally. See [avatars](docs/AVATARS.md) for the experimental
 fit, asset provenance, and deferred features. All peers need the updated build.
 
+For local Linux development (Nix required):
+
+```sh
+./build.sh
+./run.sh             # VR; start your headset runtime first
+./run.sh --desktop   # desktop mode
+./run.sh --editor    # patched Godot editor
+```
+
+The build stages the patched engine, media/audio extensions and viseme runtime.
+Repeat it after native changes; GDScript changes need only a restart. Use
+`./build.sh --refresh-deps` after changing pinned engine/media dependencies. The first
+build can take a while; subsequent builds reuse Nix and Cargo caches.
+
 See [building](docs/BUILDING.md), [protocol boundaries](docs/PROTOCOL.md), and
 [private build testing](docs/TESTING.md). Automated Linux, six-client, public-DHT
 and mixed Linux/Windows-under-Wine checks have passed. Native Windows and headset

@@ -26,6 +26,26 @@ func run() -> void:
 	app = load("res://main.tscn").instantiate()
 	root.add_child(app)
 	check(not app.sender.is_capturing(), "microphone starts muted")
+	check(await wait_for(func(): return app.visemes.get_status() != "loading", 10), "viseme initialization completes")
+	check(app.visemes.get_status() == "ready", "viseme model available")
+	if role == "host":
+		app.select_device(OS.get_environment("PULSE_SOURCE"))
+		app.menu.avatar_mic_button.pressed.emit()
+		check(app.sender.is_capturing() and not app.session.is_active(), "avatar mirror enables local-only microphone")
+		check(await wait_for(func(): return app.visemes.get_stats("local").get("hops", 0) > 35, 5), "singleplayer microphone drives visemes")
+		check(app.local_avatar.expressions.owned.any(func(bind): return bind[0].get_blend_shape_value(bind[1]) > 0.001), "singleplayer mirror mouth animates")
+		app.menu.avatar_close_up.button_pressed = true
+		app.menu.avatar_picker.get_parent().get_parent().current_tab = 1
+		await process_frame
+		check(app.menu.avatar_camera.global_position.distance_to(app.camera.global_position) < 1.0, "mirror face close-up")
+		await RenderingServer.frame_post_draw
+		app.menu.viewport.get_texture().get_image().save_png(output + "-mirror.png")
+		app.menu.avatar_mic_button.pressed.emit()
+		check(app.muted and not app.sender.is_capturing() and app.visemes.get_weights("local").count(0.0) == 15, "mirror mute stops capture and clears mouth")
+		app.menu.avatar_close_up.button_pressed = false
+		app.menu.avatar_picker.get_parent().get_parent().current_tab = 0
+		app.toggle_microphone()
+		await create_timer(0.3).timeout
 	app.session.message_received.connect(receive)
 	app.session.status_changed.connect(func(value): print("NETWORK ", value))
 	app.session.network_error.connect(func(value): print("NETWORK_ERROR ", value))
@@ -37,6 +57,7 @@ func run() -> void:
 		app.playback.request_source(OS.get_environment("PRIM_TEST_MEDIA"))
 		check(await wait_for(func(): return app.playback.loaded and not app.player.is_paused()), "client plays local media before joining")
 	app.toggle_connection()
+	check(app.muted and not app.sender.is_capturing(), "joining resets local preview to muted")
 	check(await wait_for(func(): return app.avatars.size() == expected_peers), "peer connected")
 	if app.avatars.is_empty(): finish(); return
 	peer = app.avatars.keys()[0]
@@ -80,7 +101,9 @@ func run() -> void:
 	var before: int = app.sender.get_captured_input_frames()
 	# This blocks only this process's Godot main thread; native capture/transport
 	# and the receiving client's audio thread should continue.
+	var viseme_before: int = app.visemes.get_stats("local").get("hops", 0)
 	OS.delay_msec(700)
+	check(app.visemes.get_stats("local").get("hops", 0) - viseme_before > 30, "viseme analysis survives main-thread stall")
 	var after: int = app.sender.get_captured_input_frames()
 	check(after - before > 20000, "microphone capture survives 700 ms main-thread stall")
 	await create_timer(2.0).timeout
@@ -92,6 +115,7 @@ func run() -> void:
 	check(replies.get("resumed", {}).get("voice_frames", 0) > 10000, "remote voice decoded and mixed")
 	for remote in app.avatars:
 		check(app.avatars[remote].last_sequence > 10, "remote poses applied")
+		check(app.visemes.get_stats(remote).get("hops", 0) > 100, "each remote viseme stream advances")
 		check(app.session.receive_stream(remote).get_stats().get("non_silent_output_frames", 0) > 10000, "each remote voice mixed")
 	check(app.avatars[peer].talking, "decoded remote audio lights talking indicator")
 	await verify_avatar_replication()
@@ -101,8 +125,10 @@ func run() -> void:
 	var stopped: int = app.sender.get_captured_input_frames()
 	await create_timer(0.5).timeout
 	check(not app.sender.is_capturing() and app.sender.get_captured_input_frames() == stopped, "mute stops capture")
+	check(app.visemes.get_weights("local").count(0.0) == 15, "mute clears local visemes")
 	await ask("muted")
 	check(replies.get("muted", {}).get("voice_paused", false), "mute drains to intentional silence")
+	check(replies.get("muted", {}).get("mouth_closed", false), "mute closes remote mouth")
 	var old_frames: float = replies.get("muted", {}).get("voice_frames", 0)
 	app.set_muted(false)
 	await create_timer(1.2).timeout
@@ -132,7 +158,7 @@ func receive(id: String, raw: String) -> void:
 	if message.get("type") == "test_probe":
 		var stream = app.session.receive_stream(id)
 		var stats: Dictionary = stream.get_stats()
-		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "displayed_source":app.menu.current_source.text, "avatar":app.avatars[id].body.avatar_id if app.avatars[id].body else "", "voice_id":str(app.avatars[id].voice.get_instance_id()), "finger_mask":app.avatars[id].frame.get("masks",[0,0])[0], "finger_y":app.avatars[id].frame.get("fingers",[Quaternion.IDENTITY])[0].y}))
+		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "viseme_hops":app.visemes.get_stats(id).get("hops",0), "mouth_closed":app.visemes.get_weights(id).count(0.0)==15, "displayed_source":app.menu.current_source.text, "avatar":app.avatars[id].body.avatar_id if app.avatars[id].body else "", "voice_id":str(app.avatars[id].voice.get_instance_id()), "finger_mask":app.avatars[id].frame.get("masks",[0,0])[0], "finger_y":app.avatars[id].frame.get("fingers",[Quaternion.IDENTITY])[0].y}))
 	elif message.get("type") == "test_idle_ready":
 		replies["idle/" + id] = true
 	elif message.get("type") == "test_reply":
