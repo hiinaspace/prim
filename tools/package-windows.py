@@ -35,6 +35,9 @@ while queue:
         dependency=index.get(name.lower())
         if dependency: queue.append(dependency)
         else: external.add(name.lower())
+missing_compiler_runtime = sorted(name for name in external if name.startswith(('libgcc', 'libstdc++', 'libwinpthread', 'libmcfgthread')))
+if missing_compiler_runtime:
+    raise RuntimeError('Missing compiler runtime DLLs; provide --runtime-directory: ' + ', '.join(missing_compiler_runtime))
 # Keep full debug information in build outputs; ship the smaller runtime DLLs.
 for name in seeds.values():
     subprocess.run([a.strip,'--strip-debug',str(out/name)],check=True)

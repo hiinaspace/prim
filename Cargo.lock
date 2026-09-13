@@ -3090,6 +3090,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "bytes",
+ "futures-lite",
  "godot",
  "godot_network_audio",
  "iroh",

@@ -1,3 +1,4 @@
+mod media;
 mod network;
 mod session;
 pub mod viseme;

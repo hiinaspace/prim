@@ -25,6 +25,12 @@ if not (OUT / 'media.mp4').exists():
     subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=640x360:rate=30','-f','lavfi','-i','sine=frequency=330:sample_rate=48000','-t','60','-c:v','libx264','-preset','ultrafast','-pix_fmt','yuv420p','-c:a','aac',str(OUT/'media.mp4')], check=True)
 if not (OUT/'mic.wav').exists():
     subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','lavfi','-i','sine=frequency=620:sample_rate=48000','-t','65','-af','volume=3','-ac','2',str(OUT/'mic.wav')], check=True)
+host_file = OUT / 'media.mp4'
+if os.environ.get('PRIM_TEST_CONTAINER') == 'mkv':
+    captions = OUT / 'captions.srt'
+    captions.write_text('1\n00:00:00,000 --> 00:00:30,000\nPrim shared-file subtitle fixture\n')
+    host_file = OUT / 'media.mkv'
+    subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(OUT/'media.mp4'), '-i', str(captions), '-map', '0', '-map', '1', '-c', 'copy', str(host_file)], check=True)
 class Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_): pass
     def send_head(self):
@@ -72,6 +78,7 @@ try:
     processes.append(tone)
     base = os.environ.copy()
     base.update(DISPLAY=base.get('DISPLAY',':0'), PRIM_NETWORK_LOCAL_ONLY='1', PULSE_SOURCE=mic+'.monitor', PULSE_SINK=speaker, PRIM_TEST_MEDIA=f'http://127.0.0.1:{server.server_port}/media.mp4')
+    base['PRIM_TEST_HOST_FILE'] = str(host_file)
     base.pop('PRIM_AUTOJOIN',None)
     base.pop('PRIM_MEDIA',None)
     godot = os.environ.get('GODOT','godot')

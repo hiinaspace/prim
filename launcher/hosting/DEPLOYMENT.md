@@ -1,6 +1,16 @@
 # Friends deployment
 
-Updated 2026-09-13: https://prim.hiina.space/ — Linux launcher 0.3.3, Windows launcher 0.3.2; same VRM game/protocol.
+Release candidate 2026-09-13: 0.3.5 for both launcher channels, combining host-file
+streaming, voice-driven visemes, and the existing Linux portability fixes.
+Game inputs: `dist/prim-0.3.5-{linux,windows}`. Signed package output:
+`.local/launcher-production-035/{linux,windows}` in the streaming worktree.
+0.3.4 drafts were never published; keep them outside production feeds.
+
+The checks for this release are in `docs/TESTING.md`. Everyone must update because
+the room hello is now version 3. Packaging Windows requires `--runtime-directory`
+pointing to the MinGW mcfgthread runtime; missing compiler DLLs now fail packaging.
+
+Previous live deployment: Linux 0.3.3, Windows 0.3.2; same VRM game/protocol.
 
 Linux 0.3.3 fixes the Nix-specific .NET runtime/apphost packs, libmpv's absolute
 mujs dependency, and host graphics-library discovery. Its game input is

@@ -21,6 +21,7 @@ var clock_ready := false
 var elapsed := 0.0
 var correction_elapsed := 0.0
 var awaiting_seek := false
+var was_buffering := false
 var status := "Choose a video to begin."
 var last_snapshot_sequence := -1
 var snapshot_sequence := 0
@@ -28,6 +29,9 @@ var pending_probes := {}
 var probe_sequence := 0
 var drift_seconds := 0.0
 var last_source_report := ""
+var pending_share_path := ""
+var waiting_peer_file := false
+var media_elapsed := 0.0
 
 static func now() -> float:
 	return Time.get_ticks_usec() / 1000000.0
@@ -39,13 +43,17 @@ static func valid_snapshot(message: Dictionary) -> bool:
 	for key in ["generation", "revision", "sequence", "position", "stamp", "duration"]:
 		if not message.get(key) is float and not message.get(key) is int: return false
 		if not is_finite(float(message[key])): return false
-	return message.get("source") is String and message.source.length() <= 4096 and message.get("kind") in ["url", "file"] and message.get("paused") is bool and message.position >= 0 and message.duration >= 0 and message.generation >= 0 and message.revision >= 0
+	return message.get("source") is String and message.source.length() <= 4096 and message.get("kind") in ["url", "file", "peer_file"] and message.get("paused") is bool and message.position >= 0 and message.duration >= 0 and message.generation >= 0 and message.revision >= 0
 
 func _ready() -> void:
+	menu.share_file_requested.connect(share_file)
+	menu.stop_share_requested.connect(stop_share)
+	menu.relay_decided.connect(func(id, peer, allow): session.allow_media_relay(id, peer, allow))
+	menu.media_limit_changed.connect(func(mbps): session.set_media_upload_limit(mbps))
 	player.file_loaded.connect(file_loaded)
 	player.playback_error.connect(func(message):
 		loaded = false
-		status = "Playback error: " + message)
+		status = "Shared file playback error." if source_kind == "peer_file" else "Playback error: " + message)
 	player.playback_finished.connect(func():
 		desired_paused = true
 		status = "Finished")
@@ -73,6 +81,10 @@ func request_source(value: String) -> void:
 		send(session.get_host_id(), {"type":"request", "action":"source", "source":descriptor, "kind":"url" if remote else "file"})
 
 func set_source(value: String, kind: String) -> void:
+	if kind != "peer_file":
+		session.stop_sharing()
+		pending_share_path = ""
+		waiting_peer_file = false
 	source = value
 	source_kind = kind
 	generation += 1
@@ -83,6 +95,7 @@ func set_source(value: String, kind: String) -> void:
 	broadcast_snapshot()
 
 func load_local(path: String) -> void:
+	was_buffering = false
 	show_source(path)
 	loaded = false
 	awaiting_seek = true
@@ -126,6 +139,7 @@ func apply_action(action: String, value: float) -> void:
 	broadcast_snapshot()
 
 func host_changed() -> void:
+	session.set_media_upload_limit(int(menu.upload_limit.value))
 	clock_ready = false
 	best_rtt = INF
 	last_snapshot_sequence = -1
@@ -139,6 +153,12 @@ func host_changed() -> void:
 		send(session.get_host_id(), {"type":"hello"})
 
 func left_room() -> void:
+	pending_share_path = ""
+	waiting_peer_file = false
+	if source_kind == "peer_file":
+		source = ""
+		clear_local_media()
+		status = "Host stopped sharing."
 	sample.clear()
 	clock_ready = false
 	best_rtt = INF
@@ -224,19 +244,38 @@ func message_received(peer: String, message: Dictionary) -> void:
 				if changed or loaded: clear_local_media()
 				return
 			if changed:
-				if source_kind == "file": local_path = local_files.get(source, "")
-				load_local(source if source_kind == "url" else local_path)
+				waiting_peer_file = false
+				if source_kind == "peer_file":
+					loaded = false
+					player.stop()
+					waiting_peer_file = session.receive_file(source)
+					status = "Connecting to shared file…" if waiting_peer_file else "Invalid shared file."
+					show_source("")
+				else:
+					session.stop_sharing()
+					if source_kind == "file": local_path = local_files.get(source, "")
+					load_local(source if source_kind == "url" else local_path)
 			else: correct(new_revision)
 
 func correct(force: bool = false) -> void:
 	if authority() or not loaded or sample.is_empty() or not clock_ready: return
 	if player.has_method("get_playback_state"):
 		var state: Dictionary = player.get_playback_state()
+		if state.get("buffering", false):
+			was_buffering = true
+			return
 		if state.get("seeking", false) or state.get("loading", false): return
+		if was_buffering:
+			# Recover room time immediately after a stalled download.
+			force = true
+			was_buffering = false
 	var target := target_position(sample, now() + host_offset)
 	if player.get_duration() > 0: target = minf(target, player.get_duration())
 	drift_seconds = target - float(player.get_playback_position())
-	if awaiting_seek or (force and absf(drift_seconds) > 0.12) or absf(drift_seconds) > 0.75:
+	# Range downloads can delay an asynchronous seek even without mpv reporting
+	# buffering. Do not spend tens of seconds speed-correcting that startup lag.
+	var seek_threshold := 0.25 if source_kind == "peer_file" else 0.75
+	if awaiting_seek or (force and absf(drift_seconds) > 0.12) or absf(drift_seconds) > seek_threshold:
 		player.seek(target)
 		awaiting_seek = false
 		if player.has_method("set_playback_speed"): player.set_playback_speed(1.0)
@@ -245,6 +284,10 @@ func correct(force: bool = false) -> void:
 	player.set_paused(desired_paused)
 
 func _process(delta: float) -> void:
+	media_elapsed += delta
+	if media_elapsed >= 0.25:
+		media_elapsed = 0.0
+		poll_shared_media()
 	elapsed += delta
 	correction_elapsed += delta
 	if elapsed >= 1.0:
@@ -260,6 +303,8 @@ func _process(delta: float) -> void:
 	menu.media_status.text = "%s  •  %.1f / %.1f s%s" % [status, player.get_playback_position(), player.get_duration(), "  • sync %+.0f ms" % (drift_seconds * 1000) if clock_ready else ""]
 
 func clear_local_media() -> void:
+	session.stop_sharing()
+	waiting_peer_file = false
 	local_path = ""
 	loaded = false
 	desired_paused = true
@@ -273,9 +318,49 @@ func clear_local_media() -> void:
 
 func show_source(path: String) -> void:
 	var displayed := path if not path.is_empty() else source
+	if source_kind == "peer_file" and not source.is_empty():
+		var descriptor: Variant = JSON.parse_string(source)
+		displayed = descriptor.get("name", "Shared video") if descriptor is Dictionary else "Shared video"
 	menu.current_source.text = displayed
 	menu.current_source.tooltip_text = displayed
-	var report := JSON.stringify({"source":source, "kind":source_kind, "local_path":path if source_kind == "file" else ""})
+	var report := JSON.stringify({"source":displayed if source_kind == "peer_file" else source, "kind":source_kind, "local_path":path if source_kind == "file" else ""})
 	if report != last_source_report:
 		last_source_report = report
 		printerr("[prim media] " + report)
+
+func share_file(path: String) -> void:
+	if not session.is_host(): return
+	if session.share_file(ProjectSettings.globalize_path(path)):
+		pending_share_path = ProjectSettings.globalize_path(path)
+		status = "Opening shared file…"
+
+func stop_share() -> void:
+	if not authority(): return
+	session.stop_sharing()
+	pending_share_path = ""
+	set_source("", "url")
+	clear_local_media()
+	broadcast_snapshot()
+
+func poll_shared_media() -> void:
+	var parsed: Variant = JSON.parse_string(session.media_state())
+	var state: Dictionary = parsed if parsed is Dictionary else {}
+	if state.get("hosted", false) and state.get("descriptor") is Dictionary and player.get_duration() > 0:
+		state["average_mbps"] = float(state.descriptor.size) * 8.0 / player.get_duration() / 1000000.0
+	menu.update_media_share(session.is_host(), state)
+	var descriptor: Variant = state.get("descriptor")
+	if not pending_share_path.is_empty() and state.get("hosted", false) and descriptor is Dictionary:
+		local_path = pending_share_path
+		pending_share_path = ""
+		set_source(JSON.stringify(descriptor), "peer_file")
+	elif waiting_peer_file and descriptor is Dictionary and not state.get("url", "").is_empty():
+		var expected: Variant = JSON.parse_string(source)
+		if expected is Dictionary and expected.get("id") == descriptor.get("id"):
+			waiting_peer_file = false
+			load_local(state.url)
+	if (source_kind == "peer_file" or not pending_share_path.is_empty()) and not state.get("status", "").is_empty(): status = state.status
+	if session.is_host():
+		for viewer in state.get("viewers", {}).values():
+			if viewer.get("path") == "relay" and viewer.get("consent") == "pending":
+				status = "A viewer needs relay approval. Open the Sharing tab."
+				break

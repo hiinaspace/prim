@@ -6,6 +6,10 @@ signal height_changed(height: float)
 signal calibration_requested
 
 signal source_requested(source: String)
+signal share_file_requested(path: String)
+signal stop_share_requested
+signal relay_decided(media_id: String, peer: String, allow: bool)
+signal media_limit_changed(mbps: int)
 signal playback_toggled
 signal seek_requested(seconds: float)
 signal connection_toggled
@@ -33,6 +37,12 @@ var avatar_close_up: CheckButton
 var viewport: SubViewport
 var url: LineEdit
 var current_source: LineEdit
+var share_button: Button
+var stop_share_button: Button
+var relay_rows: VBoxContainer
+var relay_signature := ""
+var share_summary: Label
+var upload_limit: SpinBox
 var xr_controls: Label
 var display_name: LineEdit
 var connection_button: Button
@@ -139,6 +149,44 @@ func _ready() -> void:
 	row.add_child(url)
 	button(row, "Paste", func(): url.text = DisplayServer.clipboard_get().strip_edges())
 	button(row, "Open", func(): source_requested.emit(url.text))
+	var share_column := VBoxContainer.new()
+	share_column.name = "Sharing"
+	share_column.add_theme_constant_override("separation", 14)
+	tabs.add_child(share_column)
+	label(share_column, "SHARE A VIDEO FILE")
+	var share_path := LineEdit.new()
+	share_path.placeholder_text = "Local file path (optional; leave empty to browse)"
+	share_path.max_length = 4096
+	share_path.text_submitted.connect(func(path): share_file_requested.emit(path))
+	share_column.add_child(share_path)
+	row = horizontal(share_column)
+	button(row, "Paste path", func(): share_path.text = DisplayServer.clipboard_get().strip_edges())
+	share_button = button(row, "Share file", func():
+		if not share_path.text.strip_edges().is_empty():
+			share_file_requested.emit(share_path.text.strip_edges())
+		else:
+			var picker := FileDialog.new()
+			picker.access = FileDialog.ACCESS_FILESYSTEM
+			picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+			picker.use_native_dialog = true
+			picker.title = "Share a video with the room"
+			picker.file_selected.connect(func(path): share_file_requested.emit(path); picker.queue_free())
+			picker.canceled.connect(picker.queue_free)
+			add_child(picker)
+			picker.popup_centered_ratio(0.7))
+	stop_share_button = button(row, "Stop sharing", func(): stop_share_requested.emit())
+	label(row, "Upload limit (Mbit/s)")
+	upload_limit = SpinBox.new()
+	upload_limit.min_value = 1
+	upload_limit.max_value = 1000
+	upload_limit.value = 100
+	upload_limit.value_changed.connect(func(value): media_limit_changed.emit(int(value)))
+	row.add_child(upload_limit)
+	share_summary = label(share_column, "Connect as host to share a file. In VR you can paste a local path above.")
+	var relay_help := label(share_column, "Relayed video uses relay-server bandwidth. Each viewer needs your approval for this share; voice stays connected.")
+	relay_help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	relay_rows = VBoxContainer.new()
+	share_column.add_child(relay_rows)
 	row = horizontal(column)
 	play_button = button(row, "Play", func(): playback_toggled.emit())
 	timeline = slider(row, 0, 1, 0, 0.1)
@@ -441,3 +489,40 @@ func set_avatar_settings(id: String, height: float) -> void:
 		if avatar_picker.get_item_metadata(i) == id: avatar_picker.select(i)
 	eye_height.set_value_no_signal(height)
 	height_label.text = "%.2f m" % height
+
+func update_media_share(host: bool, state: Dictionary) -> void:
+	share_button.disabled = not host
+	stop_share_button.disabled = not host or not state.get("hosted", false)
+	upload_limit.editable = host
+	var viewers: Dictionary = state.get("viewers", {})
+	var signature := ""
+	var rows: Array[Dictionary] = []
+	var direct := 0
+	var relayed := 0
+	for peer in viewers:
+		var viewer: Dictionary = viewers[peer]
+		if viewer.get("path") == "direct": direct += 1
+		if viewer.get("path") == "relay":
+			relayed += 1
+			rows.append(viewer.duplicate())
+		if viewer.get("consent") == "allowed": signature += peer + "allowed"
+	rows.sort_custom(func(a, b): return a.peer < b.peer)
+	var descriptor: Variant = state.get("descriptor")
+	var media_id: String = descriptor.id if descriptor is Dictionary else ""
+	for row in rows: row.erase("bytes_sent")
+	signature += media_id + JSON.stringify(rows)
+	if signature != relay_signature:
+		relay_signature = signature
+		for child in relay_rows.get_children(): relay_rows.remove_child(child); child.queue_free()
+		for viewer in rows:
+			var row := horizontal(relay_rows)
+			var notice := label(row, "%s • relay %s for this share" % [viewer.get("name", "Friend"), viewer.get("consent", "pending")])
+			notice.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			notice.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			var peer: String = viewer.peer
+			button(row, "Allow", func(): relay_decided.emit(media_id, peer, true))
+			button(row, "Direct only", func(): relay_decided.emit(media_id, peer, false))
+	if state.get("hosted", false):
+		share_summary.text = "Sharing • %d direct • %d relay paths • relay estimate %.1f Mbit/s total\nFile average only; peaks can be higher. Upload capped at %d Mbit/s." % [direct, relayed, relayed * float(state.get("average_mbps", 0)), int(upload_limit.value)]
+	elif host: share_summary.text = "Share a video file, or paste its path above."
+	else: share_summary.text = state.get("status", "Only the room host can share files.")

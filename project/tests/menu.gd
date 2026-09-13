@@ -131,7 +131,8 @@ func run() -> void:
 	await create_timer(0.5).timeout
 	var output := OS.get_environment("PRIM_TEST_OUTPUT")
 	if not output.is_empty(): root.get_texture().get_image().save_png(output + ".png")
-	app.menu.avatar_picker.get_parent().get_parent().current_tab = 1
+	var avatar_tab: Control = app.menu.avatar_picker.get_parent()
+	avatar_tab.get_parent().current_tab = avatar_tab.get_index()
 	var mirrored := false
 	for control in app.menu.avatar_picker.get_parent().get_children():
 		if control is TextureRect: mirrored = control.flip_h
@@ -146,5 +147,19 @@ func run() -> void:
 	check(app.menu.avatar_status.text.contains("desktop"), "desktop calibration explains fixed viewpoint")
 	if not output.is_empty():
 		app.menu.viewport.get_texture().get_image().save_png(output + "-avatar.png")
+	app.playback.set_process(false)
+	var sharing: Control = app.menu.share_button.get_parent().get_parent()
+	sharing.get_parent().current_tab = sharing.get_index()
+	var viewers := {}
+	for i in range(5):
+		viewers[str(i)] = {"peer":str(i), "name":"Friend " + str(i), "path":"relay", "consent":"pending"}
+	app.menu.update_media_share(true, {"hosted":true, "descriptor":{"id":"fixture"}, "viewers":viewers, "average_mbps":12.0})
+	await create_timer(0.3).timeout
+	check(sharing.get_global_rect().end.y <= app.menu.PIXELS.y, "five relay decisions fit sharing tab")
+	var decisions := []
+	app.menu.relay_decided.connect(func(id, peer, allow): decisions.append([id, peer, allow]))
+	await click(app.menu.relay_rows.get_child(0).get_child(1))
+	check(decisions == [["fixture", "0", true]], "relay approval targets viewer and share")
+	if not output.is_empty(): app.menu.viewport.get_texture().get_image().save_png(output + "-sharing.png")
 	print("MENU_RESULT ", JSON.stringify(failures))
 	quit(0 if failures.is_empty() else 1)

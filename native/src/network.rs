@@ -46,7 +46,7 @@ impl Address {
         }
         value
     }
-    fn parse(&self) -> Result<EndpointAddr> {
+    pub(crate) fn parse(&self) -> Result<EndpointAddr> {
         let mut addr = EndpointAddr::new(self.id.parse::<EndpointId>()?);
         if let Some(url) = &self.relay {
             addr = addr.with_relay_url(url.parse::<RelayUrl>()?);
@@ -101,6 +101,7 @@ struct Peer {
 }
 pub struct Shared {
     peers: RwLock<HashMap<String, Peer>>,
+    pub media: Arc<crate::media::Media>,
     pub ingress: RwLock<HashMap<String, NetworkAudioIngress>>,
     pub poses: Mutex<HashMap<String, Vec<u8>>>,
     pub host: RwLock<String>,
@@ -119,6 +120,7 @@ impl Shared {
     }
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        self.media.stop();
     }
     pub fn send_control(&self, peer: &str, data: String) -> bool {
         if data.len() > MAX_MESSAGE / 2 {
@@ -155,7 +157,17 @@ impl Shared {
         *self.host.write().unwrap() = host.clone();
         self.event(Event::Host(host));
     }
-    fn is_host(&self) -> bool {
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+    pub(crate) fn media_peer(&self, id: &str) -> Option<(Address, String)> {
+        self.peers
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|p| (p.member.address.clone(), p.member.name.clone()))
+    }
+    pub(crate) fn is_host(&self) -> bool {
         let local = self.local.read().unwrap();
         !local.is_empty() && *self.host.read().unwrap() == *local
     }
@@ -175,6 +187,7 @@ impl Handle {
         let (tx, events) = std::sync::mpsc::sync_channel(256);
         let shared = Arc::new(Shared {
             peers: RwLock::new(HashMap::new()),
+            media: crate::media::Media::new(),
             ingress: RwLock::new(HashMap::new()),
             poses: Mutex::new(HashMap::new()),
             host: RwLock::new(String::new()),
@@ -266,7 +279,7 @@ async fn establish(
 ) -> Result<()> {
     let expected = proof(&connection, &secret)?;
     let hello = Hello {
-        version: 2,
+        version: 3,
         proof: expected,
         address: Address::from_endpoint(&endpoint),
         name: state.name.clone(),
@@ -285,7 +298,7 @@ async fn establish(
         write_frame(&mut send, &hello).await?;
         remote
     };
-    if remote.version != 2 {
+    if remote.version != 3 {
         connection.close(1u8.into(), b"update prim: incompatible version");
         bail!("Incompatible Prim version; update all clients");
     }
@@ -456,16 +469,22 @@ async fn run(
     state.event(Event::Status("Starting network…".into()));
     let endpoint = if local_only {
         Endpoint::builder(presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec(), crate::media::ALPN.to_vec()])
             .bind()
             .await?
     } else {
         Endpoint::builder(presets::N0)
-            .alpns(vec![ALPN.to_vec()])
+            .alpns(vec![ALPN.to_vec(), crate::media::ALPN.to_vec()])
             .bind()
             .await?
     };
     *state.local.write().unwrap() = endpoint.id().to_string();
+    let media_task = tokio::spawn(
+        state
+            .media
+            .clone()
+            .run(endpoint.clone(), state.clone(), secret),
+    );
     if !local_only {
         let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
     }
@@ -489,11 +508,23 @@ async fn run(
     loop {
         tokio::select! {
             incoming = endpoint.accept() => {
-                if let Some(incoming) = incoming { let e = endpoint.clone(); let s = state.clone(); tokio::spawn(async move { let _ = tokio::time::timeout(Duration::from_secs(8), async { let conn = incoming.await?; establish(e,conn,false,s,secret).await }).await; }); }
+                if let Some(incoming) = incoming {
+                    let e = endpoint.clone(); let s = state.clone();
+                    tokio::spawn(async move {
+                        let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(8), incoming).await else { return; };
+                        if conn.alpn() == crate::media::ALPN {
+                            let _ = crate::media::accept(conn, s, secret).await;
+                        } else {
+                            let _ = tokio::time::timeout(Duration::from_secs(8), establish(e,conn,false,s,secret)).await;
+                        }
+                    });
+                }
             },
             _ = tokio::time::sleep(Duration::from_millis(50)) => { if state.stopped.load(Ordering::Acquire) { break; } }
         }
     }
+    state.media.stop();
+    media_task.abort();
     state.peers.write().unwrap().clear();
     state.ingress.write().unwrap().clear();
     state.poses.lock().unwrap().clear();

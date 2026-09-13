@@ -204,6 +204,57 @@ impl PrimSession {
         }
     }
     #[func]
+    fn share_file(&self, path: GString) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|h| h.shared.is_host() && h.shared.media.share(path.to_string()))
+    }
+    #[func]
+    fn receive_file(&self, json: GString) -> bool {
+        let Ok(d) = serde_json::from_str::<crate::media::Descriptor>(&json.to_string()) else {
+            return false;
+        };
+        self.handle
+            .as_ref()
+            .is_some_and(|h| d.owner == *h.shared.host.read().unwrap() && h.shared.media.receive(d))
+    }
+    #[func]
+    fn stop_sharing(&self) {
+        if let Some(h) = &self.handle {
+            h.shared.media.stop();
+        }
+    }
+    #[func]
+    fn media_state(&self) -> GString {
+        self.handle
+            .as_ref()
+            .map(|h| {
+                serde_json::to_string(&*h.shared.media.view.lock().unwrap()).unwrap_or_default()
+            })
+            .unwrap_or_else(|| "{}".into())
+            .as_str()
+            .into()
+    }
+    #[func]
+    fn allow_media_relay(&self, media_id: GString, peer: GString, allow: bool) {
+        if let Some(h) = &self.handle {
+            if h.shared.is_host() {
+                h.shared
+                    .media
+                    .consent(&media_id.to_string(), &peer.to_string(), allow);
+            }
+        }
+    }
+    #[func]
+    fn set_media_upload_limit(&self, mbps: i64) {
+        if let Some(h) = &self.handle {
+            h.shared.media.upload_mbps.store(
+                mbps.clamp(1, 1000) as u64,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+    #[func]
     fn send_pose(&self, bytes: PackedByteArray) {
         if let Some(handle) = &self.handle {
             handle.shared.send_pose(bytes.as_slice());

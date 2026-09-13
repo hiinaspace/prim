@@ -78,7 +78,10 @@ func run() -> void:
 			finish()
 		return
 	check(await wait_for(func(): return phase_complete("idle")), "all clients adopted idle host state")
-	app.playback.request_source(OS.get_environment("PRIM_TEST_MEDIA"))
+	if OS.get_environment("PRIM_TEST_SHARED_FILE") == "1":
+		app.playback.share_file(OS.get_environment("PRIM_TEST_HOST_FILE"))
+	else:
+		app.playback.request_source(OS.get_environment("PRIM_TEST_MEDIA"))
 	check(await wait_for(func(): return app.playback.loaded), "host media loaded")
 	await create_timer(4.0).timeout
 	await ask("playing")
@@ -158,7 +161,7 @@ func receive(id: String, raw: String) -> void:
 	if message.get("type") == "test_probe":
 		var stream = app.session.receive_stream(id)
 		var stats: Dictionary = stream.get_stats()
-		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "viseme_hops":app.visemes.get_stats(id).get("hops",0), "mouth_closed":app.visemes.get_weights(id).count(0.0)==15, "displayed_source":app.menu.current_source.text, "avatar":app.avatars[id].body.avatar_id if app.avatars[id].body else "", "voice_id":str(app.avatars[id].voice.get_instance_id()), "finger_mask":app.avatars[id].frame.get("masks",[0,0])[0], "finger_y":app.avatars[id].frame.get("fingers",[Quaternion.IDENTITY])[0].y}))
+		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "viseme_hops":app.visemes.get_stats(id).get("hops",0), "mouth_closed":app.visemes.get_weights(id).count(0.0)==15, "displayed_source":app.menu.current_source.text, "media_kind":app.playback.source_kind, "media_status":JSON.parse_string(app.session.media_state()).get("status", ""), "waiting_file":app.playback.waiting_peer_file, "media_bytes":JSON.parse_string(app.session.media_state()).get("bytes_received", 0), "avatar":app.avatars[id].body.avatar_id if app.avatars[id].body else "", "voice_id":str(app.avatars[id].voice.get_instance_id()), "finger_mask":app.avatars[id].frame.get("masks",[0,0])[0], "finger_y":app.avatars[id].frame.get("fingers",[Quaternion.IDENTITY])[0].y}))
 	elif message.get("type") == "test_idle_ready":
 		replies["idle/" + id] = true
 	elif message.get("type") == "test_reply":
@@ -166,7 +169,10 @@ func receive(id: String, raw: String) -> void:
 		replies[message.phase + "/" + id] = message
 		if message.phase in ["playing", "resumed"]:
 			check(message.loaded and not message.paused and absf(float(message.drift)) < 0.4, "peer running playback converges")
-			check(message.displayed_source == app.playback.source, "remote menu displays authoritative media source")
+			var expected_source: String = JSON.parse_string(app.playback.source).name if app.playback.source_kind == "peer_file" else app.playback.source
+			check(message.displayed_source == expected_source, "remote menu displays authoritative media source")
+			if OS.get_environment("PRIM_TEST_SHARED_FILE") == "1":
+				check(message.media_kind == "peer_file" and message.media_bytes > 0, "client decodes bytes received over Iroh")
 	elif message.get("type") == "test_scrub":
 		app.playback.request_action("seek_to", message.position)
 	elif message.get("type") == "test_finish":
