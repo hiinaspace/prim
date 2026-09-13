@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>prim — friends build</title>
+<h1>prim</h1>
+<p>A small shared video room for friends, with desktop and VR modes. This is an early test build; please keep this link within the friend group.</p>
+<h2>Download</h2>
+<p>Linux launcher 0.3.3 / Windows launcher 0.3.2, including VRM avatars with a mirrored preview and height calibration. No separate .NET installation is needed.</p>
+<ul>
+  <li><a href="downloads/windows/Prim-friends-windows-Setup.exe">Windows x64 installer</a></li>
+  <li><a href="downloads/linux/Prim-friends-linux.AppImage">Linux x64 AppImage</a></li>
+  <li><a href="downloads/windows/Prim-friends-windows-Portable.zip">Windows portable ZIP</a> (optional)</li>
+</ul>
+<p>Everyone in a room must use 0.3.2 or newer; the avatar protocol has changed.</p>
+<p>Linux 0.3.3 fixes startup on systems without Nix. If an older AppImage cannot open, download the new one here once.</p>
+<h2>Getting started</h2>
+<ol>
+  <li>Windows: run the installer. These builds are not code-signed, so Windows may show an unknown-publisher warning. A custom installation folder can be selected with <code>--installto "D:\Games\prim"</code>.</li>
+  <li>Linux: make the AppImage executable (<code>chmod +x Prim-friends-linux.AppImage</code>), then run it. Choose <strong>Install in user folder</strong> or another folder, close the download copy, and open the installed copy for future use. If FUSE is unavailable, run <code>APPIMAGE_EXTRACT_AND_RUN=1 ./Prim-friends-linux.AppImage</code>.</li>
+  <li>Start your OpenXR runtime before choosing <strong>Play VR</strong>, or choose <strong>Play Desktop</strong>. Keep the launcher open while playing.</li>
+</ol>
+<p>Allow several GB of free space for the game and update staging. If you used the earlier localhost test launcher, download this version once to switch to the friends update feed.</p>
+<details>
+<summary>NixOS</summary>
+<p>Download <a href="prim-shell.nix">prim-shell.nix</a> beside the AppImage. Build the runtime and keep its <code>prim-runtime</code> symlink as a garbage-collection root:</p>
+<pre>nix-build prim-shell.nix -A runtime -o prim-runtime
+nix-shell prim-shell.nix --run 'prim-launcher-fhs -c ./Prim-friends-linux.AppImage'</pre>
+<p>The launcher's install buttons preserve this FHS wrapper in the installed shortcut. Keep the runtime root while using it.</p>
+</details>
+<h2>Updates and troubleshooting</h2>
+<p>The launcher checks for updates on startup. Read the changelog, click <strong>Download update</strong>, close prim, then click <strong>Install and restart</strong>. Nothing is installed automatically.</p>
+<p>If files seem broken, use <strong>Verify files</strong> or <strong>Repair installation</strong>. If the launcher itself cannot start, download it again here.</p>
+<p>For help, choose <strong>Create support report</strong>, then <strong>Open report folder</strong>. The ZIP contains selected system information and text logs with basic scrubbing. Review it before sending it to me; nothing is uploaded automatically.</p>
+</html>

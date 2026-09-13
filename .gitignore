@@ -12,3 +12,5 @@ project/private_lobby.json
 *.pyc
 result
 result-*
+launcher/**/bin/
+launcher/**/obj/

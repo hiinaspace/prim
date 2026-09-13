@@ -56,6 +56,13 @@ for path in out.rglob('*'):
     if not path.is_file() or path.name.startswith('ld-linux'):continue
     with path.open('rb') as f:magic=f.read(4)
     if magic!=b'\x7fELF':continue
+    # Some Nix libraries (notably mpv's mujs dependency) encode an absolute
+    # DT_NEEDED path. RPATH rewriting alone cannot redirect those dependencies.
+    for needed in call('patchelf','--print-needed',str(path)).splitlines():
+        if needed.startswith('/nix/store/'):
+            name=Path(needed).name
+            if not (lib/name).is_file():raise RuntimeError(f'Missing bundled dependency: {needed}')
+            subprocess.run(['patchelf','--replace-needed',needed,name,str(path)],check=True)
     relative=os.path.relpath(lib,path.parent)
     subprocess.run(['patchelf','--set-rpath','$ORIGIN' if relative=='.' else '$ORIGIN/'+relative,str(path)],check=True)
 # The package is explicitly mounted: loading through the bundled glibc loader
@@ -66,7 +73,15 @@ app_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export PATH="$app_dir/tools:$PATH"
 export LIBMPV_ZERO_MPV_LIBRARY="$app_dir/bin/linux/libmpv.so.2"
 export LIBMPV_ZERO_VULKAN_LIBRARY="$app_dir/lib/libvulkan.so.1"
-exec "$app_dir/lib/ld-linux-x86-64.so.2" --argv0 "$app_dir/prim.bin" --library-path "$app_dir/lib" "$app_dir/prim.bin" --path "$app_dir" --main-pack "$app_dir/prim.pck" "$@"
+# Driver manifests can name host libraries by SONAME. The bundled Nix glibc's
+# default search paths do not cover a normal distro's multiarch library folders.
+runtime_library_path="$app_dir/lib"
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then runtime_library_path+=":$LD_LIBRARY_PATH"; fi
+for directory in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 /usr/lib /lib64 /lib /run/opengl-driver/lib; do
+    if [[ -d "$directory" ]]; then runtime_library_path+=":$directory"; fi
+done
+export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+exec "$app_dir/lib/ld-linux-x86-64.so.2" --argv0 "$app_dir/prim.bin" --library-path "$runtime_library_path" "$app_dir/prim.bin" --path "$app_dir" --main-pack "$app_dir/prim.pck" "$@"
 '''
 (out/'prim').write_text(launcher);(out/'prim').chmod(0o755)
 (out/'desktop').write_text('''#!/usr/bin/env bash

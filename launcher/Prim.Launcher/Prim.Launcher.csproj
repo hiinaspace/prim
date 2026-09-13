@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PrimLauncher</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RuntimeFrameworkVersion>10.0.11</RuntimeFrameworkVersion>
+    <!-- Nix's installed runtime/apphost packs contain Nix interpreters, RPATHs
+         and ABI dependencies. An empty pack root forces portable NuGet packs. -->
+    <PrunePackageTargetingPackRoots Condition="'$(RuntimeIdentifier)' == 'linux-x64'">$(NetCoreTargetingPackRoot)</PrunePackageTargetingPackRoots>
+    <NetCoreTargetingPackRoot Condition="'$(RuntimeIdentifier)' == 'linux-x64'">$(MSBuildProjectDirectory)/obj/portable-packs</NetCoreTargetingPackRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
+    <PackageReference Include="Velopack" Version="1.2.0" />
+  </ItemGroup>
+</Project>
