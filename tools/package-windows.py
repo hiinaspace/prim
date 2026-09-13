@@ -46,3 +46,12 @@ for launcher,flags in [('Desktop.bat','--xr-mode off -- --desktop'),('VR.bat',''
 subprocess.run([a.godot,'--headless','--xr-mode','off','--path',str(root/'project'),'--export-pack','Windows',str(out/'prim.pck')],check=True)
 (out/'system-runtime-imports.json').write_text(json.dumps(sorted(external),indent=2)+'\n')
 print('Windows bundle:',out)
+
+# Keep bundled avatar and vendored implementation notices readable outside the PCK.
+notices = out / 'licenses' / 'avatars'
+notices.mkdir(parents=True, exist_ok=True)
+for name in ['ATTRIBUTION.md', 'LICENSE_SAMPLES.txt']:
+    shutil.copy2(root / 'project/avatars/models' / name, notices / name)
+for addon in ['vrm', 'Godot-MToon-Shader', 'renik']:
+    for source in (root / 'project/addons' / addon).glob('LICENSE*'):
+        shutil.copy2(source, notices / (addon + '-' + source.name))

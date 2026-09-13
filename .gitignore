@@ -2,7 +2,10 @@
 target/
 dist/
 project/.godot/
-project/addons/
+project/addons/*
+!project/addons/vrm/
+!project/addons/Godot-MToon-Shader/
+!project/addons/renik/
 project/bin/
 project/private_lobby.json
 *.log

@@ -1,6 +1,17 @@
 class_name PrimAvatar
 extends Node3D
 
+const Driver = preload("res://avatars/driver.gd")
+const Catalog = preload("res://avatars/catalog.gd")
+const Pose = preload("res://net/pose.gd")
+var body: PrimAvatarDriver
+var avatar_state := {}
+var pending_frame := {}
+var pending_time := 0
+var frame := {}
+var tracking := 0
+var reset_epoch := -1
+
 var head: Node3D
 var left: Node3D
 var right: Node3D
@@ -60,32 +71,68 @@ func box(size: Vector3, color: Color) -> Node3D:
 	add_child(node)
 	return node
 
-func apply_pose(sequence: int, poses: Array[Transform3D], tracked: int) -> void:
-	if sequence <= last_sequence or poses.size() != 3:
+func configure(state: Dictionary) -> void:
+	if not Catalog.valid_state(state): return
+	state = state.duplicate()
+	state.epoch = int(state.epoch)
+	if not avatar_state.is_empty() and state.epoch != avatar_state.epoch and not Pose.newer(state.epoch, avatar_state.epoch): return
+	if avatar_state == state: return
+	avatar_state = state.duplicate()
+	if body:
+		remove_child(body)
+		body.queue_free()
+		body = null
+	if state.revision == Catalog.REVISION and Catalog.MODELS.has(state.avatar):
+		body = Driver.new()
+		add_child(body)
+		if not body.configure(state.avatar, state.eye_height, false):
+			body.queue_free()
+			body = null
+	for part in [head,left,right]: part.layers = 0 if body else 1
+	reset_epoch = -1
+	if not pending_frame.is_empty() and Time.get_ticks_msec() - pending_time < 3000:
+		var pending := pending_frame
+		pending_frame = {}
+		apply_frame(pending)
+
+func apply_frame(value: Dictionary) -> void:
+	if avatar_state.is_empty() or value.epoch != avatar_state.epoch:
+		if pending_frame.is_empty() or Pose.newer(value.sequence, pending_frame.sequence):
+			pending_frame = value
+			pending_time = Time.get_ticks_msec()
 		return
-	last_sequence = sequence
+	if not Pose.newer(value.sequence, last_sequence): return
+	var snap: bool = not visible or reset_epoch != value.reset_epoch
+	last_sequence = value.sequence
 	last_update = Time.get_ticks_msec()
-	targets = poses
-	if not visible:
-		head.global_transform = poses[0]
-		left.global_transform = poses[1]
-		right.global_transform = poses[2]
-	visible = true
-	left.visible = tracked & 1 != 0
-	right.visible = tracked & 2 != 0
+	frame = value
+	targets = value.poses
+	tracking = value.tracked
+	reset_epoch = value.reset_epoch
+	if snap:
+		head.global_transform = targets[0]
+		left.global_transform = targets[1]
+		right.global_transform = targets[2]
+		if body: body.ready_pose = false
+	visible = tracking & 4 != 0
+	left.visible = tracking & 1 != 0
+	right.visible = tracking & 2 != 0
 
 func _process(delta: float) -> void:
 	if receive_stream != null:
 		var frames: int = receive_stream.get_stats().get("non_silent_output_frames", 0)
 		update_talking(frames > previous_voice_frames, delta)
 		previous_voice_frames = frames
-	if Time.get_ticks_msec() - last_update > 3000:
-		visible = false
+	var age := Time.get_ticks_msec() - last_update
+	if age > 3000: visible = false
 	if targets.size() == 3:
 		var amount := 1 - exp(-delta * 20)
 		head.global_transform = head.global_transform.interpolate_with(targets[0], amount)
 		left.global_transform = left.global_transform.interpolate_with(targets[1], amount)
 		right.global_transform = right.global_transform.interpolate_with(targets[2], amount)
+		if body and visible:
+			var poses: Array[Transform3D] = [head.global_transform,left.global_transform,right.global_transform]
+			body.apply_frame(poses, tracking if age < 350 else 4, frame.fingers, frame.masks if age < 350 else PackedInt32Array([0,0]), frame.curls if age < 350 else PackedFloat32Array(Pose.EMPTY_CURLS))
 
 func retire() -> void:
 	if voice != null:
@@ -109,3 +156,12 @@ func update_talking(active: bool, delta: float) -> void:
 	talking = talking_hold > 0.0
 	talking_indicator.visible = talking
 	nameplate.modulate = Color("86e3cc") if talking else Color.WHITE
+
+func update_personal_space(listener: Vector3) -> void:
+	# Peers can share a spawn or lean through one another. Keep their complete
+	# mesh out of the local camera without moving the voice emitter or IK targets.
+	if body:
+		var distance := head.global_position.distance_to(listener)
+		var show_body := distance > (0.35 if body.visible else 0.40)
+		if show_body and not body.visible: body.ready_pose = false
+		body.visible = show_body

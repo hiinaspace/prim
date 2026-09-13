@@ -1,5 +1,9 @@
 extends Node3D
 
+const AvatarDriver = preload("res://avatars/driver.gd")
+const AvatarCatalog = preload("res://avatars/catalog.gd")
+const HandPose = preload("res://avatars/hand_pose.gd")
+
 const Menu = preload("res://ui/world_menu.gd")
 const Avatar = preload("res://net/avatar.gd")
 const Pose = preload("res://net/pose.gd")
@@ -8,6 +12,14 @@ const Playback = preload("res://media/playback.gd")
 @onready var left: XRController3D = $XROrigin3D/LeftController
 @onready var right: XRController3D = $XROrigin3D/RightController
 @onready var player = $MPVPlayer
+var local_avatar: PrimAvatarDriver
+var avatar_id := "alicia"
+var avatar_height := 1.6
+var avatar_epoch := 0
+var avatar_reset_epoch := 0
+var grips: Array[XRController3D] = []
+var calibration_remaining := 0.0
+var calibration_samples: Array[float] = []
 var camera: Camera3D
 var menu: PrimMenu
 var session
@@ -50,6 +62,9 @@ func _ready() -> void:
 	voice_far_radius = clampf(settings.get_value("audio", "voice_far_radius", 15.0), voice_near_radius + 0.5, 40)
 	movie_near_radius = clampf(settings.get_value("audio", "movie_near_radius", 6.0), 0.5, 12)
 	movie_far_radius = clampf(settings.get_value("audio", "movie_far_radius", 18.0), movie_near_radius + 0.5, 40)
+	avatar_id = settings.get_value("avatar", "id", "alicia")
+	if not AvatarCatalog.MODELS.has(avatar_id): avatar_id = "alicia"
+	avatar_height = clampf(settings.get_value("avatar", "eye_height", 1.6), 0.5, 2.5)
 	rig.position = Vector3(0, 0, 3)
 	var interface := XRServer.find_interface("OpenXR")
 	if "--desktop" not in OS.get_cmdline_user_args() and "--flat" not in OS.get_cmdline_user_args() and interface:
@@ -57,6 +72,7 @@ func _ready() -> void:
 	get_viewport().use_xr = xr
 	if xr:
 		camera = $XROrigin3D/XRCamera3D
+		interface.pose_recentered.connect(reset_avatar_motion)
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 		for controller in [left, right]:
 			var visuals := preload("res://xr/controller_visual.gd").new()
@@ -71,6 +87,14 @@ func _ready() -> void:
 		$XROrigin3D/XRCamera3D/SteamAudioListener.reparent(camera)
 		camera.make_current()
 		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	camera.cull_mask = 1 | AvatarDriver.LOCAL_FIRST | AvatarDriver.REMOTE
+	for controller in [left,right]:
+		var grip := XRController3D.new()
+		grip.tracker = controller.tracker
+		grip.pose = "grip"
+		rig.add_child(grip)
+		grips.append(grip)
+	create_avatar_floor()
 	movie_bus = AudioServer.get_bus_index("Movie")
 	if movie_bus < 0:
 		movie_bus = AudioServer.bus_count
@@ -91,6 +115,11 @@ func _ready() -> void:
 		set_muted.call_deferred(true))
 	menu = Menu.new()
 	add_child(menu)
+	menu.avatar_selected.connect(select_avatar)
+	menu.height_changed.connect(set_avatar_height)
+	menu.calibration_requested.connect(start_calibration)
+	menu.set_avatar_settings(avatar_id, avatar_height)
+	rebuild_local_avatar()
 	menu.display_name.text = display_name
 	menu.smooth.set_pressed_no_signal(smooth_turn)
 	menu.speed.set_value_no_signal(turn_speed)
@@ -209,6 +238,7 @@ func peer_connected(peer: String, peer_name: String) -> void:
 	add_child(avatar)
 	avatar.setup(peer_name, session.receive_stream(peer))
 	avatars[peer] = avatar
+	session.send_control(peer, JSON.stringify(local_avatar_state()))
 	update_voice_volumes()
 	playback.peer_joined(peer)
 
@@ -226,7 +256,9 @@ func left_room() -> void:
 func message_received(peer: String, json: String) -> void:
 	var message: Variant = JSON.parse_string(json)
 	if not message is Dictionary: return
-	if message.get("type") == "name" and message.get("name") is String and avatars.has(peer):
+	if message.get("type") == "avatar_state":
+		if avatars.has(peer): avatars[peer].configure(message)
+	elif message.get("type") == "name" and message.get("name") is String and avatars.has(peer):
 		avatars[peer].nameplate.text = message.name.left(32)
 	else:
 		playback.message_received(peer, message)
@@ -234,7 +266,7 @@ func message_received(peer: String, json: String) -> void:
 func pose_received(peer: String, bytes: PackedByteArray) -> void:
 	if not avatars.has(peer): return
 	var pose := Pose.decode(bytes)
-	if not pose.is_empty(): avatars[peer].apply_pose(pose.sequence, pose.poses, pose.tracked)
+	if not pose.is_empty(): avatars[peer].apply_frame(pose)
 
 func capture_desktop_pointer() -> void:
 	if xr or camera == null: return
@@ -284,6 +316,7 @@ func toggle_menu() -> void:
 
 func _process(delta: float) -> void:
 	if camera == null: return
+	if delta > 0.25: reset_avatar_motion()
 	var movement := Vector2.ZERO
 	if xr:
 		var left_active := left.get_has_tracking_data()
@@ -327,18 +360,32 @@ func _process(delta: float) -> void:
 		mesh.surface_add_vertex(origin)
 		mesh.surface_add_vertex(target)
 		mesh.surface_end()
+	var avatar_frame := sample_avatar_frame()
+	var head_valid: bool = avatar_frame.tracked & 4 != 0
+	if head_valid and not local_avatar.visible: local_avatar.ready_pose = false
+	local_avatar.visible = head_valid
+	local_avatar.apply_frame(avatar_frame.poses, avatar_frame.tracked, avatar_frame.fingers, avatar_frame.masks, avatar_frame.curls)
+	update_calibration(delta)
+	var preview_target := camera.global_position - Vector3.UP * avatar_height * 0.45
+	var preview_forward := -camera.global_basis.z
+	preview_forward.y = 0
+	if preview_forward.length_squared() < 0.01: preview_forward = Vector3.FORWARD
+	menu.avatar_camera.global_position = preview_target + preview_forward.normalized() * avatar_height * 1.8
+	menu.avatar_camera.look_at(preview_target)
+	menu.avatar_preview.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE if menu.visible else SubViewport.UPDATE_DISABLED
 	pose_elapsed += delta
 	if session.is_active() and pose_elapsed >= 0.05:
 		pose_elapsed = 0
-		sequence += 1
-		var poses: Array[Transform3D] = [camera.global_transform, left.global_transform, right.global_transform]
-		var tracking := int(left.get_has_tracking_data()) | (int(right.get_has_tracking_data()) << 1) if xr else 0
-		session.send_pose(Pose.encode(sequence, poses, tracking))
+		sequence = (sequence + 1) & 0xffffffff
+		session.send_pose(Pose.encode(sequence, avatar_frame.poses, avatar_frame.tracked, avatar_frame.fingers, avatar_frame.masks, avatar_frame.curls, avatar_epoch, avatar_reset_epoch))
 	menu.connection_button.text = "Disconnect" if session.is_active() else "Connect to friends"
 	menu.status.text = "%s • %d/6 people • %s" % [status_text, avatars.size() + 1, "mic muted" if muted else "MIC LIVE"]
 	if sender.has_method("get_input_peak_db"): menu.meter.value = sender.get_input_peak_db()
 
 func rotate_about_head(angle: float) -> void:
+	if not smooth_turn:
+		avatar_reset_epoch = (avatar_reset_epoch + 1) & 0xffffffff
+		if local_avatar: local_avatar.ready_pose = false
 	var pivot := camera.global_position
 	var turn := Basis(Vector3.UP, angle)
 	rig.global_transform = Transform3D(turn, pivot - turn * pivot) * rig.global_transform
@@ -387,3 +434,95 @@ func set_voice_settings(percent: float, near_radius: float, far_radius: float) -
 func update_voice_volumes() -> void:
 	for avatar in avatars.values():
 		avatar.update_voice_volume(camera.global_position, voice_volume_percent, voice_near_radius, voice_far_radius)
+		avatar.update_personal_space(camera.global_position)
+
+func create_avatar_floor() -> void:
+	var floor_body := StaticBody3D.new()
+	floor_body.collision_layer = 2
+	floor_body.collision_mask = 0
+	floor_body.name = "AvatarGround"
+	var collision := CollisionShape3D.new()
+	var shape := BoxShape3D.new()
+	shape.size = Vector3(20,0.2,20)
+	collision.shape = shape
+	floor_body.add_child(collision)
+	floor_body.position.y = -0.1
+	add_child(floor_body)
+
+func local_avatar_state() -> Dictionary:
+	return {"type":"avatar_state", "avatar":avatar_id, "revision":AvatarCatalog.REVISION, "eye_height":avatar_height if xr else 1.6, "epoch":avatar_epoch}
+
+func rebuild_local_avatar() -> void:
+	if local_avatar:
+		remove_child(local_avatar)
+		local_avatar.queue_free()
+	local_avatar = AvatarDriver.new()
+	add_child(local_avatar)
+	local_avatar.configure(avatar_id, avatar_height if xr else 1.6, true)
+	for visual in controller_visuals: visual.set_avatar_visible(true)
+
+func select_avatar(id: String) -> void:
+	if not AvatarCatalog.MODELS.has(id): return
+	avatar_id = id
+	save_setting("avatar", "id", id)
+	avatar_configuration_changed()
+
+func set_avatar_height(height: float) -> void:
+	if not is_finite(height): return
+	avatar_height = clampf(height, 0.5, 2.5)
+	save_setting("avatar", "eye_height", avatar_height)
+	avatar_configuration_changed()
+
+func avatar_configuration_changed() -> void:
+	avatar_epoch = (avatar_epoch + 1) & 0xffffffff
+	rebuild_local_avatar()
+	menu.set_avatar_settings(avatar_id, avatar_height)
+	session.broadcast_control(JSON.stringify(local_avatar_state()))
+
+func sample_avatar_frame() -> Dictionary:
+	var poses: Array[Transform3D] = [camera.global_transform, Transform3D.IDENTITY, Transform3D.IDENTITY]
+	var fingers: Array[Quaternion] = []
+	var masks := PackedInt32Array([0,0])
+	var curls := PackedFloat32Array()
+	var tracked := 4
+	if xr:
+		var head_tracker: XRPositionalTracker = XRServer.get_tracker("head")
+		var head_pose: XRPose = head_tracker.get_pose("default") if head_tracker else null
+		if head_pose == null or not head_pose.has_tracking_data: tracked = 0
+	for i in range(2):
+		var tracker: XRHandTracker = XRServer.get_tracker("/user/hand_tracker/left" if i == 0 else "/user/hand_tracker/right") if xr else null
+		var hand := HandPose.sample(tracker)
+		fingers.append_array(hand.rotations)
+		masks[i] = hand.mask
+		curls.append_array(HandPose.curls(grips[i]) if xr else PackedFloat32Array([0,0,0,0,0]))
+		if xr:
+			var wrist := HandPose.wrist(rig, grips[i], tracker, i == 0)
+			poses[i+1] = wrist.pose
+			if wrist.valid: tracked |= 1 << i
+	return {"poses":poses,"tracked":tracked,"fingers":fingers,"masks":masks,"curls":curls}
+
+func start_calibration() -> void:
+	if not xr:
+		menu.avatar_status.text = "Height measurement uses the VR headset; desktop uses a 1.60 m viewpoint."
+		return
+	calibration_remaining = 3.5
+	calibration_samples.clear()
+
+func update_calibration(delta: float) -> void:
+	if calibration_remaining <= 0: return
+	calibration_remaining -= delta
+	menu.avatar_status.text = "Stand upright, look forward… %.0f" % ceilf(calibration_remaining)
+	if calibration_remaining < 0.5:
+		var height := rig.to_local(camera.global_position).y
+		if local_avatar.visible and height >= 0.5 and height <= 2.5: calibration_samples.append(height)
+	if calibration_remaining <= 0:
+		if calibration_samples.size() >= 3:
+			calibration_samples.sort()
+			set_avatar_height(calibration_samples[calibration_samples.size()/2])
+			menu.avatar_status.text = "Standing eye height saved: %.2f m" % avatar_height
+		else:
+			menu.avatar_status.text = "Couldn't measure height. Check the tracking floor or adjust the height manually."
+
+func reset_avatar_motion() -> void:
+	avatar_reset_epoch = (avatar_reset_epoch + 1) & 0xffffffff
+	if local_avatar: local_avatar.ready_pose = false

@@ -1,5 +1,7 @@
 extends Node3D
 
+var avatar_visible := false
+
 var controller: XRController3D
 var hand: int
 var fallback: MeshInstance3D
@@ -21,7 +23,7 @@ func _ready() -> void:
 	add_child(manager)
 
 func _process(_delta: float) -> void:
-	fallback.visible = controller.get_has_tracking_data() and not has_visible_model()
+	fallback.visible = not avatar_visible and controller.get_has_tracking_data() and not has_visible_model()
 
 func has_visible_model() -> bool:
 	for model in models:
@@ -33,3 +35,7 @@ func contains_visible_mesh(node: Node) -> bool:
 	for child in node.get_children():
 		if contains_visible_mesh(child): return true
 	return false
+
+func set_avatar_visible(value: bool) -> void:
+	avatar_visible = value
+	visible = not value

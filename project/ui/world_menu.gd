@@ -1,6 +1,10 @@
 class_name PrimMenu
 extends Node3D
 
+signal avatar_selected(id: String)
+signal height_changed(height: float)
+signal calibration_requested
+
 signal source_requested(source: String)
 signal playback_toggled
 signal seek_requested(seconds: float)
@@ -17,6 +21,12 @@ signal voice_settings_changed(percent: float, near_radius: float, far_radius: fl
 
 const PIXELS := Vector2i(1200, 1200)
 const METERS := Vector2(1.5, 1.5)
+var avatar_picker: OptionButton
+var eye_height: HSlider
+var height_label: Label
+var avatar_status: Label
+var avatar_preview: SubViewport
+var avatar_camera: Camera3D
 var viewport: SubViewport
 var url: LineEdit
 var current_source: LineEdit
@@ -84,9 +94,15 @@ func _ready() -> void:
 	background.content_margin_bottom = 22
 	panel.add_theme_stylebox_override("panel", background)
 	viewport.add_child(panel)
+	var tabs := TabContainer.new()
+	panel.add_child(tabs)
+	build_avatar_menu(tabs)
 	var column := VBoxContainer.new()
+	column.name = "Theater"
 	column.add_theme_constant_override("separation", 14)
-	panel.add_child(column)
+	tabs.add_child(column)
+	tabs.move_child(column, 0)
+	tabs.current_tab = 0
 	var title := Label.new()
 	title.text = "prim  /  friends theater"
 	title.add_theme_font_size_override("font_size", 38)
@@ -360,3 +376,58 @@ func refresh_movie_labels() -> void:
 func emit_movie_settings() -> void:
 	refresh_movie_labels()
 	movie_settings_changed.emit(movie_near.value, movie_far.value)
+
+func build_avatar_menu(tabs: TabContainer) -> void:
+	var column := VBoxContainer.new()
+	column.name = "Avatar"
+	column.add_theme_constant_override("separation", 18)
+	tabs.add_child(column)
+	label(column, "AVATAR")
+	avatar_picker = OptionButton.new()
+	var catalog = preload("res://avatars/catalog.gd")
+	for id in catalog.MODELS:
+		avatar_picker.add_item(catalog.MODELS[id].name)
+		avatar_picker.set_item_metadata(avatar_picker.item_count - 1, id)
+	avatar_picker.item_selected.connect(func(index): avatar_selected.emit(avatar_picker.get_item_metadata(index)))
+	column.add_child(avatar_picker)
+	var row := horizontal(column)
+	label(row, "Standing eye height")
+	eye_height = slider(row, 0.5, 2.5, 1.6, 0.01)
+	height_label = label(row, "1.60 m")
+	var height_commit := Timer.new()
+	height_commit.one_shot = true
+	height_commit.wait_time = 0.3
+	column.add_child(height_commit)
+	height_commit.timeout.connect(func(): height_changed.emit(eye_height.value))
+	eye_height.value_changed.connect(func(value):
+		height_label.text = "%.2f m" % value
+		height_commit.start())
+	button(column, "Measure / recalibrate standing height", func(): calibration_requested.emit())
+	avatar_status = label(column, "Stand upright and look forward when measuring. Headset and hands only.")
+	avatar_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	avatar_preview = SubViewport.new()
+	avatar_preview.size = Vector2i(700,700)
+	avatar_preview.transparent_bg = false
+	avatar_preview.msaa_3d = Viewport.MSAA_4X
+	avatar_preview.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
+	column.add_child(avatar_preview)
+	avatar_camera = Camera3D.new()
+	avatar_camera.fov = 40
+	avatar_camera.cull_mask = preload("res://avatars/driver.gd").LOCAL_THIRD
+	avatar_preview.add_child(avatar_camera)
+	avatar_camera.make_current()
+	var preview := TextureRect.new()
+	preview.texture = avatar_preview.get_texture()
+	preview.flip_h = true
+	preview.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	preview.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	preview.custom_minimum_size = Vector2(650,650)
+	preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	column.add_child(preview)
+	label(column, "Experimental standing avatars • Alicia fit based on Mainspring")
+
+func set_avatar_settings(id: String, height: float) -> void:
+	for i in range(avatar_picker.item_count):
+		if avatar_picker.get_item_metadata(i) == id: avatar_picker.select(i)
+	eye_height.set_value_no_signal(height)
+	height_label.text = "%.2f m" % height

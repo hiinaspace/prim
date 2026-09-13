@@ -94,6 +94,7 @@ func run() -> void:
 		check(app.avatars[remote].last_sequence > 10, "remote poses applied")
 		check(app.session.receive_stream(remote).get_stats().get("non_silent_output_frames", 0) > 10000, "each remote voice mixed")
 	check(app.avatars[peer].talking, "decoded remote audio lights talking indicator")
+	await verify_avatar_replication()
 	await verify_spatial_voice()
 	app.update_mute_button(true)
 	app.update_mute_button(false)
@@ -131,7 +132,7 @@ func receive(id: String, raw: String) -> void:
 	if message.get("type") == "test_probe":
 		var stream = app.session.receive_stream(id)
 		var stats: Dictionary = stream.get_stats()
-		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "displayed_source":app.menu.current_source.text}))
+		app.session.send_control(id, JSON.stringify({"type":"test_reply", "phase":message.phase, "loaded":app.playback.loaded, "paused":app.player.is_paused(), "position":app.player.get_playback_position(), "drift":app.playback.drift_seconds, "voice_frames":stats.get("non_silent_output_frames", 0), "voice_paused":stats.get("playout_paused", false), "displayed_source":app.menu.current_source.text, "avatar":app.avatars[id].body.avatar_id if app.avatars[id].body else "", "voice_id":str(app.avatars[id].voice.get_instance_id()), "finger_mask":app.avatars[id].frame.get("masks",[0,0])[0], "finger_y":app.avatars[id].frame.get("fingers",[Quaternion.IDENTITY])[0].y}))
 	elif message.get("type") == "test_idle_ready":
 		replies["idle/" + id] = true
 	elif message.get("type") == "test_reply":
@@ -212,3 +213,26 @@ func verify_spatial_voice() -> void:
 	avatar.voice.bus = "Master"
 	avatar.set_process(true)
 	AudioServer.remove_bus(index)
+
+func verify_avatar_replication() -> void:
+	await ask("avatar_before")
+	app.set_process(false)
+	app.select_avatar("vita")
+	var sample: Dictionary = app.sample_avatar_frame()
+	var joint := Quaternion(Vector3.UP, 0.4) * Quaternion(Vector3.RIGHT, 0.3)
+	sample.fingers[0] = joint
+	for tick in range(6):
+		app.sequence = (app.sequence + 1) & 0xffffffff
+		app.session.send_pose(app.Pose.encode(app.sequence, sample.poses, 4, sample.fingers, PackedInt32Array([32767,32767]), sample.curls, app.avatar_epoch, app.avatar_reset_epoch))
+		await create_timer(0.05).timeout
+	await ask("avatar_after")
+	for remote in app.avatars:
+		var before: Dictionary = replies.get("avatar_before/" + remote, {})
+		var after: Dictionary = replies.get("avatar_after/" + remote, {})
+		check(after.get("avatar") == "vita", "bundled avatar change reaches peer")
+		check(after.get("finger_mask") == 32767 and absf(after.get("finger_y",0.0) - joint.y) < 0.00001, "articulated finger rotation reaches peer")
+		check(before.get("voice_id") == after.get("voice_id") and after.get("voice_frames",0) > before.get("voice_frames",0), "avatar swap preserves advancing voice stream")
+		check(app.avatars[remote].body != null, "remote body loaded")
+		check(not app.avatars[remote].body.visible, "overlapping remote body is hidden from local camera")
+	app.select_avatar("alicia")
+	app.set_process(true)

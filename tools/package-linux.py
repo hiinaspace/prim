@@ -79,3 +79,12 @@ subprocess.run([args.godot,'--headless','--path',str(root/'project'),'--xr-mode'
 (root/'.local/linux-bundle-inputs.json').write_text(json.dumps({name:str(path) for name,path in dependencies.items()},indent=2))
 (out/'runtime-libraries.json').write_text(json.dumps(sorted(dependencies),indent=2))
 print('Linux bundle:',out)
+
+# Keep bundled avatar and vendored implementation notices readable outside the PCK.
+notices = out / 'licenses' / 'avatars'
+notices.mkdir(parents=True, exist_ok=True)
+for name in ['ATTRIBUTION.md', 'LICENSE_SAMPLES.txt']:
+    shutil.copy2(root / 'project/avatars/models' / name, notices / name)
+for addon in ['vrm', 'Godot-MToon-Shader', 'renik']:
+    for source in (root / 'project/addons' / addon).glob('LICENSE*'):
+        shutil.copy2(source, notices / (addon + '-' + source.name))

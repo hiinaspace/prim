@@ -131,5 +131,20 @@ func run() -> void:
 	await create_timer(0.5).timeout
 	var output := OS.get_environment("PRIM_TEST_OUTPUT")
 	if not output.is_empty(): root.get_texture().get_image().save_png(output + ".png")
+	app.menu.avatar_picker.get_parent().get_parent().current_tab = 1
+	var mirrored := false
+	for control in app.menu.avatar_picker.get_parent().get_children():
+		if control is TextureRect: mirrored = control.flip_h
+	check(mirrored, "avatar preview is mirrored horizontally")
+	app.set_process(true)
+	app.menu.open_at(app.camera)
+	app.select_avatar("vita")
+	app.menu.eye_height.value = 1.75
+	await create_timer(0.6).timeout
+	check(app.avatar_height == 1.75 and app.local_avatar.avatar_id == "vita", "avatar tab applies selection and height")
+	app.start_calibration()
+	check(app.menu.avatar_status.text.contains("desktop"), "desktop calibration explains fixed viewpoint")
+	if not output.is_empty():
+		app.menu.viewport.get_texture().get_image().save_png(output + "-avatar.png")
 	print("MENU_RESULT ", JSON.stringify(failures))
 	quit(0 if failures.is_empty() else 1)
