@@ -87,7 +87,7 @@ exec "$app_dir/lib/ld-linux-x86-64.so.2" --argv0 "$app_dir/prim.bin" --library-p
 (out/'desktop').write_text('''#!/usr/bin/env bash
 set -euo pipefail
 app_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-exec "$app_dir/prim" --xr-mode off "$@" -- --desktop
+exec "$app_dir/prim" "$@" -- --desktop
 ''');(out/'desktop').chmod(0o755)
 copy(root/'.local/media-tools/yt-dlp_linux',out/'tools/yt-dlp')
 copy(root/'.local/media-tools/linux/deno',out/'tools/deno')

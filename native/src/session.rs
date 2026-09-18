@@ -207,7 +207,7 @@ impl PrimSession {
     fn share_file(&self, path: GString) -> bool {
         self.handle
             .as_ref()
-            .is_some_and(|h| h.shared.is_host() && h.shared.media.share(path.to_string()))
+            .is_some_and(|h| h.shared.media.share(path.to_string()))
     }
     #[func]
     fn receive_file(&self, json: GString) -> bool {
@@ -216,7 +216,43 @@ impl PrimSession {
         };
         self.handle
             .as_ref()
-            .is_some_and(|h| d.owner == *h.shared.host.read().unwrap() && h.shared.media.receive(d))
+            .is_some_and(|h| h.shared.media_peer(&d.owner).is_some() && h.shared.media.receive(d))
+    }
+    #[func]
+    fn publish_file(&self, id: GString) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|h| h.shared.media.publish(&id.to_string()))
+    }
+    #[func]
+    fn stop_receiving_file(&self) {
+        if let Some(h) = &self.handle {
+            h.shared.media.stop_receiving();
+        }
+    }
+    #[func]
+    fn stop_publishing_file(&self, id: GString) {
+        if let Some(h) = &self.handle {
+            h.shared.media.stop_publishing(&id.to_string());
+        }
+    }
+    #[func]
+    fn cancel_file_offer(&self) {
+        if let Some(h) = &self.handle {
+            h.shared.media.cancel_offer();
+        }
+    }
+    #[func]
+    fn validate_file_offer(&self, peer: GString, json: GString) -> bool {
+        let Ok(d) = serde_json::from_str::<crate::media::Descriptor>(&json.to_string()) else {
+            return false;
+        };
+        self.handle.as_ref().is_some_and(|h| {
+            d.valid()
+                && d.owner == peer.to_string()
+                && (d.owner == *h.shared.local.read().unwrap()
+                    || h.shared.media_peer(&d.owner).is_some())
+        })
     }
     #[func]
     fn stop_sharing(&self) {
@@ -229,7 +265,11 @@ impl PrimSession {
         self.handle
             .as_ref()
             .map(|h| {
-                serde_json::to_string(&*h.shared.media.view.lock().unwrap()).unwrap_or_default()
+                let active = h.shared.media.publication_active();
+                let mut view =
+                    serde_json::to_value(&*h.shared.media.view.lock().unwrap()).unwrap_or_default();
+                view["publication_active"] = active.into();
+                view.to_string()
             })
             .unwrap_or_else(|| "{}".into())
             .as_str()
@@ -238,7 +278,7 @@ impl PrimSession {
     #[func]
     fn allow_media_relay(&self, media_id: GString, peer: GString, allow: bool) {
         if let Some(h) = &self.handle {
-            if h.shared.is_host() {
+            {
                 h.shared
                     .media
                     .consent(&media_id.to_string(), &peer.to_string(), allow);

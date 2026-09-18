@@ -4,11 +4,20 @@ A six-person Godot theater prototype with synchronized local video, Steam Audio
 spatial voice, bundled VRM avatars, and a shared-secret Iroh/DHT lobby. Linux and
 Windows builds include the patched Godot/libmpv runtime, yt-dlp and Deno.
 
-Starts in singleplayer with the microphone muted. Desktop and PCVR share a world
-menu for URL paste/text entry, playback, microphone selection/gain, name and
-snap/smooth turning. One video is shared at a time. URLs load independently; the host can also use
-**Sharing → Share file** to stream a local video over Iroh. Received bytes use a
-32 MiB temporary RAM cache. Relayed viewers need host approval before media flows.
+Starts in singleplayer with the microphone muted. Desktop uses a 2D menu; PCVR
+uses a panel drawn over scene geometry. Both offer URL paste/text entry,
+playback, microphone selection/gain, name and
+snap/smooth turning. One video is shared at a time. URLs load independently; any connected participant can use
+**Movie → Browse… → Share with room** to replace the movie with a local video
+streamed over Iroh. Local selection offers Share with room or Play only here;
+file drops use the same chooser. Received bytes
+use a 32 MiB temporary RAM cache. Relayed viewers need the file provider's approval
+before media flows. The room host continues to order playback and synchronization.
+Movie offers local **Direct stereo** movie audio and embedded subtitle selection.
+Turning settings are in **Comfort**. **Enable VR / Disable VR** switches modes while
+keeping the Prim room alive; see [session lifecycle](docs/XR_LIFECYCLE.md).
+Live RTSP/RTMP and unbounded streams bypass movie seeking/synchronization; see
+[the manual OBS/MediaMTX test](docs/LIVESTREAM_TEST.md).
 There is no playlist, general multiplayer framework or UGC layer.
 
 The Avatar tab selects Alicia or Vita, previews the full body, and measures or
@@ -20,8 +29,8 @@ For local Linux development (Nix required):
 
 ```sh
 ./build.sh
-./run.sh             # VR; start your headset runtime first
-./run.sh --desktop   # desktop mode
+./run.sh             # try VR, fall back to desktop
+./run.sh --desktop   # start desktop; Enable VR later
 ./run.sh --editor    # patched Godot editor
 ```
 

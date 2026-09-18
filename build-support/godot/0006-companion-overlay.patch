@@ -1,0 +1,193 @@
+--- a/modules/openxr/openxr_api.h
++++ b/modules/openxr/openxr_api.h
+@@ -269,6 +269,13 @@
+ 	void destroy_instance();
+ 
+ 	// session
++	// Opt-in companion session. Immutable session role, independently queued rendering.
++	bool overlay_requested = false;
++	bool overlay_available = false;
++	bool overlay_session = false;
++	int overlay_main_visible = -1;
++	int64_t overlay_visibility_serial = 0;
++	uint32_t overlay_placement = 1;
+ 	bool create_session();
+ 	bool load_supported_reference_spaces();
+ 	bool is_reference_space_supported(XrReferenceSpaceType p_reference_space);
+@@ -355,6 +362,7 @@
+ 	struct RenderState {
+ 		bool running = false;
+ 		bool should_render = false;
++		bool overlay_hidden = false;
+ 		bool has_xr_viewport = false;
+ 		XrTime predicted_display_time = 0;
+ 		XrSpace play_space = XR_NULL_HANDLE;
+@@ -473,6 +481,10 @@
+ 	bool initialize(const String &p_rendering_driver);
+ 	bool initialize_session();
+ 	bool request_session_exit();
++	void configure_overlay(bool p_enabled, uint32_t p_placement);
++	Dictionary get_overlay_status() const;
++	void set_overlay_hidden(bool p_hidden);
++	static void _set_overlay_hidden_rt(bool p_hidden);
+ 	void finish();
+ 
+ 	_FORCE_INLINE_ XrSpace get_play_space() const { return play_space; }
+--- a/modules/openxr/openxr_api.cpp
++++ b/modules/openxr/openxr_api.cpp
+@@ -574,6 +574,10 @@
+ 
+ 	// Find all extensions we wish to enable for the requested OpenXR version.
+ 	LocalVector<RequestExtension> requested_extensions;
++	overlay_available = false;
++	if (overlay_requested) {
++		requested_extensions.push_back({ XR_EXTX_OVERLAY_EXTENSION_NAME, &overlay_available });
++	}
+ 	for (OpenXRExtensionWrapper *wrapper : registered_extension_wrappers) {
+ 		const HashMap<String, bool *> &wrapper_request_extensions = wrapper->get_requested_extensions(p_version);
+ 
+@@ -934,6 +938,31 @@
+ 	}
+ }
+ 
++void OpenXRAPI::configure_overlay(bool p_enabled, uint32_t p_placement) {
++	ERR_FAIL_COND(instance != XR_NULL_HANDLE);
++	overlay_requested = p_enabled;
++	overlay_placement = p_placement;
++}
++
++Dictionary OpenXRAPI::get_overlay_status() const {
++	Dictionary status;
++	status["active"] = session != XR_NULL_HANDLE && overlay_session;
++	status["supported"] = overlay_available;
++	status["main_visible"] = overlay_main_visible;
++	status["visibility_serial"] = overlay_visibility_serial;
++	status["placement"] = overlay_placement;
++	return status;
++}
++
++void OpenXRAPI::_set_overlay_hidden_rt(bool p_hidden) {
++	ERR_NOT_ON_RENDER_THREAD;
++	get_singleton()->render_state.overlay_hidden = p_hidden;
++}
++
++void OpenXRAPI::set_overlay_hidden(bool p_hidden) {
++	RenderingServer::get_singleton()->call_on_render_thread(callable_mp_static(&OpenXRAPI::_set_overlay_hidden_rt).bind(p_hidden));
++}
++
+ bool OpenXRAPI::create_session() {
+ 	ERR_FAIL_COND_V(instance == XR_NULL_HANDLE, false);
+ 	ERR_FAIL_COND_V(session != XR_NULL_HANDLE, false);
+@@ -946,6 +975,14 @@
+ 		}
+ 	}
+ 
++	overlay_session = overlay_requested && overlay_available;
++	overlay_main_visible = -1;
++	overlay_visibility_serial = 0;
++	render_state.overlay_hidden = overlay_session; // Start hidden until application policy is known.
++	XrSessionCreateInfoOverlayEXTX overlay_info = { XR_TYPE_SESSION_CREATE_INFO_OVERLAY_EXTX, next_pointer, 0, overlay_placement };
++	if (overlay_session) {
++		next_pointer = &overlay_info;
++	}
+ 	XrSessionCreateInfo session_create_info = {
+ 		XR_TYPE_SESSION_CREATE_INFO, // type
+ 		next_pointer, // next
+@@ -2113,6 +2150,11 @@
+ 			handled |= wrapper->on_event_polled(runtimeEvent);
+ 		}
+ 		switch (runtimeEvent.type) {
++			case XR_TYPE_EVENT_DATA_MAIN_SESSION_VISIBILITY_CHANGED_EXTX: {
++				const auto *event = reinterpret_cast<const XrEventDataMainSessionVisibilityChangedEXTX *>(&runtimeEvent);
++				overlay_main_visible = event->visible ? 1 : 0;
++				overlay_visibility_serial++;
++			} break;
+ 			case XR_TYPE_EVENT_DATA_EVENTS_LOST: {
+ 				XrEventDataEventsLost *event = (XrEventDataEventsLost *)&runtimeEvent;
+ 
+@@ -2578,7 +2620,7 @@
+ 	// We found an XR viewport!
+ 	render_state.has_xr_viewport = true;
+ 
+-	if (instance == XR_NULL_HANDLE || session == XR_NULL_HANDLE || !render_state.running || !render_state.view_pose_valid || !render_state.should_render) {
++	if (instance == XR_NULL_HANDLE || session == XR_NULL_HANDLE || !render_state.running || !render_state.view_pose_valid || !render_state.should_render || (overlay_session && render_state.overlay_hidden)) {
+ 		return false;
+ 	}
+ 
+@@ -2720,7 +2762,7 @@
+ 		return;
+ 	}
+ 
+-	if (render_state.should_render && render_state.view_pose_valid) {
++	if (render_state.should_render && render_state.view_pose_valid && !(overlay_session && render_state.overlay_hidden)) {
+ 		if (!render_state.has_xr_viewport) {
+ 			print_line("OpenXR: No viewport was marked with use_xr, there is no rendered output!");
+ 		} else if (!render_state.main_swapchains[OPENXR_SWAPCHAIN_COLOR].is_image_acquired()) {
+@@ -2805,8 +2847,9 @@
+ 	}
+ 
+ 	XrCompositionLayerFlags layer_flags = XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT;
+-	if (!projection_layer_is_first || render_state.environment_blend_mode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) {
++	if (overlay_session || !projection_layer_is_first || render_state.environment_blend_mode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) {
+ 		layer_flags |= XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
++		if (overlay_session) layer_flags |= XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+ 	}
+ 
+ 	void *projection_layer_next_pointer = nullptr;
+@@ -2823,7 +2866,7 @@
+ 	render_state.projection_layer.viewCount = (uint32_t)render_state.projection_views.size();
+ 	render_state.projection_layer.views = render_state.projection_views.ptr();
+ 
+-	const bool submit_depth_views = render_state.submit_depth_buffer && OpenXRCompositionLayerDepthExtension::get_singleton()->is_available() && !render_state.depth_views.is_empty();
++	const bool submit_depth_views = !overlay_session && render_state.submit_depth_buffer && OpenXRCompositionLayerDepthExtension::get_singleton()->is_available() && !render_state.depth_views.is_empty();
+ 	for (uint32_t v = 0; v < render_state.projection_views.size(); v++) {
+ 		void *next_pointer = nullptr;
+ 		// Start next chain with depth_views if submitting the depth buffer since this is handled here as a special case currently.
+--- a/modules/openxr/openxr_interface.h
++++ b/modules/openxr/openxr_interface.h
+@@ -143,6 +143,9 @@
+ 	virtual bool initialize() override;
+ 	virtual void uninitialize() override;
+ 	bool request_session_exit();
++	void configure_overlay(bool p_enabled, int p_placement);
++	Dictionary get_overlay_status() const;
++	void set_overlay_hidden(bool p_hidden);
+ 	virtual Dictionary get_system_info() override;
+ 
+ 	virtual void trigger_haptic_pulse(const String &p_action_name, const StringName &p_tracker_name, double p_frequency, double p_amplitude, double p_duration_sec, double p_delay_sec = 0) override;
+--- a/modules/openxr/openxr_interface.cpp
++++ b/modules/openxr/openxr_interface.cpp
+@@ -66,6 +66,9 @@
+ 	// State
+ 	ClassDB::bind_method(D_METHOD("get_session_state"), &OpenXRInterface::get_session_state);
+ 	ClassDB::bind_method(D_METHOD("request_session_exit"), &OpenXRInterface::request_session_exit);
++	ClassDB::bind_method(D_METHOD("configure_overlay", "enabled", "placement"), &OpenXRInterface::configure_overlay);
++	ClassDB::bind_method(D_METHOD("get_overlay_status"), &OpenXRInterface::get_overlay_status);
++	ClassDB::bind_method(D_METHOD("set_overlay_hidden", "hidden"), &OpenXRInterface::set_overlay_hidden);
+ 
+ 	// User presence
+ 	ADD_SIGNAL(MethodInfo("user_presence_changed", PropertyInfo(Variant::BOOL, "is_user_present")));
+@@ -735,6 +738,23 @@
+ 	return initialized;
+ }
+ 
++void OpenXRInterface::configure_overlay(bool p_enabled, int p_placement) {
++	ERR_FAIL_COND(initialized);
++	if (openxr_api) {
++		openxr_api->configure_overlay(p_enabled, uint32_t(MAX(0, p_placement)));
++	}
++}
++
++Dictionary OpenXRInterface::get_overlay_status() const {
++	return openxr_api ? openxr_api->get_overlay_status() : Dictionary();
++}
++
++void OpenXRInterface::set_overlay_hidden(bool p_hidden) {
++	if (openxr_api) {
++		openxr_api->set_overlay_hidden(p_hidden);
++	}
++}
++
+ bool OpenXRInterface::request_session_exit() {
+ 	return openxr_api && openxr_api->request_session_exit();
+ }

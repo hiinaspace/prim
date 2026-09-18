@@ -45,7 +45,7 @@ for name in seeds.values():
 shutil.copy2(out/'libmpv-2.dll',out/'bin/windows/libmpv-2.dll')
 for source,name in [('yt-dlp.exe','yt-dlp.exe'),('windows/deno.exe','deno.exe'),('VC_redist.x64.exe','VC_redist.x64.exe')]:
     shutil.copy2(root/'.local/media-tools'/source,out/name)
-for launcher,flags in [('Desktop.bat','--xr-mode off -- --desktop'),('VR.bat','')]:
+for launcher,flags in [('Play.bat',''),('Desktop.bat','-- --desktop'),('VR.bat','')]:
     (out/launcher).write_text('@echo off\ncd /d "%~dp0"\nset "PATH=%~dp0;%PATH%"\nprim.exe '+flags+'\n',newline='\r\n')
 subprocess.run([a.godot,'--headless','--xr-mode','off','--path',str(root/'project'),'--export-pack','Windows',str(out/'prim.pck')],check=True)
 (out/'system-runtime-imports.json').write_text(json.dumps(sorted(external),indent=2)+'\n')

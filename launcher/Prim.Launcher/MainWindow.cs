@@ -27,7 +27,7 @@ internal sealed class MainWindow : Window
         if (File.Exists(localNotes)) notes.Text = File.ReadAllText(localNotes);
         panel.Children.Add(new ScrollViewer { Content = notes, MaxHeight = 230 });
         var play = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-        Add(play, "Play VR", () => StartGame(true)); Add(play, "Play Desktop", () => StartGame(false)); panel.Children.Add(play);
+        Add(play, "Play", () => StartGame()); panel.Children.Add(play);
         var row = new WrapPanel { Orientation = Orientation.Horizontal };
         Add(row, "Check for updates", Check);
         Add(row, "Download update", async () => await Prepare(updates?.Available ?? throw new InvalidOperationException("Check for an available update first.")));
@@ -86,14 +86,14 @@ internal sealed class MainWindow : Window
         await updates!.Prepare(update, p => Dispatcher.UIThread.Post(() => progress.Value = p), operation!.Token);
         status.Text = $"{update.TargetFullRelease.Version} is verified and ready. Close prim, then click Install and restart.";
     }
-    private Task StartGame(bool vr)
+    private Task StartGame()
     {
         if (GameSession.IsRunning) throw new InvalidOperationException("prim is already running.");
-        _ = WatchGame(vr); return Task.CompletedTask;
+        _ = WatchGame(); return Task.CompletedTask;
     }
-    private async Task WatchGame(bool vr)
+    private async Task WatchGame()
     {
-        try { status.Text = "prim is running."; await GameSession.Run(vr, updates?.Version ?? "development"); status.Text = "prim exited. Session logs saved."; }
+        try { status.Text = "prim is running."; await GameSession.Run(true, updates?.Version ?? "development"); status.Text = "prim exited. Session logs saved."; }
         catch (Exception ex) { status.Text = ex.Message; Program.Log.Write(ex.ToString()); }
     }
     private static void OpenFolder(string path) => Process.Start(new ProcessStartInfo {

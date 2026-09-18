@@ -18,6 +18,8 @@ driver/enable_input=true
 
 [xr]
 openxr/enabled=true
+openxr/runtime_switching=true
+openxr/startup_alert=false
 openxr/extensions/hand_tracking=true
 shaders/enabled=true
 

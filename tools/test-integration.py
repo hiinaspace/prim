@@ -82,7 +82,7 @@ try:
     base.pop('PRIM_AUTOJOIN',None)
     base.pop('PRIM_MEDIA',None)
     godot = os.environ.get('GODOT','godot')
-    command = [godot,'--path',str(ROOT/'project'),'--display-driver','x11','--xr-mode','off','--disable-vsync','--max-fps','60','--script','res://tests/integration.gd','--','--desktop']
+    command = [godot,'--path',str(ROOT/'project'),'--display-driver','x11','--xr-mode','off','--disable-vsync','--max-fps','60','--script','res://tests/'+os.environ.get('PRIM_TEST_SCRIPT','integration.gd'),'--','--desktop']
     endpoint=OUT/'host.endpoint'
     endpoint.unlink(missing_ok=True)
     roles = ['host'] + ['client'+str(i) for i in range(int(os.environ.get('PRIM_TEST_PEERS','1')))]
@@ -97,15 +97,20 @@ try:
         if role != 'host' and windows:
             launch = ['wine', windows, '--rendering-driver', 'vulkan', '--xr-mode', 'off', '--disable-vsync', '--max-fps', '60', '--', '--desktop']
             env['PRIM_TEST_OUTPUT'] = 'Z:' + str(OUT/role).replace('/', '\\')
+            env['PRIM_TEST_HOST_FILE'] = 'Z:' + str(host_file).replace('/', '\\')
             env.pop('LIBMPV_ZERO_MPV_LIBRARY', None)
             env.pop('LIBMPV_ZERO_VULKAN_LIBRARY', None)
             env['WINEDLLOVERRIDES'] = 'winemenubuilder.exe,mscoree,mshtml=;vulkan-1=b'
             env['WINEDEBUG'] = '-all'
+            # Wine may expose no interface addresses to the minimal endpoint.
+            # Opt into normal discovery/relays while retaining the explicit test
+            # host, so this does not discover or join a user's real room.
+            env['PRIM_NETWORK_LOCAL_ONLY'] = base.get('PRIM_TEST_WINDOWS_LOCAL_ONLY', '1')
         process=subprocess.Popen(launch,env=env,stdout=log,stderr=subprocess.STDOUT)
         processes.append(process)
         if role=='host': wait_file(endpoint,process)
     for process in processes[1:]:
-        process.wait(timeout=65)
+        process.wait(timeout=110)
     reports=[json.loads((OUT/(role+'.json')).read_text()) for role in roles]
     print(json.dumps(reports,indent=2))
     if any(report['failures'] for report in reports): raise SystemExit(1)

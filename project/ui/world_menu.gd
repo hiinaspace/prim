@@ -3,9 +3,16 @@ extends Node3D
 
 signal avatar_selected(id: String)
 signal height_changed(height: float)
+signal xr_hide_requested
+signal xr_toggled
 signal calibration_requested
 
+signal stereo_changed(enabled: bool)
+signal subtitle_selected(id: int)
+
 signal source_requested(source: String)
+signal local_file_requested(path: String)
+signal room_playback_requested
 signal share_file_requested(path: String)
 signal stop_share_requested
 signal relay_decided(media_id: String, peer: String, allow: bool)
@@ -25,6 +32,24 @@ signal voice_settings_changed(percent: float, near_radius: float, far_radius: fl
 
 const PIXELS := Vector2i(1200, 1200)
 const METERS := Vector2(1.5, 1.5)
+var desktop_layer: CanvasLayer
+var desktop_surface: TextureRect
+var quad: MeshInstance3D
+var vr_mode := false
+var desktop_in_vr := false
+var headset_input_allowed := true
+var room_connected := false
+# Query at selection time: native pickers can stay open across room changes.
+var connection_active: Callable
+var file_choice: VBoxContainer
+var file_choice_label: Label
+var selected_file := ""
+var return_to_room: Button
+var tabs: TabContainer
+var share_path: LineEdit
+var file_selection_status: Label
+var stereo: CheckButton
+var subtitles: OptionButton
 var avatar_picker: OptionButton
 var eye_height: HSlider
 var height_label: Label
@@ -43,6 +68,9 @@ var relay_rows: VBoxContainer
 var relay_signature := ""
 var share_summary: Label
 var upload_limit: SpinBox
+var xr_button: Button
+var xr_hide_button: Button
+var xr_status: Label
 var xr_controls: Label
 var display_name: LineEdit
 var connection_button: Button
@@ -82,8 +110,22 @@ func _ready() -> void:
 	viewport.render_target_update_mode = SubViewport.UPDATE_WHEN_VISIBLE
 	viewport.gui_disable_input = false
 	viewport.gui_embed_subwindows = true
+	desktop_layer = CanvasLayer.new()
+	desktop_layer.layer = 10
+	add_child(desktop_layer)
+	# Keep a single standalone viewport in both modes. Both pointers feed the
+	# same local-coordinate event path; only the texture's presentation changes.
 	add_child(viewport)
-	var quad := MeshInstance3D.new()
+	viewport.handle_input_locally = true
+	desktop_surface = TextureRect.new()
+	desktop_surface.texture = viewport.get_texture()
+	desktop_surface.size = Vector2(PIXELS)
+	desktop_surface.mouse_filter = Control.MOUSE_FILTER_STOP
+	desktop_surface.gui_input.connect(forward_desktop_input)
+	desktop_layer.add_child(desktop_surface)
+	get_viewport().size_changed.connect(layout_desktop)
+	visibility_changed.connect(update_presentation)
+	quad = MeshInstance3D.new()
 	var mesh := QuadMesh.new()
 	mesh.size = METERS
 	quad.mesh = mesh
@@ -91,6 +133,9 @@ func _ready() -> void:
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	material.albedo_texture = viewport.get_texture()
 	material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR
+	material.no_depth_test = true
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	material.render_priority = 100
 	quad.material_override = material
 	add_child(quad)
 	var panel := PanelContainer.new()
@@ -107,11 +152,11 @@ func _ready() -> void:
 	background.content_margin_bottom = 22
 	panel.add_theme_stylebox_override("panel", background)
 	viewport.add_child(panel)
-	var tabs := TabContainer.new()
+	tabs = TabContainer.new()
 	panel.add_child(tabs)
 	build_avatar_menu(tabs)
 	var column := VBoxContainer.new()
-	column.name = "Theater"
+	column.name = "Room"
 	column.add_theme_constant_override("separation", 14)
 	tabs.add_child(column)
 	tabs.move_child(column, 0)
@@ -132,8 +177,18 @@ func _ready() -> void:
 	display_name.text_submitted.connect(func(value): name_changed.emit(value))
 	display_name.focus_exited.connect(func(): name_changed.emit(display_name.text))
 	row.add_child(display_name)
-	column.add_child(HSeparator.new())
-	label(column, "VIDEO")
+	row = horizontal(column)
+	xr_button = button(row, "Enable VR", func(): xr_toggled.emit())
+	xr_button.custom_minimum_size = Vector2(260, 58)
+	xr_hide_button = button(row, "Hide room view", func(): xr_hide_requested.emit())
+	xr_hide_button.visible = false
+	var room_column := column
+	column = VBoxContainer.new()
+	column.name = "Movie"
+	column.add_theme_constant_override("separation", 14)
+	tabs.add_child(column)
+	tabs.move_child(column, 1)
+	label(column, "MOVIE / LIVESTREAM")
 	row = horizontal(column)
 	label(row, "Current source")
 	current_source = LineEdit.new()
@@ -144,36 +199,39 @@ func _ready() -> void:
 	row = horizontal(column)
 	url = LineEdit.new()
 	url.placeholder_text = "Video URL or local file path"
+	url.max_length = 4096
 	url.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	url.text_submitted.connect(func(value): source_requested.emit(value))
+	url.text_submitted.connect(func(value): choose_source(value))
 	row.add_child(url)
 	button(row, "Paste", func(): url.text = DisplayServer.clipboard_get().strip_edges())
-	button(row, "Open", func(): source_requested.emit(url.text))
+	button(row, "Open", func(): choose_source(url.text))
+	button(row, "Browse…", browse_file)
 	var share_column := VBoxContainer.new()
 	share_column.name = "Sharing"
 	share_column.add_theme_constant_override("separation", 14)
 	tabs.add_child(share_column)
-	label(share_column, "SHARE A VIDEO FILE")
-	var share_path := LineEdit.new()
-	share_path.placeholder_text = "Local file path (optional; leave empty to browse)"
-	share_path.max_length = 4096
-	share_path.text_submitted.connect(func(path): share_file_requested.emit(path))
-	share_column.add_child(share_path)
+	label(share_column, "FILE TRANSFERS")
+	label(share_column, "Choose a file on the Movie tab to share it with the room.")
+	# One source field is shared by URL, pasted paths, browsing, and file drops.
+	share_path = url
+	file_selection_status = label(column, "Open a URL, browse, or drop one video file onto the window.")
+	file_selection_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	file_choice = VBoxContainer.new()
+	column.add_child(file_choice)
+	file_choice_label = label(file_choice, "Share this file with the room?")
+	file_choice_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	row = horizontal(file_choice)
+	share_button = button(row, "Share with room", func():
+		file_choice.hide()
+		share_file_requested.emit(selected_file))
+	button(row, "Play only here", func():
+		file_choice.hide()
+		local_file_requested.emit(selected_file))
+	button(row, "Cancel", func(): file_choice.hide())
+	file_choice.hide()
+	return_to_room = button(column, "Playing only here • Return to room playback", func(): room_playback_requested.emit())
+	return_to_room.hide()
 	row = horizontal(share_column)
-	button(row, "Paste path", func(): share_path.text = DisplayServer.clipboard_get().strip_edges())
-	share_button = button(row, "Share file", func():
-		if not share_path.text.strip_edges().is_empty():
-			share_file_requested.emit(share_path.text.strip_edges())
-		else:
-			var picker := FileDialog.new()
-			picker.access = FileDialog.ACCESS_FILESYSTEM
-			picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
-			picker.use_native_dialog = true
-			picker.title = "Share a video with the room"
-			picker.file_selected.connect(func(path): share_file_requested.emit(path); picker.queue_free())
-			picker.canceled.connect(picker.queue_free)
-			add_child(picker)
-			picker.popup_centered_ratio(0.7))
 	stop_share_button = button(row, "Stop sharing", func(): stop_share_requested.emit())
 	label(row, "Upload limit (Mbit/s)")
 	upload_limit = SpinBox.new()
@@ -182,7 +240,7 @@ func _ready() -> void:
 	upload_limit.value = 100
 	upload_limit.value_changed.connect(func(value): media_limit_changed.emit(int(value)))
 	row.add_child(upload_limit)
-	share_summary = label(share_column, "Connect as host to share a file. In VR you can paste a local path above.")
+	share_summary = label(share_column, "Connect to friends, choose a file, then Share with room.")
 	var relay_help := label(share_column, "Relayed video uses relay-server bandwidth. Each viewer needs your approval for this share; voice stays connected.")
 	relay_help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	relay_rows = VBoxContainer.new()
@@ -208,6 +266,19 @@ func _ready() -> void:
 	add_child(scrub_timer)
 	playback_time = label(row, "0:00 / 0:00")
 	row = horizontal(column)
+	stereo = CheckButton.new()
+	stereo.text = "Direct stereo"
+	stereo.toggled.connect(func(value): stereo_changed.emit(value))
+	row.add_child(stereo)
+	subtitles = OptionButton.new()
+	subtitles.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	subtitles.fit_to_longest_item = false
+	subtitles.clip_text = true
+	subtitles.add_item("Subtitles: none available", -1)
+	subtitles.disabled = true
+	subtitles.item_selected.connect(func(index): subtitle_selected.emit(subtitles.get_item_id(index)))
+	row.add_child(subtitles)
+	row = horizontal(column)
 	label(row, "Video volume")
 	volume = slider(row, -40, 6, 0, 1)
 	volume.value_changed.connect(func(value): volume_changed.emit(value))
@@ -230,10 +301,14 @@ func _ready() -> void:
 	media_status.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	media_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	media_status.max_lines_visible = 2
+	column = room_column
 	column.add_child(HSeparator.new())
 	label(column, "VOICE")
 	row = horizontal(column)
-	mic_button = button(row, "Unmute microphone", func(): microphone_toggled.emit())
+	mic_button = button(row, "MIC MUTED • Unmute", func(): microphone_toggled.emit())
+	mic_button.custom_minimum_size = Vector2(450, 80)
+	mic_button.add_theme_font_size_override("font_size", 32)
+	row = horizontal(column)
 	devices = OptionButton.new()
 	devices.fit_to_longest_item = false
 	devices.clip_text = true
@@ -276,6 +351,12 @@ func _ready() -> void:
 		emit_voice_settings())
 	label(column, "Use headphones. Voice starts muted whenever you join.")
 	column.add_child(HSeparator.new())
+	column = VBoxContainer.new()
+	column.name = "Comfort"
+	xr_status = label(column, "Desktop")
+	xr_status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	column.add_theme_constant_override("separation", 14)
+	tabs.add_child(column)
 	label(column, "COMFORT")
 	row = horizontal(column)
 	smooth = CheckButton.new()
@@ -286,7 +367,44 @@ func _ready() -> void:
 	speed = slider(row, 15, 150, 60, 5)
 	speed.value_changed.connect(func(value): turn_speed_changed.emit(value))
 	xr_controls = label(column, "VR: Y/B menu • A/X mic • trigger selects • sticks move / turn")
-	label(column, "Desktop: WASD + mouse • Tab menu • click selects • Esc cursor")
+	label(column, "Desktop: WASD + mouse • Tab or Esc menu • click selects")
+	layout_desktop()
+	set_microphone_muted(true)
+	update_presentation()
+
+func layout_desktop() -> void:
+	var available := get_viewport().get_visible_rect().size
+	var factor := minf((available.x - 32) / PIXELS.x, (available.y - 32) / PIXELS.y)
+	factor = clampf(factor, 0.1, 1.0)
+	desktop_surface.scale = Vector2.ONE * factor
+	desktop_surface.position = (available - Vector2(PIXELS) * factor) * 0.5
+
+func set_vr_mode(enabled: bool) -> void:
+	release_pointer()
+	vr_mode = enabled
+	desktop_in_vr = false
+	headset_input_allowed = true
+	var focus := viewport.gui_get_focus_owner()
+	if focus: focus.release_focus()
+	update_presentation()
+
+func update_presentation() -> void:
+	if not is_instance_valid(quad): return
+	quad.visible = vr_mode and visible and not desktop_in_vr and headset_input_allowed
+	desktop_surface.visible = (not vr_mode or desktop_in_vr) and visible
+	viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if visible else SubViewport.UPDATE_DISABLED
+	layout_desktop()
+	if vr_mode:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	else:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if visible or not get_window().has_focus() else Input.MOUSE_MODE_CAPTURED
+
+func set_microphone_muted(muted: bool) -> void:
+	mic_button.text = "MIC MUTED • Unmute" if muted else "MIC ON • Mute"
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color("74434a") if muted else Color("246950")
+	style.set_corner_radius_all(8)
+	mic_button.add_theme_stylebox_override("normal", style)
 
 func horizontal(parent: Node) -> HBoxContainer:
 	var row := HBoxContainer.new()
@@ -330,8 +448,15 @@ func refresh_devices() -> void:
 func text_focused() -> bool:
 	return viewport != null and viewport.gui_get_focus_owner() is LineEdit
 
+func forward_desktop_input(event: InputEvent) -> void:
+	if not desktop_surface.visible: return
+	if event is InputEventMouse:
+		# Control.gui_input has already removed the desktop panel's scale/offset.
+		viewport.push_input(event, true)
+		desktop_surface.accept_event()
+
 func forward_key(event: InputEvent) -> void:
-	if visible and text_focused():
+	if visible:
 		viewport.push_input(event, true)
 
 func open_at(camera: Camera3D) -> void:
@@ -347,7 +472,7 @@ func point(origin: Vector3, direction: Vector3, pressed: bool) -> Vector3:
 	var local_direction := global_basis.inverse() * direction
 	has_hit = false
 	var target := origin + direction * 5
-	if visible and absf(local_direction.z) > 0.0001:
+	if quad.visible and absf(local_direction.z) > 0.0001:
 		var distance := -local_origin.z / local_direction.z
 		var hit := local_origin + local_direction * distance
 		if distance > 0 and absf(hit.x) < METERS.x * 0.5 and absf(hit.y) < METERS.y * 0.5:
@@ -490,10 +615,11 @@ func set_avatar_settings(id: String, height: float) -> void:
 	eye_height.set_value_no_signal(height)
 	height_label.text = "%.2f m" % height
 
-func update_media_share(host: bool, state: Dictionary) -> void:
-	share_button.disabled = not host
-	stop_share_button.disabled = not host or not state.get("hosted", false)
-	upload_limit.editable = host
+func update_media_share(connected: bool, state: Dictionary) -> void:
+	room_connected = connected
+	share_button.disabled = not connected
+	stop_share_button.disabled = not connected or not state.get("hosted", false)
+	upload_limit.editable = connected
 	var viewers: Dictionary = state.get("viewers", {})
 	var signature := ""
 	var rows: Array[Dictionary] = []
@@ -507,7 +633,7 @@ func update_media_share(host: bool, state: Dictionary) -> void:
 			rows.append(viewer.duplicate())
 		if viewer.get("consent") == "allowed": signature += peer + "allowed"
 	rows.sort_custom(func(a, b): return a.peer < b.peer)
-	var descriptor: Variant = state.get("descriptor")
+	var descriptor: Variant = state.get("publication")
 	var media_id: String = descriptor.id if descriptor is Dictionary else ""
 	for row in rows: row.erase("bytes_sent")
 	signature += media_id + JSON.stringify(rows)
@@ -524,5 +650,116 @@ func update_media_share(host: bool, state: Dictionary) -> void:
 			button(row, "Direct only", func(): relay_decided.emit(media_id, peer, false))
 	if state.get("hosted", false):
 		share_summary.text = "Sharing • %d direct • %d relay paths • relay estimate %.1f Mbit/s total\nFile average only; peaks can be higher. Upload capped at %d Mbit/s." % [direct, relayed, relayed * float(state.get("average_mbps", 0)), int(upload_limit.value)]
-	elif host: share_summary.text = "Share a video file, or paste its path above."
-	else: share_summary.text = state.get("status", "Only the room host can share files.")
+	elif connected: share_summary.text = "Choose a file on the Movie tab to share with friends."
+	else: share_summary.text = state.get("status", "Connect to friends to share files.")
+
+static func normalize_file_path(value: String) -> String:
+	value = value.strip_edges()
+	if value.length() >= 2 and ((value.begins_with('"') and value.ends_with('"')) or (value.begins_with("'") and value.ends_with("'"))):
+		value = value.substr(1, value.length() - 2)
+	if value.begins_with("file://"):
+		value = value.substr(7)
+		if value.begins_with("localhost/"): value = value.substr(9)
+		if not value.begins_with("/"): return ""
+		for i in range(value.length()):
+			if value[i] == "%" and (i + 2 >= value.length() or not value.substr(i + 1, 2).is_valid_hex_number()): return ""
+		value = value.uri_decode()
+		if OS.get_name() == "Windows" and value.length() >= 3 and value[2] == ":": value = value.substr(1)
+	if value.contains("\n") or value.contains("\r"): return ""
+	return value
+
+func choose_source(value: String) -> void:
+	file_choice.hide()
+	if PrimPlayback.is_remote_source(value.strip_edges()):
+		source_requested.emit(value.strip_edges())
+	else:
+		select_file(value)
+
+func select_file(path: String) -> void:
+	url.text = normalize_file_path(path)
+	select_tab("Movie")
+	if not FileAccess.file_exists(url.text):
+		file_selection_status.text = "Choose an existing local file."
+		file_choice.hide()
+		return
+	selected_file = url.text
+	file_selection_status.text = "Selected: " + selected_file.get_file()
+	var connected: bool = connection_active.call() if connection_active.is_valid() else room_connected
+	share_button.disabled = not connected
+	if connected:
+		file_choice_label.text = "Share %s with the room, or play it only here?" % url.text.get_file()
+		file_choice.show()
+	else:
+		local_file_requested.emit(url.text)
+
+func select_tab(title: String) -> void:
+	for i in range(tabs.get_tab_count()):
+		if tabs.get_tab_title(i) == title: tabs.current_tab = i
+
+func browse_file() -> void:
+	var picker := FileDialog.new()
+	picker.access = FileDialog.ACCESS_FILESYSTEM
+	picker.file_mode = FileDialog.FILE_MODE_OPEN_FILE
+	picker.use_native_dialog = true
+	picker.title = "Open a video"
+	picker.file_selected.connect(func(path): select_file(path); picker.queue_free())
+	picker.canceled.connect(picker.queue_free)
+	add_child(picker)
+	file_selection_status.text = "File picker opened on the desktop."
+	picker.popup_centered_ratio(0.7)
+
+func accept_file_drop(files: PackedStringArray, camera: Camera3D) -> void:
+	open_at(camera)
+	select_tab("Movie")
+	if files.size() != 1:
+		file_selection_status.text = "Drop one video file at a time."
+		return
+	select_file(files[0])
+
+func update_subtitles(tracks: Array, selected: int) -> void:
+	subtitles.clear()
+	subtitles.add_item("Subtitles: Off", 0)
+	subtitles.set_item_id(0, -1)
+	subtitles.disabled = tracks.is_empty()
+	if tracks.is_empty(): subtitles.set_item_text(0, "Subtitles: none available")
+	for track in tracks:
+		var text := " · ".join([str(track.get("lang", "und")), str(track.get("title", "Track %s" % track.id))])
+		subtitles.add_item(text, int(track.id))
+		if int(track.id) == selected: subtitles.select(subtitles.item_count - 1)
+
+func set_xr_state(state: String, message: String) -> void:
+	xr_button.text = {"desktop": "Enable VR", "starting": "Enabling VR…", "xr": "Disable VR", "stopping": "Disabling VR…"}.get(state, "Enable VR")
+	xr_button.disabled = state == "starting" or state == "stopping"
+	xr_status.text = message
+	xr_button.tooltip_text = message
+	if state != "xr": xr_hide_button.visible = false
+
+func release_pointer() -> void:
+	if last_pressed and is_instance_valid(viewport):
+		var event := InputEventMouseButton.new()
+		event.button_index = MOUSE_BUTTON_LEFT
+		event.position = last_position
+		event.global_position = last_position
+		event.pressed = false
+		viewport.push_input(event, true)
+	last_pressed = false
+
+func set_headset_input_allowed(allowed: bool) -> void:
+	if headset_input_allowed == allowed: return
+	release_pointer()
+	headset_input_allowed = allowed
+	if not allowed and not desktop_in_vr: visible = false
+	update_presentation()
+
+func open_desktop() -> void:
+	release_pointer()
+	desktop_in_vr = vr_mode
+	visible = true
+	update_presentation()
+
+func open_headset(camera: Camera3D) -> void:
+	if not headset_input_allowed: return
+	release_pointer()
+	desktop_in_vr = false
+	open_at(camera)
+	update_presentation()

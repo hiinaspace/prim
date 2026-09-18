@@ -75,6 +75,9 @@ pub struct Viewer {
 }
 #[derive(Default, Serialize)]
 pub struct View {
+    pub offered: Option<Descriptor>,
+    pub publication: Option<Descriptor>,
+    pub offer_status: String,
     pub descriptor: Option<Descriptor>,
     pub url: String,
     pub status: String,
@@ -92,6 +95,8 @@ pub struct Media {
     tx: mpsc::Sender<Command>,
     rx: Mutex<Option<mpsc::Receiver<Command>>>,
     epoch: AtomicU64,
+    offer_epoch: AtomicU64,
+    prepared: Mutex<Option<Arc<Source>>>,
     lifecycle: Mutex<()>,
     pub view: Mutex<View>,
     source: Mutex<Option<Arc<Source>>>,
@@ -146,6 +151,8 @@ impl Media {
             tx,
             rx: Mutex::new(Some(rx)),
             epoch: AtomicU64::new(0),
+            offer_epoch: AtomicU64::new(0),
+            prepared: Mutex::new(None),
             lifecycle: Mutex::new(()),
             view: Mutex::new(View::default()),
             source: Mutex::new(None),
@@ -159,38 +166,101 @@ impl Media {
         })
     }
     pub fn stop(&self) {
+        self.stop_receiving();
+        self.stop_publishing("");
+        self.cancel_offer();
+    }
+    pub fn cancel_offer(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        self.offer_epoch.fetch_add(1, Ordering::AcqRel);
+        self.prepared.lock().unwrap().take();
+        let mut view = self.view.lock().unwrap();
+        view.offered = None;
+        view.offer_status.clear();
+    }
+    pub fn stop_receiving(&self) {
         let _lifecycle = self.lifecycle.lock().unwrap();
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        if let Some(s) = self.source.lock().unwrap().take() {
-            s.active.store(false, Ordering::Release);
-        }
         if let Some(r) = self.remote.lock().unwrap().take() {
             r.active.store(false, Ordering::Release);
             r.connection.close(0u8.into(), b"media stopped");
         }
-        for (_, c) in self.connections.lock().unwrap().drain() {
-            c.close(0u8.into(), b"media stopped");
-        }
-        *self.view.lock().unwrap() = View::default();
+        let mut view = self.view.lock().unwrap();
+        view.descriptor = None;
+        view.url.clear();
+        view.bytes_received = 0;
+        view.cache_bytes = 0;
+        view.status.clear();
+        drop(view);
         if let Ok(mut cache) = self.cache.try_lock() {
             *cache = Cache::default();
         }
     }
+    pub fn stop_publishing(&self, id: &str) {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        let mut source = self.source.lock().unwrap();
+        if !id.is_empty() && !source.as_ref().is_some_and(|s| s.descriptor.id == id) {
+            return;
+        }
+        if let Some(s) = source.take() {
+            s.active.store(false, Ordering::Release);
+        }
+        for (_, c) in self.connections.lock().unwrap().drain() {
+            c.close(0u8.into(), b"publication stopped");
+        }
+        let mut view = self.view.lock().unwrap();
+        view.publication = None;
+        view.hosted = false;
+        view.viewers.clear();
+    }
     pub fn share(&self, path: String) -> bool {
-        self.stop();
-        self.view.lock().unwrap().status = "Opening shared file…".into();
+        self.cancel_offer();
+        self.view.lock().unwrap().offer_status = "Opening shared file…".into();
         self.tx
             .try_send(Command::Share(
                 path.into(),
-                self.epoch.load(Ordering::Acquire),
+                self.offer_epoch.load(Ordering::Acquire),
             ))
             .is_ok()
+    }
+    pub fn publish(&self, id: &str) -> bool {
+        let prepared = self.prepared.lock().unwrap().clone();
+        let Some(source) = prepared.filter(|s| s.descriptor.id == id) else {
+            return false;
+        };
+        self.stop_publishing("");
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        // A cancelled/newer preparation must never be resurrected.
+        if !self
+            .prepared
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.descriptor.id == id)
+        {
+            return false;
+        }
+        *self.source.lock().unwrap() = Some(source.clone());
+        self.prepared.lock().unwrap().take();
+        let mut view = self.view.lock().unwrap();
+        view.offered = None;
+        view.offer_status.clear();
+        view.publication = Some(source.descriptor.clone());
+        view.hosted = true;
+        true
+    }
+    pub fn publication_active(&self) -> bool {
+        self.source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.active.load(Ordering::Acquire))
     }
     pub fn receive(&self, descriptor: Descriptor) -> bool {
         if !descriptor.valid() {
             return false;
         }
-        self.stop();
+        self.stop_receiving();
         self.view.lock().unwrap().status = "Connecting to shared file…".into();
         self.tx
             .try_send(Command::Receive(
@@ -211,7 +281,7 @@ impl Media {
     }
     pub fn consent(&self, id: &str, peer: &str, allow: bool) {
         let mut view = self.view.lock().unwrap();
-        if view.descriptor.as_ref().is_some_and(|d| d.id == id) {
+        if view.publication.as_ref().is_some_and(|d| d.id == id) {
             if let Some(v) = view.viewers.get_mut(peer) {
                 v.consent = if allow { "allowed" } else { "denied" }.into();
             }
@@ -246,14 +316,19 @@ impl Media {
             tokio::select! {
                 command = rx.recv() => {
                     let Some(command) = command else { break; };
-                    let epoch = match &command { Command::Share(_, e) | Command::Receive(_,e) => *e };
-                    if epoch != self.epoch.load(Ordering::Acquire) { continue; }
-                    let result = match command {
-                        Command::Share(path, _) => self.open_file(path, &state, epoch).await,
-                        Command::Receive(d, _) => self.open_remote(d, &endpoint, &state, secret, port, epoch).await,
-                    };
-                    if result.is_err() && epoch == self.epoch.load(Ordering::Acquire) {
-                        self.view.lock().unwrap().status = "Shared file unavailable. Choose it again to retry.".into();
+                    match command {
+                        Command::Share(path, epoch) => {
+                            if epoch != self.offer_epoch.load(Ordering::Acquire) { continue; }
+                            if self.open_file(path, &state, epoch).await.is_err() && epoch == self.offer_epoch.load(Ordering::Acquire) {
+                                self.view.lock().unwrap().offer_status = "Cannot share this file. Choose an existing regular file.".into();
+                            }
+                        }
+                        Command::Receive(d, epoch) => {
+                            if epoch != self.epoch.load(Ordering::Acquire) { continue; }
+                            if self.open_remote(d, &endpoint, &state, secret, port, epoch).await.is_err() && epoch == self.epoch.load(Ordering::Acquire) {
+                                self.view.lock().unwrap().status = "Shared file unavailable. Choose it again to retry.".into();
+                            }
+                        }
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -268,7 +343,7 @@ impl Media {
         Ok(())
     }
     async fn open_file(&self, path: PathBuf, state: &Shared, epoch: u64) -> Result<()> {
-        ensure!(state.is_host(), "only the host shares files");
+        ensure!(!state.is_stopped(), "room stopped");
         let file = tokio::fs::File::open(&path).await?;
         let meta = file.metadata().await?;
         ensure!(meta.is_file(), "not a regular file");
@@ -289,7 +364,7 @@ impl Media {
         ensure!(descriptor.valid(), "unsupported file metadata");
         let _lifecycle = self.lifecycle.lock().unwrap();
         ensure!(
-            epoch == self.epoch.load(Ordering::Acquire) && !state.is_stopped(),
+            epoch == self.offer_epoch.load(Ordering::Acquire) && !state.is_stopped(),
             "cancelled"
         );
         let source = Arc::new(Source {
@@ -298,13 +373,10 @@ impl Media {
             modified: meta.modified().ok(),
             active: AtomicBool::new(true),
         });
-        *self.source.lock().unwrap() = Some(source);
-        *self.view.lock().unwrap() = View {
-            descriptor: Some(descriptor),
-            hosted: true,
-            status: "Sharing file".into(),
-            ..View::default()
-        };
+        *self.prepared.lock().unwrap() = Some(source);
+        let mut view = self.view.lock().unwrap();
+        view.offered = Some(descriptor);
+        view.offer_status = "File ready to share".into();
         Ok(())
     }
     async fn open_remote(
@@ -316,13 +388,10 @@ impl Media {
         port: u16,
         epoch: u64,
     ) -> Result<()> {
-        ensure!(
-            descriptor.owner == *state.host.read().unwrap(),
-            "not the room host"
-        );
+        ensure!(descriptor.valid(), "invalid descriptor");
         let addr = state
             .media_peer(&descriptor.owner)
-            .context("host not connected")?
+            .context("provider not connected")?
             .0
             .parse()?;
         let connection =
@@ -353,12 +422,10 @@ impl Media {
             path: path.clone(),
         });
         *self.remote.lock().unwrap() = Some(remote);
-        *self.view.lock().unwrap() = View {
-            descriptor: Some(descriptor),
-            url: format!("http://127.0.0.1:{port}{path}"),
-            status: "Waiting for shared video…".into(),
-            ..View::default()
-        };
+        let mut view = self.view.lock().unwrap();
+        view.descriptor = Some(descriptor);
+        view.url = format!("http://127.0.0.1:{port}{path}");
+        view.status = "Waiting for shared video…".into();
         Ok(())
     }
     async fn pace(&self, length: usize) {
@@ -404,10 +471,7 @@ fn gate(path: u8, consent: &str) -> u8 {
 }
 pub async fn accept(connection: Connection, state: Arc<Shared>, secret: [u8; 32]) -> Result<()> {
     let peer = connection.remote_id().to_string();
-    ensure!(
-        state.is_host() && state.media_peer(&peer).is_some(),
-        "not a room viewer"
-    );
+    ensure!(state.media_peer(&peer).is_some(), "not a room viewer");
     tokio::time::timeout(Duration::from_secs(5), async {
         let (mut send, mut recv) = connection.accept_bi().await?;
         let mut proof = [0; 32];
@@ -460,7 +524,7 @@ pub async fn accept(connection: Connection, state: Arc<Shared>, secret: [u8; 32]
                 });
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if state.is_stopped() || state.media_peer(&peer).is_none() || !state.is_host() { break; }
+                if state.is_stopped() || state.media_peer(&peer).is_none() { break; }
                 update_viewer(&state, &peer, path.load(Ordering::Acquire), connected);
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -642,22 +706,22 @@ impl Remote {
                 }
                 Ok(Ok((WAIT, _))) => media.status(
                     &self.descriptor.id,
-                    "Waiting for a direct path or host relay approval…",
+                    "Waiting for a direct path or provider relay approval…",
                 ),
                 Ok(Ok((DENIED, _))) => media.status(
                     &self.descriptor.id,
-                    "Host allows direct viewers only. Waiting for a direct path…",
+                    "Provider allows direct viewers only. Waiting for a direct path…",
                 ),
                 Ok(Ok((GONE | INVALID, _))) => {
                     media.status(
                         &self.descriptor.id,
-                        "Host stopped sharing or the file changed.",
+                        "Provider stopped sharing or the file changed.",
                     );
                     bail!("source unavailable");
                 }
                 _ => {
                     if self.connection.close_reason().is_some() {
-                        media.status(&self.descriptor.id, "Host stopped sharing.");
+                        media.status(&self.descriptor.id, "Provider stopped sharing.");
                         bail!("disconnected");
                     }
                     media.status(&self.descriptor.id, "Reconnecting to shared video…");

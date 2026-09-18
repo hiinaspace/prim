@@ -1,5 +1,11 @@
 # Private build test
 
+Current friends launcher: **0.3.6**, https://prim.hiina.space/. Update everyone
+together (protocol 4). The Linux single-client XR/menu/audio/live batch was
+accepted by the user. Release evidence is in `.local/release-036/` and
+`launcher/hosting/DEPLOYMENT.md`; native Windows and multi-runtime friend sessions
+remain distinct tests.
+
 Extract the whole archive. Both packages share one private lobby configuration.
 Start in singleplayer; the microphone is muted until explicitly enabled after
 connecting. Allow the application through the firewall when prompted.
@@ -8,10 +14,10 @@ connecting. Allow the application through the firewall when prompted.
 - **Windows:** `Desktop.bat` or `VR.bat`. If a Visual C++ runtime DLL is missing,
   run the included `VC_redist.x64.exe` installer. It comes from Microsoft's
   [supported runtime download](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
-- **Desktop:** WASD moves; mouse looks; center dot aims at the menu; left click
-  activates controls. Tab opens/closes the menu; Esc releases/captures the cursor.
-  Refocusing the window or clicking back inside it recaptures the cursor; that
-  click does not also activate a menu control.
+- **Desktop:** WASD moves and the mouse looks while the menu is closed. Tab or
+  Esc opens/closes the 2D menu; use the mouse directly on its controls.
+  With the menu closed, refocusing the window or clicking back inside it
+  recaptures the cursor. With the menu open, the pointer remains available.
   Click the URL field for typing or use Paste URL. Movement keys are suppressed
   while editing text.
 - **VR:** left stick moves; right stick turns; Y/B toggles the menu; the right
@@ -60,9 +66,9 @@ hand tracking, nameplates, shared URL changes and pause/seek/resume. Let a third
 person join during playback. Test mute/unmute and switching microphones. Close
 the host: clients should return to local playback muted with remote avatars gone.
 Reconnect deliberately to start another room. Finally try six people and a longer
-movie. URL viewers need independent access to the site. For a host-owned video, use
-Sharing → Share file; viewers receive its bytes automatically. The original
-local-copy mode still requires matching local files.
+movie. URL viewers need independent access to the site. For a local video, any participant can use
+Movie → Browse… → Share with room; viewers receive its bytes automatically.
+Choose Play only here for independent local playback.
 
 ## Automated evidence for the initial build
 
@@ -158,3 +164,90 @@ verification and a 90-frame desktop launch/exit on Ubuntu 26.04.1 with `/nix`
 hidden. The isolated desktop menu regression also passes. These checks do not
 establish real WAN relay migration or native Windows/headset behavior. No new
 claim about subjective viseme timing is made.
+
+## Playback/provider follow-up (2026-09-15)
+
+Run the staged development build after rebuilding native extensions:
+
+```sh
+nix develop --command cargo test --lib
+nix develop --command cargo clippy --all-targets -- -D warnings
+# Set GODOT and LIBMPV_ZERO_MPV_LIBRARY to the staged patched runtime.
+nix develop --command python3 tools/test-playback-controls.py
+PRIM_TEST_SHARED_FILE=1 PRIM_TEST_PROVIDER=client0 PRIM_TEST_PEERS=5 PRIM_TEST_CONTAINER=mkv nix develop --command python3 tools/test-integration.py
+PRIM_TEST_SCRIPT=sharing.gd PRIM_TEST_PEERS=2 PRIM_TEST_CONTAINER=mkv nix develop --command python3 tools/test-integration.py
+```
+
+Use isolated `XDG_DATA_HOME` for direct test-script launches and a private X display
+when possible. The Python control/room runners create isolated audio sinks and
+preferences. Do not run two room runners simultaneously: they share their output
+folder. `PRIM_TEST_WINDOWS_EXE` runs the exported Windows test package under Wine;
+use an isolated Wine prefix and export the corresponding test script first.
+
+Treat engine/script errors in logs as failures even if a test prints PASS.
+
+Focused control fixtures exercise channel isolation, sample alignment, 5.1 center downmix, output
+switching, pause/seek, movie gain, subtitle enumeration/selection/Off, rendered
+subtitle pixels (including paused Off), no-subtitle replacement, quoted/URI paths,
+and simulated drops without implicit playback replacement.
+
+Sharing fixtures exercise non-host providers, late join, replacement, competing
+offers, stale acknowledgements/stops, ownership spoof rejection, provider/host
+stop, provider departure, URL transitions, and independent subtitle choices.
+Native range tests retain byte equality, bounded cache, mutation rejection,
+revocation and controlled relay-policy checks; new preparation tests preserve
+an incoming stream and active publication during replacement/cancellation/errors.
+
+Manual follow-up: compare Direct stereo/Screen speakers in the headset; try the
+actual OS picker and desktop file drop on Linux/native Windows; compare local and
+remote springbone behavior with telemetry; exercise real WAN relay fallback and
+long playback. Wine checks are not native Windows/PCVR qualification.
+
+
+## Restartable OpenXR candidate — 2026-09-17
+
+See [desktop/VR lifecycle](XR_LIFECYCLE.md) for the implementation, exact staged
+engine, artifacts, and afternoon human test card. The final Linux Nix engine
+passed 137 checks using two Prim processes and an isolated Monado QWERTY/null
+compositor, including repeated entry/exit, runtime loss/restart, head/controller
+tracking, continuous remote voice/media/poses and graceful close from VR. The
+expanded suite reproduces the original re-entry defect on the old engine and
+checks actual render-buffer/scene view counts and eye separation on the patched
+engine. All six entries retain stereo, desktop exits return to mono, and rendering
+errors fail the runner. The
+36 menu, 29 playback-control and 23 launcher checks also passed. This is not
+physical-headset or native-Windows evidence, and existing friend packages were
+not rebuilt. `nix develop --command python3 tools/test-xr-lifecycle.py` reproduces
+the runtime test without touching the normal VR service or default audio devices.
+
+
+## Spatial movie/voice audio — 2026-09-17
+
+See [spatial audio diagnosis](SPATIAL_AUDIO_DIAGNOSIS.md). The deterministic
+white-noise regression compares first-order Ambisonics, point-source HRTF and
+bypass; it checks spectral loss independently from split-channel timing, verifies
+left/right and head-turn localization, and captures identical split channels
+before HRTF on two output-mode transitions. Final captures are sample-identical.
+The rebuilt Steam Audio and libmpv-zero plugins also pass the 29 playback controls.
+Run `nix develop --command uv run --with numpy python tools/test-spatial-audio.py`.
+The concurrent XR loss-injection run coincided with NVIDIA Xid 51/154 and a
+persistent reset-required state; a later isolated run also failed Vulkan startup.
+Final XR qualification is blocked on driver recovery. Do not repeat loss injection
+on the live GPU until investigated; details are in the diagnosis note.
+
+## September 17 menu and live receiver follow-up
+
+See [the OBS/MediaMTX test card](LIVESTREAM_TEST.md) for the current Room/Movie
+layout, unified file chooser, local-only semantics, RTSP/TCP URL, test results and
+remaining human gates. Earlier world-ray desktop menu and separate Sharing
+picker instructions above are historical.
+
+
+## Monado companion overlay
+
+See [XR_COMPANION_TEST.md](XR_COMPANION_TEST.md) for the headset card and exact
+verification boundaries. `nix develop --command python3 tools/test-xr-companion.py`
+starts its own Monado/QWERTY runtime, a main XR app and two Prim clients; it does
+not stop the host runtime. Gesture and policy tests are `res://tests/xr_gesture.gd`
+and `res://tests/xr_policy.gd`. Always set an isolated `XDG_DATA_HOME` for UI tests;
+Linux `res://tests/menu.gd` now refuses to run without one because it saves controls.

@@ -1,0 +1,578 @@
+--- a/main/main.cpp
++++ b/main/main.cpp
+@@ -2884,6 +2884,7 @@
+ 
+ 	GLOBAL_DEF_BASIC("xr/openxr/submit_depth_buffer", false);
+ 	GLOBAL_DEF_BASIC("xr/openxr/startup_alert", true);
++	GLOBAL_DEF_RST_BASIC("xr/openxr/runtime_switching", false);
+ 
+ 	// OpenXR project extensions settings.
+ 	GLOBAL_DEF_BASIC(PropertyInfo(Variant::INT, "xr/openxr/extensions/debug_utils", PROPERTY_HINT_ENUM, "Disabled,Error,Warning,Info,Verbose"), "0");
+--- a/drivers/vulkan/vulkan_hooks.h
++++ b/drivers/vulkan/vulkan_hooks.h
+@@ -32,6 +32,8 @@
+ 
+ #include "core/math/vector2i.h"
+ #include "core/templates/local_vector.h"
++#include "core/templates/hash_map.h"
++#include "core/string/ustring.h"
+ 
+ #include <drivers/vulkan/godot_vulkan.h>
+ 
+@@ -40,6 +42,24 @@
+ 	static VulkanHooks *singleton;
+ 
+ public:
++	// Capture the actual enabled extensions, not just driver-supported extensions.
++	// Late OpenXR attachment validates the existing desktop device against its runtime.
++	struct InstanceInfo {
++		uint32_t api_version = 0;
++		Vector<String> extensions;
++	};
++	struct DeviceInfo {
++		VkPhysicalDevice physical_device = VK_NULL_HANDLE;
++		Vector<String> extensions;
++		uint32_t queue_family = UINT32_MAX;
++		uint32_t queue_index = UINT32_MAX;
++	};
++	static HashMap<uint64_t, InstanceInfo> instances;
++	static HashMap<uint64_t, DeviceInfo> devices;
++	static void record_instance(VkInstance p_instance, const VkInstanceCreateInfo &p_info);
++	static void record_device(VkDevice p_device, VkPhysicalDevice p_physical_device, const VkDeviceCreateInfo &p_info);
++	static void record_queue(VkDevice p_device, uint32_t p_family, uint32_t p_index);
++
+ 	VulkanHooks();
+ 	virtual ~VulkanHooks();
+ 	virtual bool create_vulkan_instance(const VkInstanceCreateInfo *p_vulkan_create_info, VkInstance *r_instance) = 0;
+--- a/drivers/vulkan/vulkan_hooks.cpp
++++ b/drivers/vulkan/vulkan_hooks.cpp
+@@ -31,6 +31,34 @@
+ #include "vulkan_hooks.h"
+ 
+ VulkanHooks *VulkanHooks::singleton = nullptr;
++HashMap<uint64_t, VulkanHooks::InstanceInfo> VulkanHooks::instances;
++HashMap<uint64_t, VulkanHooks::DeviceInfo> VulkanHooks::devices;
++
++void VulkanHooks::record_instance(VkInstance p_instance, const VkInstanceCreateInfo &p_info) {
++	InstanceInfo info;
++	info.api_version = p_info.pApplicationInfo->apiVersion;
++	for (uint32_t i = 0; i < p_info.enabledExtensionCount; i++) {
++		info.extensions.push_back(String(p_info.ppEnabledExtensionNames[i]));
++	}
++	instances[(uint64_t)p_instance] = info;
++}
++
++void VulkanHooks::record_device(VkDevice p_device, VkPhysicalDevice p_physical_device, const VkDeviceCreateInfo &p_info) {
++	DeviceInfo info;
++	info.physical_device = p_physical_device;
++	for (uint32_t i = 0; i < p_info.enabledExtensionCount; i++) {
++		info.extensions.push_back(String(p_info.ppEnabledExtensionNames[i]));
++	}
++	devices[(uint64_t)p_device] = info;
++}
++
++void VulkanHooks::record_queue(VkDevice p_device, uint32_t p_family, uint32_t p_index) {
++	DeviceInfo *info = devices.getptr((uint64_t)p_device);
++	if (info) {
++		info->queue_family = p_family;
++		info->queue_index = p_index;
++	}
++}
+ 
+ VulkanHooks::VulkanHooks() {
+ 	if (singleton == nullptr) {
+--- a/drivers/vulkan/rendering_context_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_context_driver_vulkan.cpp
+@@ -439,6 +439,11 @@
+ 
+ 	// This extension allows us to use the properties2 features to query additional device capabilities.
+ 	_register_requested_instance_extension(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, false);
++	if (GLOBAL_GET("xr/openxr/runtime_switching")) {
++		_register_requested_instance_extension(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME, false);
++		_register_requested_instance_extension(VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME, false);
++		_register_requested_instance_extension(VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME, false);
++	}
+ 
+ 	// This extension allows us to use colorspaces other than SRGB.
+ 	_register_requested_instance_extension(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME, false);
+@@ -748,6 +753,7 @@
+ 
+ 	err = _create_vulkan_instance(&instance_info, &instance);
+ 	ERR_FAIL_COND_V(err != OK, err);
++	VulkanHooks::record_instance(instance, instance_info);
+ 
+ #ifdef USE_VOLK
+ 	volkLoadInstance(instance);
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -563,6 +563,21 @@
+ 	enabled_device_extension_names.clear();
+ 
+ 	_register_requested_device_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME, true);
++	if (GLOBAL_GET("xr/openxr/runtime_switching")) {
++		_register_requested_device_extension(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, false);
++		_register_requested_device_extension(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, false);
++		_register_requested_device_extension(VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME, false);
++		_register_requested_device_extension(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, false);
++		_register_requested_device_extension(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, false);
++#ifdef WINDOWS_ENABLED
++		_register_requested_device_extension("VK_KHR_external_memory_win32", false);
++		_register_requested_device_extension("VK_KHR_external_semaphore_win32", false);
++		_register_requested_device_extension("VK_KHR_external_fence_win32", false);
++#else
++		_register_requested_device_extension("VK_KHR_external_semaphore_fd", false);
++		_register_requested_device_extension("VK_KHR_external_fence_fd", false);
++#endif
++	}
+ 	_register_requested_device_extension(VK_KHR_MULTIVIEW_EXTENSION_NAME, false);
+ 	_register_requested_device_extension(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, false);
+ 	_register_requested_device_extension(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME, false);
+@@ -1515,6 +1530,8 @@
+ 		VkResult err = vkCreateDevice(physical_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_DEVICE), &vk_device);
+ 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan device (VkResult error %d).", err));
+ 	}
++
++	VulkanHooks::record_device(vk_device, physical_device, create_info);
+ 
+ 	for (uint32_t i = 0; i < queue_families.size(); i++) {
+ 		for (uint32_t j = 0; j < queue_families[i].size(); j++) {
+@@ -3190,6 +3207,10 @@
+ 	command_queue->queue_family = family_index;
+ 	command_queue->queue_index = picked_queue_index;
+ 	queue_family[picked_queue_index].virtual_count++;
++
++	if (p_identify_as_main_queue) {
++		VulkanHooks::record_queue(vk_device, family_index, picked_queue_index);
++	}
+ 
+ 	// If is was identified as the main queue and a hook is active, indicate it as such to the hook.
+ 	if (p_identify_as_main_queue && (VulkanHooks::get_singleton() != nullptr)) {
+--- a/modules/openxr/extensions/platform/openxr_vulkan_extension.h
++++ b/modules/openxr/extensions/platform/openxr_vulkan_extension.h
+@@ -44,6 +44,7 @@
+ 	OpenXRVulkanExtension() = default;
+ 	virtual ~OpenXRVulkanExtension() override = default;
+ 
++	bool prepare_existing_device();
+ 	virtual HashMap<String, bool *> get_requested_extensions(XrVersion p_version) override;
+ 
+ 	virtual void on_instance_created(const XrInstance p_instance) override;
+@@ -67,6 +68,7 @@
+ 	virtual RID get_density_map(void *p_swapchain_graphics_data, int p_image_index) override;
+ 
+ private:
++	bool late_attachment = false;
+ 	static OpenXRVulkanExtension *singleton;
+ 	static XrGraphicsBindingVulkanKHR graphics_binding_vulkan; // declaring this as static so we don't need to know its size and we only need it once when creating our session
+ 
+--- a/modules/openxr/extensions/platform/openxr_vulkan_extension.cpp
++++ b/modules/openxr/extensions/platform/openxr_vulkan_extension.cpp
+@@ -34,13 +34,17 @@
+ #include "../openxr_fb_foveation_extension.h"
+ 
+ #include "core/string/print_string.h"
++#include "core/config/project_settings.h"
+ #include "servers/rendering/rendering_device.h"
+ #include "servers/rendering/rendering_server.h"
+ 
+ HashMap<String, bool *> OpenXRVulkanExtension::get_requested_extensions(XrVersion p_version) {
+ 	HashMap<String, bool *> request_extensions;
+ 
+-	request_extensions[XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME] = nullptr; // must be available
++	late_attachment = GLOBAL_GET("xr/openxr/runtime_switching");
++	// enable2 requires runtime-created VkInstance/VkDevice. Legacy enable explicitly
++	// permits an app-created device, after checking the runtime's required extensions.
++	request_extensions[late_attachment ? XR_KHR_VULKAN_ENABLE_EXTENSION_NAME : XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME] = nullptr;
+ 
+ 	return request_extensions;
+ }
+@@ -50,11 +54,73 @@
+ 
+ 	// Obtain pointers to functions we're accessing here, they are (not yet) part of core.
+ 
++	if (late_attachment) {
++		EXT_INIT_XR_FUNC(xrEnumerateSwapchainImages);
++		return;
++	}
+ 	EXT_INIT_XR_FUNC(xrGetVulkanGraphicsRequirements2KHR);
+ 	EXT_INIT_XR_FUNC(xrCreateVulkanInstanceKHR);
+ 	EXT_INIT_XR_FUNC(xrGetVulkanGraphicsDevice2KHR);
+ 	EXT_INIT_XR_FUNC(xrCreateVulkanDeviceKHR);
+ 	EXT_INIT_XR_FUNC(xrEnumerateSwapchainImages);
++}
++
++bool OpenXRVulkanExtension::prepare_existing_device() {
++	if (!late_attachment) {
++		return true;
++	}
++	RenderingDevice *rd = RenderingDevice::get_singleton();
++	ERR_FAIL_NULL_V(rd, false);
++	OpenXRAPI *api = OpenXRAPI::get_singleton();
++	vulkan_instance = (VkInstance)rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_TOPMOST_OBJECT, RID(), 0);
++	vulkan_device = (VkDevice)rd->get_driver_resource(RenderingDevice::DRIVER_RESOURCE_LOGICAL_DEVICE, RID(), 0);
++	const InstanceInfo *instance_info = instances.getptr((uint64_t)vulkan_instance);
++	const DeviceInfo *device_info = devices.getptr((uint64_t)vulkan_device);
++	ERR_FAIL_COND_V_MSG(!instance_info || !device_info, false, "OpenXR: desktop Vulkan device metadata unavailable.");
++	vulkan_physical_device = device_info->physical_device;
++	vulkan_queue_family_index = device_info->queue_family;
++	vulkan_queue_index = device_info->queue_index;
++	ERR_FAIL_COND_V(vulkan_queue_family_index == UINT32_MAX, false);
++
++	PFN_xrGetVulkanGraphicsRequirementsKHR requirements_fn = nullptr;
++	PFN_xrGetVulkanGraphicsDeviceKHR physical_device_fn = nullptr;
++	PFN_xrGetVulkanInstanceExtensionsKHR instance_extensions_fn = nullptr;
++	PFN_xrGetVulkanDeviceExtensionsKHR device_extensions_fn = nullptr;
++	api->get_instance_proc_addr("xrGetVulkanGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&requirements_fn);
++	api->get_instance_proc_addr("xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction *)&physical_device_fn);
++	api->get_instance_proc_addr("xrGetVulkanInstanceExtensionsKHR", (PFN_xrVoidFunction *)&instance_extensions_fn);
++	api->get_instance_proc_addr("xrGetVulkanDeviceExtensionsKHR", (PFN_xrVoidFunction *)&device_extensions_fn);
++	ERR_FAIL_COND_V(!requirements_fn || !physical_device_fn || !instance_extensions_fn || !device_extensions_fn, false);
++	XrGraphicsRequirementsVulkanKHR requirements = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR, nullptr, 0, 0 };
++	if (XR_FAILED(requirements_fn(api->get_instance(), api->get_system_id(), &requirements))) {
++		return false;
++	}
++	XrVersion version = XR_MAKE_VERSION(VK_VERSION_MAJOR(instance_info->api_version), VK_VERSION_MINOR(instance_info->api_version), VK_VERSION_PATCH(instance_info->api_version));
++	ERR_FAIL_COND_V_MSG(version < requirements.minApiVersionSupported, false, "OpenXR requires a newer Vulkan API than this desktop device.");
++	VkPhysicalDevice required_device = VK_NULL_HANDLE;
++	if (XR_FAILED(physical_device_fn(api->get_instance(), api->get_system_id(), vulkan_instance, &required_device))) {
++		return false;
++	}
++	ERR_FAIL_COND_V_MSG(required_device != vulkan_physical_device, false, "OpenXR and Prim are using different GPUs. Start Prim on the headset GPU.");
++	for (int kind = 0; kind < 2; kind++) {
++		uint32_t size = 0;
++		// Both extension-query functions have the same signature.
++		auto query = kind == 0 ? instance_extensions_fn : device_extensions_fn;
++		if (XR_FAILED(query(api->get_instance(), api->get_system_id(), 0, &size, nullptr))) {
++			return false;
++		}
++		Vector<char> buffer;
++		buffer.resize(MAX(size, 1u));
++		buffer.write[0] = 0;
++		if (XR_FAILED(query(api->get_instance(), api->get_system_id(), size, &size, buffer.ptrw()))) {
++			return false;
++		}
++		const Vector<String> &enabled = kind == 0 ? instance_info->extensions : device_info->extensions;
++		for (const String &extension : String(buffer.ptr()).split(" ", false)) {
++			ERR_FAIL_COND_V_MSG(!enabled.has(extension), false, "OpenXR requires an extension not enabled on the desktop Vulkan device: " + extension);
++		}
++	}
++	return true;
+ }
+ 
+ bool OpenXRVulkanExtension::check_graphics_api_support(XrVersion p_desired_version) {
+--- a/modules/openxr/register_types.cpp
++++ b/modules/openxr/register_types.cpp
+@@ -246,7 +246,7 @@
+ 			openxr_api = memnew(OpenXRAPI);
+ 			ERR_FAIL_NULL(openxr_api);
+ 
+-			if (!openxr_api->initialize(OS::get_singleton()->get_current_rendering_driver_name())) {
++			if (!bool(GLOBAL_GET("xr/openxr/runtime_switching")) && !openxr_api->initialize(OS::get_singleton()->get_current_rendering_driver_name())) {
+ 				const char *init_error_message =
+ 						"OpenXR was requested but failed to start.\n"
+ 						"HMD was not detected or a required feature was not supported.\n\n"
+--- a/modules/openxr/openxr_api.h
++++ b/modules/openxr/openxr_api.h
+@@ -89,6 +89,9 @@
+ 
+ 	// linked XR interface
+ 	OpenXRInterface *xr_interface = nullptr;
++	bool rendering_extensions_registered = false;
++	bool runtime_lost = false;
++	void report_runtime_loss();
+ 
+ 	// layers
+ 	LocalVector<XrApiLayerProperties> layer_properties;
+@@ -469,6 +472,7 @@
+ 	bool is_running();
+ 	bool initialize(const String &p_rendering_driver);
+ 	bool initialize_session();
++	bool request_session_exit();
+ 	void finish();
+ 
+ 	_FORCE_INLINE_ XrSpace get_play_space() const { return play_space; }
+--- a/modules/openxr/openxr_api.cpp
++++ b/modules/openxr/openxr_api.cpp
+@@ -29,6 +29,7 @@
+ /**************************************************************************/
+ 
+ #include "openxr_api.h"
++#include "core/os/os.h"
+ 
+ #include "action_map/openxr_interaction_profile_metadata.h"
+ #include "openxr_interface.h"
+@@ -924,6 +925,7 @@
+ 		instance = XR_NULL_HANDLE;
+ 	}
+ 	enabled_extensions.clear();
++	supported_extensions.clear();
+ 
+ 	if (graphics_extension != nullptr) {
+ 		unregister_extension_wrapper(graphics_extension);
+@@ -1374,7 +1376,7 @@
+ 	// We could be pulling the rug from underneath rendering...
+ 
+ 	if (running) {
+-		if (session != XR_NULL_HANDLE) {
++		if (session != XR_NULL_HANDLE && session_state == XR_SESSION_STATE_STOPPING) {
+ 			xrEndSession(session);
+ 		}
+ 
+@@ -1412,6 +1414,17 @@
+ 	local_floor_emulation.enabled = false;
+ 	local_floor_emulation.should_reset_floor_height = false;
+ 
++	// No handles, predictions or swapchain dimensions survive a session.
++	play_space_is_dirty = true;
++	custom_play_space = XR_NULL_HANDLE;
++	interaction_profile_changed = true;
++	frame_state = { XR_TYPE_FRAME_STATE, nullptr, 0, 0, false };
++	render_state.running = false;
++	render_state.should_render = false;
++	render_state.has_xr_viewport = false;
++	render_state.view_pose_valid = false;
++	render_state.predicted_display_time = 0;
++	render_state.main_swapchain_size = Size2i();
+ 	supported_reference_spaces.clear();
+ 
+ 	if (session != XR_NULL_HANDLE) {
+@@ -1748,9 +1761,13 @@
+ 		ERR_FAIL_V_MSG(false, "OpenXR: Unsupported rendering device.");
+ 	}
+ 
+-	// Also register our rendering extensions
+-	register_extension_wrapper(memnew(OpenXRFBUpdateSwapchainExtension(p_rendering_driver)));
+-	register_extension_wrapper(memnew(OpenXRFBFoveationExtension(p_rendering_driver)));
++	// The wrapper set outlives each instance, including failed/retried initialization.
++	if (!rendering_extensions_registered) {
++		register_extension_wrapper(memnew(OpenXRFBUpdateSwapchainExtension(p_rendering_driver)));
++		register_extension_wrapper(memnew(OpenXRFBFoveationExtension(p_rendering_driver)));
++		rendering_extensions_registered = true;
++	}
++	runtime_lost = false;
+ 
+ 	// initialize
+ 	for (OpenXRExtensionWrapper *wrapper : registered_extension_wrappers) {
+@@ -1801,6 +1818,14 @@
+ }
+ 
+ bool OpenXRAPI::initialize_session() {
++#ifdef VULKAN_ENABLED
++	if (bool(GLOBAL_GET("xr/openxr/runtime_switching")) && OS::get_singleton()->get_current_rendering_driver_name() == "vulkan") {
++		if (!static_cast<OpenXRVulkanExtension *>(graphics_extension)->prepare_existing_device()) {
++			return false;
++		}
++	}
++#endif
++	session_state = XR_SESSION_STATE_UNKNOWN;
+ 	if (!create_session()) {
+ 		destroy_session();
+ 		return false;
+@@ -1829,6 +1854,31 @@
+ 	allocate_view_buffers(view_configuration_views.size(), submit_depth_buffer);
+ 
+ 	return true;
++}
++
++bool OpenXRAPI::request_session_exit() {
++	if (session == XR_NULL_HANDLE || !running || runtime_lost) {
++		return false;
++	}
++	PFN_xrRequestExitSession request_exit = nullptr;
++	if (XR_FAILED(xrGetInstanceProcAddr(instance, "xrRequestExitSession", (PFN_xrVoidFunction *)&request_exit)) || !request_exit) {
++		return false;
++	}
++	return XR_SUCCEEDED(request_exit(session));
++}
++
++void OpenXRAPI::report_runtime_loss() {
++	if (runtime_lost) {
++		return;
++	}
++	runtime_lost = true;
++	running = false;
++	session_state = XR_SESSION_STATE_LOSS_PENDING;
++	set_render_session_running(false);
++	set_render_display_info(0, false);
++	if (xr_interface) {
++		xr_interface->on_state_loss_pending();
++	}
+ }
+ 
+ void OpenXRAPI::finish() {
+@@ -2076,6 +2126,7 @@
+ 				// We should queue exiting Godot at this point.
+ 
+ 				print_verbose(String("OpenXR EVENT: instance loss pending at ") + itos(event->lossTime));
++				report_runtime_loss();
+ 				return false;
+ 			} break;
+ 			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+@@ -2153,7 +2204,9 @@
+ 		// processed all events in the queue
+ 		return true;
+ 	} else {
+-		ERR_FAIL_V_MSG(false, "OpenXR: Failed to poll events!");
++		report_runtime_loss();
++		print_line("OpenXR: runtime unavailable; returning to desktop.");
++		return false;
+ 	}
+ }
+ 
+@@ -2341,7 +2394,9 @@
+ }
+ 
+ bool OpenXRAPI::process() {
+-	ERR_FAIL_COND_V(instance == XR_NULL_HANDLE, false);
++	if (instance == XR_NULL_HANDLE || runtime_lost) {
++		return false;
++	}
+ 
+ 	if (!poll_events()) {
+ 		return false;
+@@ -2376,6 +2431,9 @@
+ 	XrResult result = xrWaitFrame(session, &frame_wait_info, &frame_state);
+ 	if (XR_FAILED(result)) {
+ 		print_line("OpenXR: xrWaitFrame() was not successful [", get_error_string(result), "]");
++		if (result == XR_ERROR_INSTANCE_LOST || result == XR_ERROR_SESSION_LOST || result == XR_ERROR_RUNTIME_FAILURE) {
++			report_runtime_loss();
++		}
+ 
+ 		// reset just in case
+ 		frame_state.predictedDisplayTime = 0;
+--- a/modules/openxr/openxr_interface.h
++++ b/modules/openxr/openxr_interface.h
+@@ -142,6 +142,7 @@
+ 	virtual bool is_initialized() const override;
+ 	virtual bool initialize() override;
+ 	virtual void uninitialize() override;
++	bool request_session_exit();
+ 	virtual Dictionary get_system_info() override;
+ 
+ 	virtual void trigger_haptic_pulse(const String &p_action_name, const StringName &p_tracker_name, double p_frequency, double p_amplitude, double p_duration_sec, double p_delay_sec = 0) override;
+--- a/modules/openxr/openxr_interface.cpp
++++ b/modules/openxr/openxr_interface.cpp
+@@ -37,6 +37,9 @@
+ #include "extensions/openxr_user_presence_extension.h"
+ 
+ #include "core/config/engine.h"
++#include "core/config/project_settings.h"
++#include "core/os/os.h"
++#include "servers/rendering/rendering_server.h"
+ #include "core/io/resource_loader.h"
+ #include "core/io/resource_saver.h"
+ #include "core/object/class_db.h"
+@@ -62,6 +65,7 @@
+ 
+ 	// State
+ 	ClassDB::bind_method(D_METHOD("get_session_state"), &OpenXRInterface::get_session_state);
++	ClassDB::bind_method(D_METHOD("request_session_exit"), &OpenXRInterface::request_session_exit);
+ 
+ 	// User presence
+ 	ADD_SIGNAL(MethodInfo("user_presence_changed", PropertyInfo(Variant::BOOL, "is_user_present")));
+@@ -375,8 +379,8 @@
+ 				openxr_api->interaction_profile_suggest_bindings(ip);
+ 
+ 				// And record it in our array so we can clean it up later on
+-				if (interaction_profile_array.has(ip)) {
+-					interaction_profile_array.push_back(ip);
++				if (!interaction_profiles.has(ip)) {
++					interaction_profiles.push_back(ip);
+ 				}
+ 			}
+ 		}
+@@ -685,18 +689,23 @@
+ 	XRServer *xr_server = XRServer::get_singleton();
+ 	ERR_FAIL_NULL_V(xr_server, false);
+ 
++	if (initialized) {
++		return true;
++	}
+ 	if (openxr_api == nullptr) {
+ 		return false;
+-	} else if (!openxr_api->is_initialized()) {
+-		return false;
+-	} else if (initialized) {
+-		return true;
++	}
++	if (!openxr_api->is_initialized()) {
++		if (!bool(GLOBAL_GET("xr/openxr/runtime_switching")) || !openxr_api->initialize(OS::get_singleton()->get_current_rendering_driver_name())) {
++			return false;
++		}
+ 	}
+ 
+ 	// load up our action sets before setting up our session, note that our profiles are suggestions, OpenXR takes ownership of (re)binding
+ 	_load_action_map();
+ 
+ 	if (!openxr_api->initialize_session()) {
++		uninitialize();
+ 		return false;
+ 	}
+ 
+@@ -726,12 +735,23 @@
+ 	return initialized;
+ }
+ 
++bool OpenXRInterface::request_session_exit() {
++	return openxr_api && openxr_api->request_session_exit();
++}
++
+ void OpenXRInterface::uninitialize() {
+-	// Our OpenXR driver will clean itself up properly when Godot exits, so we just do some basic stuff here
+-
+-	// end the session if we need to?
+-
+-	// cleanup stuff
++	if (!openxr_api) {
++		return;
++	}
++	// The caller first requests exit, detaches XR viewports and drains rendering.
++	// Prevent further XR rendering and flush commands before freeing swapchains.
++	XRServer *server = XRServer::get_singleton();
++	if (server && server->get_primary_interface() == this) {
++		server->set_primary_interface(Ref<XRInterface>());
++	}
++	RenderingServer::get_singleton()->sync();
++
++	// Release action spaces while the session and instance are still valid.
+ 	free_trackers();
+ 	free_interaction_profiles();
+ 	free_action_sets();
+@@ -744,8 +764,11 @@
+ 		}
+ 	}
+ 
+-	DisplayServer::get_singleton()->unregister_additional_output(this);
+-
++	if (initialized) {
++		DisplayServer::get_singleton()->unregister_additional_output(this);
++	}
++	openxr_api->finish();
++	head_confidence = XRPose::XR_TRACKING_CONFIDENCE_NONE;
+ 	initialized = false;
+ }
+ 
+@@ -1216,6 +1239,9 @@
+ }
+ 
+ void OpenXRInterface::process() {
++	if (!initialized) {
++		return;
++	}
+ 	if (openxr_api) {
+ 		// do our normal process
+ 		if (openxr_api->process()) {
+--- a/modules/openxr/extensions/spatial_entities/openxr_spatial_marker_tracking.cpp
++++ b/modules/openxr/extensions/spatial_entities/openxr_spatial_marker_tracking.cpp
+@@ -512,7 +512,10 @@
+ 		spatial_context = RID();
+ 	}
+ 
+-	se_extension->disconnect(SNAME("spatial_discovery_recommended"), callable_mp(this, &OpenXRSpatialMarkerTrackingCapability::_on_spatial_discovery_recommended));
++	const Callable callback = callable_mp(this, &OpenXRSpatialMarkerTrackingCapability::_on_spatial_discovery_recommended);
++	if (se_extension->is_connected(SNAME("spatial_discovery_recommended"), callback)) {
++		se_extension->disconnect(SNAME("spatial_discovery_recommended"), callback);
++	}
+ }
+ 
+ void OpenXRSpatialMarkerTrackingCapability::on_process() {

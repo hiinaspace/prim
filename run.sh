@@ -5,7 +5,7 @@ prim_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$prim_root"
 if [[ ${1:-} == --help ]]; then
     echo 'Usage: ./run.sh [--desktop|--editor] [--test-vrm /path/model.vrm] [Godot arguments...]'
-    echo 'Default: VR. Build first with ./build.sh. Example smoke: ./run.sh --desktop --headless --quit-after 90'
+    echo 'Default: try VR, fall back to desktop. Build first with ./build.sh. Example smoke: ./run.sh --desktop --headless --quit-after 90'
     exit 0
 fi
 if [[ ${PRIM_LOCAL_DEV_SHELL:-} != 1 ]]; then
@@ -37,7 +37,7 @@ done
 set -- "${forwarded[@]}"
 mode=${1:-}
 case "$mode" in
-    --desktop) shift; exec .local/godot/bin/godot --path "$prim_project" --xr-mode off "$@" -- --desktop;;
+    --desktop) shift; exec .local/godot/bin/godot --path "$prim_project" "$@" -- --desktop;;
     --editor) shift; exec .local/godot/bin/godot --path "$prim_project" --xr-mode off --editor "$@";;
     *) exec .local/godot/bin/godot --path "$prim_project" "$@";;
 esac

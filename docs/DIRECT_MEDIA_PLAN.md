@@ -5,6 +5,11 @@ is implemented in this worktree.** See [protocol](PROTOCOL.md) for the concrete
 wire format and [testing](TESTING.md#direct-file-sharing-worktree) for evidence
 and outstanding qualification. Livestreaming and overlays remain planned.
 
+Later product context (2026-09-16): [living room and external experiences](EXPERIENCE_CONTINUITY.md)
+adds the mech-vr solo playtest/mirror use case, continuing avatar/voice presence,
+and desktop/XR handoff. This does not reorder the media stages below; OBS-first
+live ingest can prove the spectator use case before integrated capture or RGBD.
+
 The manifest permits Iroh 1.1; the existing lockfile actually resolves Iroh 1.2.0.
 Implementation uses that locked version without a transport upgrade.
 

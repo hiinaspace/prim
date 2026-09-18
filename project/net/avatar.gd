@@ -52,6 +52,9 @@ func setup(display_name: String, stream: AudioStream) -> void:
 	voice.distance_attenuation = false
 	voice.volume_linear = 0.0
 	voice.ambisonics = true
+	voice.point_source_binaural = true
+	voice.attenuation_filter_db = 0.0
+	voice.air_absorption = false
 	voice.occlusion = false
 	voice.panning_strength = 0.0
 	voice.attenuation_model = AudioStreamPlayer3D.ATTENUATION_DISABLED
@@ -113,7 +116,7 @@ func apply_frame(value: Dictionary) -> void:
 		head.global_transform = targets[0]
 		left.global_transform = targets[1]
 		right.global_transform = targets[2]
-		if body: body.ready_pose = false
+		if body: body.request_motion_reset("sender_epoch_or_tracking")
 	visible = tracking & 4 != 0
 	left.visible = tracking & 1 != 0
 	right.visible = tracking & 2 != 0
@@ -163,5 +166,5 @@ func update_personal_space(listener: Vector3) -> void:
 	if body:
 		var distance := head.global_position.distance_to(listener)
 		var show_body := distance > (0.35 if body.visible else 0.40)
-		if show_body and not body.visible: body.ready_pose = false
+		if show_body and not body.visible: body.request_motion_reset("proximity_visible")
 		body.visible = show_body

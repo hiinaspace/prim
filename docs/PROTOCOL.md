@@ -18,11 +18,22 @@ host clock offset using the lowest observed RTT. Clients independently load the
 original URL (including yt-dlp resolution), estimate the target position, and use
 bounded speed corrections for small drift or exact seeks for large drift. Slow
 clients catch up; they do not pause the whole room. A local file is identified by
-basename when using the original local-copy mode. The Sharing tab instead
-streams the host's file to viewers over a dedicated authenticated connection.
-Subtitle selection remains local to mpv's default track selection for this MVP.
+basename in legacy local-copy snapshots. The Movie tab offers explicit sharing
+of a participant's file to viewers, including the room host over a dedicated authenticated connection.
+Subtitle selection is local to each viewer.
 
-The authenticated connection hello is version 3; older builds must be updated.
+Playback snapshots optionally include boolean `live` (absence means false).
+RTSP/RTMP and unbounded/nonseekable sources bypass pause, seek and speed
+correction; source/generation ordering still comes from the host. Receivers may
+also recognize live media from local mpv observations before the next snapshot.
+All peers should use the current candidate. Local-only file selection changes
+neither room intent nor published media permissions. While the host watches a
+local file, it advances the previous room snapshot clock and applies peer
+pause/seek requests to that clock; its own player remains independent. Returning
+to room playback reloads/seeks to that clock. A new room source ends the local
+override. Local subtitle/audio settings still apply to the local player.
+
+The authenticated connection hello is version 4; older builds must be updated.
 Reliable `avatar_state` carries `avatar` (a catalog ID), `revision` (catalog
 revision 1), `eye_height` (0.5–2.5 meters), and a uint32 configuration `epoch`.
 Unknown IDs or catalog revisions use cubes. A body swap preserves the peer's
@@ -74,18 +85,18 @@ backlog. Losing critical native events fails the session visibly rather than
 silently keeping an inconsistent membership state. This protocol intentionally
 has no general Godot MultiplayerAPI adapter, playlist or UGC layer.
 
-## Host file sharing (range protocol 1)
+## Participant file sharing (range protocol 1)
 
 `peer_file` playback sources contain JSON `{id, owner, name, size}`. The ID is an
-opaque random 64-hex share generation, owner is the host endpoint ID, name is a
+opaque random 64-hex share generation, owner is the provider endpoint ID, name is a
 sanitized display basename, and size is a decimal **string** (Godot JSON numbers
-are doubles). No host path or receiver-local URL is broadcast. Re-sharing the
+are doubles). No provider path or receiver-local URL is broadcast. Re-sharing the
 same file creates a new ID and clears relay consent.
 
 The existing endpoint dispatches `prim/media-range/1` to a separate connection.
 It requires an active room member and a keyed BLAKE3 proof over the connection's
-TLS exporter (`prim-media-auth-v1`), using the room secret. Only the current host
-serves files. One dedicated media connection per viewer admits at most four
+TLS exporter (`prim-media-auth-v1`), using the room secret. Any active room member
+can serve its own publication. One dedicated media connection per viewer admits at most four
 concurrent range streams, separate from room control and voice queues.
 
 After the proof stream, each bidirectional stream requests 64 ASCII ID bytes,
@@ -96,7 +107,7 @@ insert partial blocks into the cache. Open-file size/mtime checks reject changed
 sources; this is a trusted-file workflow, not cryptographic snapshot validation.
 
 Selected-path notifications distinguish direct, relay and unknown. Unknown and
-unapproved relayed paths carry no new range payload. The host approves/declines
+unapproved relayed paths carry no new range payload. The provider approves/declines
 per viewer and share in Sharing; direct-to-relay changes reapply the same gate.
 Checks run before each 64 KiB write, with a configurable aggregate application
 payload cap (default 100 Mbit/s). Transport overhead is additional. Asynchronous
@@ -111,3 +122,31 @@ requests share a 32 MiB RAM block cache; mpv and bounded in-flight buffers use
 additional memory. There is no disk cache, persistent download or swarm.
 Stop, source replacement and room departure revoke URLs and active transfers.
 Buffering viewers catch up to the host clock without pausing the room.
+
+### Source handoff (room control protocol 4)
+
+Local preparation preserves existing playback and publication. A provider sends
+`file_offer {source}` containing the descriptor JSON. The host validates the owner
+against the authenticated sender, cancels any older pending offer with
+`file_abort {id}`, and replies `file_activate {id}`. The provider publishes only
+its matching prepared ID and acknowledges `file_ready {id}`. Only the current
+pending provider/ID can complete the handoff; the host then increments the normal
+media generation/revision and broadcasts a `peer_file` snapshot. A pending host
+handoff expires after 15 seconds; the provider abandons an uncommitted offer after
+20 seconds. A newer local preparation cancels the old pending ID.
+
+Every receiver validates source announcements from the room host and connects
+directly to the connected provider. The provider plays its own local file and
+follows the host clock. Host snapshots remain paused until the host has loaded
+its receiving stream; provider relay consent applies to the host as a viewer too.
+Publication and receiving have separate cancellation/lifecycle state.
+
+`file_stopped {id}` is honored only for that provider's current source or pending
+offer. The host can stop any current source. Replacement revokes the old provider;
+provider departure clears the source. File preparation, stale acknowledgements,
+and stale stop messages cannot restore a previous video. This does not introduce
+room-host migration. All participants must update to hello version 4.
+
+Subtitle choices and direct-stereo preferences stay local and generate no room
+control messages. Runtime VRM import is currently an offline local-file preview;
+avatar bytes are not transferred.

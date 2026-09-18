@@ -1,0 +1,13 @@
+--- a/scene/main/viewport.cpp
++++ b/scene/main/viewport.cpp
+@@ -5031,6 +5031,10 @@
+ 		{
+ 			// No longer check for recommended size changes in internal process.
+ 			set_process_internal(false);
++
++			// The renderer switches its buffers to mono when disabling XR. Keep our
++			// cached count in sync so re-entry at the same size triggers a stereo resize.
++			view_count = 1;
+ 
+ 			// Reset render target override textures.
+ 			RID rt = RS::get_singleton()->viewport_get_render_target(viewport);

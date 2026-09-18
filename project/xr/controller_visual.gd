@@ -39,3 +39,6 @@ func contains_visible_mesh(node: Node) -> bool:
 func set_avatar_visible(value: bool) -> void:
 	avatar_visible = value
 	visible = not value
+
+func _exit_tree() -> void:
+	if is_instance_valid(fallback): fallback.queue_free()

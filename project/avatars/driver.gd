@@ -25,6 +25,9 @@ var eye_height := 1.6
 var model_scale := 1.0
 var view_offset := Vector3(0, 0.023, -0.015)
 var reset_pending := false
+var reset_reason := "initial"
+var reset_count := 0
+var reset_trace_time := 0
 var ready_pose := false
 var last_view := Transform3D.IDENTITY
 var avatar_id := ""
@@ -119,7 +122,10 @@ func add_limb(index: int, leg: bool) -> void:
 
 func apply_frame(poses: Array[Transform3D], tracked: int, rotations: Array[Quaternion], masks: PackedInt32Array, fallback_curls: PackedFloat32Array, reset: bool = false) -> void:
 	if not skeleton or poses.size() != 3: return
-	if not ready_pose or last_view.origin.distance_to(poses[0].origin) > 1.0: reset = true
+	if not ready_pose: reset = true
+	if last_view.origin.distance_to(poses[0].origin) > 1.0 and ready_pose:
+		reset_reason = "position_jump"
+		reset = true
 	last_view = poses[0]
 	# Root translation follows the view horizontally. The skeleton itself solves yaw.
 	global_position = Vector3(poses[0].origin.x, 0, poses[0].origin.z)
@@ -154,7 +160,15 @@ func _physics_process(delta: float) -> void:
 			placement.update_placement(minf(delta, 0.05))
 		placement.interpolate_transforms(1.0)
 
+func request_motion_reset(reason: String) -> void:
+	ready_pose = false
+	reset_reason = reason
+
 func reset_springs() -> void:
+	reset_count += 1
+	if OS.get_environment("PRIM_TRACE_SPRINGS") == "1" and Time.get_ticks_msec() - reset_trace_time >= 1000:
+		reset_trace_time = Time.get_ticks_msec()
+		printerr("[prim springs] " + JSON.stringify({"instance":get_instance_id(), "avatar":avatar_id, "reason":reset_reason, "count":reset_count, "frame_ms":get_process_delta_time()*1000}))
 	for secondary in spring_nodes:
 		secondary.update_centers(skeleton.global_transform)
 		for i in range(secondary.spring_bones_internal.size()):

@@ -2,27 +2,34 @@
 
 Use a native Linux filesystem for build outputs. Initialize submodules recursively.
 The prototype expects the paired Godot build with the three interop/lifetime
-patches in `dependencies/godot-libmpv-zero/patches/godot`; stock Godot is not a
+patches in `dependencies/godot-libmpv-zero/patches/godot` plus
+`build-support/godot/0004-restartable-openxr.patch`,
+`build-support/godot/0005-restore-stereo-on-xr-reentry.patch`, and
+`build-support/godot/0006-companion-overlay.patch`; stock Godot is not a
 supported runtime for this build.
 
 ## Local build and launch helper
 
 On Linux x86-64 with Nix, run `./build.sh` from this checkout (or invoke it by
 absolute path). It enters the project's development shell, initializes missing
-submodules, builds missing patched Godot/mpv/Steam Audio dependencies, builds
+submodules, resolves the patched Godot and Steam Audio builds, builds missing mpv dependencies, builds
 and stages the C++ and Rust extensions, fetches verified media and viseme
 runtimes, then imports the Godot project. `JOBS=8 ./build.sh` changes C++ build
 parallelism. Existing dependency working trees and lobby secrets are preserved.
-Staged `.local` dependency outputs are reused for fast iteration; use
+Godot and Steam Audio derivations are always resolved so new local patches cannot
+be skipped; unchanged Nix outputs are reused. Other staged dependencies are reused; use
 `./build.sh --refresh-deps` to rebuild them from the pinned flake after dependency
 changes. A first build or dependency refresh can take substantially longer.
 
-Run `./run.sh` for VR after starting the headset runtime, `./run.sh --desktop`
-for desktop mode, or `./run.sh --editor` for the patched editor. The launcher sets
+Run `./run.sh` to try VR with a desktop fallback, `./run.sh --desktop`
+to start in desktop mode (Enter VR remains available), or `./run.sh --editor` for the patched editor. The launcher sets
 libmpv and media-helper paths and enters the same Nix shell. It does not rebuild;
 repeat `./build.sh` after native changes. GDScript changes need only a restart.
 Use `./run.sh --desktop --test-vrm /path/model.vrm` for an isolated offline
 private-avatar comparison; see [avatars](AVATARS.md#private-vrm-comparison-local-development-only).
+For the runtime-import proof (original bytes, no editor import), use
+`./run.sh --desktop --runtime-vrm /path/model.vrm`. This previews the file offline;
+choose a bundled avatar to connect again. See [avatars](AVATARS.md#runtime-vrm-import-proof).
 Additional arguments go to Godot, for example:
 
 ```sh
@@ -41,10 +48,10 @@ Build these once and retain their output paths; the prim development shell suppl
 Cargo, CMake, Ninja, media fixture tools, bindgen, and Rust LLVM utilities.
 
 ```sh
-nix build ./dependencies/godot-libmpv-zero#godot-interop -o .local/godot
+./tools/build-godot.sh
 nix build ./dependencies/godot-libmpv-zero#mpv -o .local/mpv
 nix build ./dependencies/godot-libmpv-zero#mpv.dev -o .local/mpv-dev
-nix build ./dependencies/godot-libmpv-zero#steam-audio -o .local/steam-audio
+./tools/build-steam-audio.sh
 nix develop
 cargo build
 cmake -S dependencies/godot-libmpv-zero -B .local/video-build -G Ninja \
@@ -100,7 +107,11 @@ These are the tested recipe stages; compiler paths are supplied locally:
    and `gcc-ranlib` from the underlying GCC package as well as the normal tools.
    Cross compiler wrappers must clear the host `NIX_CFLAGS_COMPILE` and
    `NIX_LDFLAGS`; add the Windows sysroot's include/lib directories instead.
-2. Copy the pinned Godot 4.7.2 source from nixpkgs; apply the three Godot patches.
+2. Copy the pinned Godot 4.7.2 source from nixpkgs; apply the three media Godot patches,
+   then `build-support/godot/0004-restartable-openxr.patch`,
+   `build-support/godot/0005-restore-stereo-on-xr-reentry.patch`, and
+   `build-support/godot/0006-companion-overlay.patch`. The overlay hook is optional
+   at runtime; SteamVR continues to use an ordinary scene session.
    Build with `scons platform=windows arch=x86_64 target=template_debug
    use_mingw=yes use_static_cpp=yes d3d12=no opengl3=yes debug_symbols=no
    lto=none -j4`, with `MINGW_PREFIX` pointing to the cross toolchain.
@@ -120,7 +131,7 @@ These are the tested recipe stages; compiler paths are supplied locally:
    and explicit Windows include/library directories. Install into the same sysroot.
 5. Build godot-steam-audio `8f65c29b21c1d8cdbf2d6dbfc53c92ef95dd2a93`, SDK 4.8.1,
    and godot-cpp `4862a9dcf1471c9ea19680b9faadb5b6a9432092` using the sources,
-   hashes, class profile and four patches recorded in the video dependency's
+   hashes, class profile and five patches recorded in the video dependency's
    `nix/steam-audio.nix`. Its `steam-audio-CMakeLists.txt` now supports Windows.
    Set `GODOT_CPP_SOURCE`, `STEAM_AUDIO_SDK`, `GODOTCPP_BUILD_PROFILE`, and a
    Windows CMake toolchain; link the GCC C++ runtime statically.

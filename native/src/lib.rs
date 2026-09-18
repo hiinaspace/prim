@@ -1,6 +1,7 @@
 mod media;
 mod network;
 mod session;
+mod xr_monitor;
 pub mod viseme;
 use godot::prelude::*;
 struct PrimExtension;

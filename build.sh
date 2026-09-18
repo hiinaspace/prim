@@ -5,7 +5,7 @@ prim_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$prim_root"
 if [[ ${1:-} == --help ]]; then
     echo 'Usage: ./build.sh [--refresh-deps]  (Linux x86-64; Nix required; JOBS defaults to 4)'
-    echo 'Then ./run.sh for VR, ./run.sh --desktop, or ./run.sh --editor.'
+    echo 'Then ./run.sh (auto VR), ./run.sh --desktop, or ./run.sh --editor.'
     exit 0
 fi
 refresh_deps=0
@@ -27,8 +27,11 @@ if [[ ! -f dependencies/godot-libmpv-zero/godot-cpp/CMakeLists.txt ]]; then
     git -C dependencies/godot-libmpv-zero submodule update --init -- godot-cpp
 fi
 mkdir -p .local project/bin/linux project/addons/godot-steam-audio
-for item in godot-interop mpv mpv.dev steam-audio; do
-    case "$item" in godot-interop) link=godot;; mpv.dev) link=mpv-dev;; *) link=$item;; esac
+# Always resolve the engine derivation so an old staged engine cannot omit XR fixes.
+./tools/build-godot.sh
+./tools/build-steam-audio.sh
+for item in mpv mpv.dev; do
+    case "$item" in mpv.dev) link=mpv-dev;; *) link=$item;; esac
     if (( refresh_deps )) || [[ ! -e .local/$link ]]; then
         nix build "./dependencies/godot-libmpv-zero#$item" -o ".local/$link"
     else
@@ -75,4 +78,4 @@ else:
 PY
 LIBMPV_ZERO_MPV_LIBRARY="$prim_root/.local/mpv/lib/libmpv.so.2" \
     .local/godot/bin/godot --headless --path project --xr-mode off --editor --import
-echo 'Build ready. Run ./run.sh (VR), ./run.sh --desktop, or ./run.sh --editor.'
+echo 'Build ready. Run ./run.sh (auto VR), ./run.sh --desktop, or ./run.sh --editor.'

@@ -7,19 +7,19 @@
 <h1>prim</h1>
 <p>A small shared video room for friends, with desktop and VR modes. This is an early test build; please keep this link within the friend group.</p>
 <h2>Download</h2>
-<p>Linux and Windows launcher 0.3.5, including direct video-file sharing, voice-driven avatar mouths, a mirrored preview and height calibration. No separate .NET installation is needed.</p>
+<p>Linux and Windows launcher 0.3.6, with in-session desktop/VR switching, participant video-file sharing, subtitles, clearer spatial audio and livestream playback. No separate .NET installation is needed.</p>
 <ul>
   <li><a href="downloads/windows/Prim-friends-windows-Setup.exe">Windows x64 installer</a></li>
   <li><a href="downloads/linux/Prim-friends-linux.AppImage">Linux x64 AppImage</a></li>
   <li><a href="downloads/windows/Prim-friends-windows-Portable.zip">Windows portable ZIP</a> (optional)</li>
 </ul>
-<p>Everyone in a room must use 0.3.5 or newer; the room protocol has changed.</p>
+<p>Everyone in a room must update to 0.3.6; the room protocol has changed.</p>
 <p>Linux 0.3.3 fixes startup on systems without Nix. If an older AppImage cannot open, download the new one here once.</p>
 <h2>Getting started</h2>
 <ol>
   <li>Windows: run the installer. These builds are not code-signed, so Windows may show an unknown-publisher warning. A custom installation folder can be selected with <code>--installto "D:\Games\prim"</code>.</li>
   <li>Linux: make the AppImage executable (<code>chmod +x Prim-friends-linux.AppImage</code>), then run it. Choose <strong>Install in user folder</strong> or another folder, close the download copy, and open the installed copy for future use. If FUSE is unavailable, run <code>APPIMAGE_EXTRACT_AND_RUN=1 ./Prim-friends-linux.AppImage</code>.</li>
-  <li>Start your OpenXR runtime before choosing <strong>Play VR</strong>, or choose <strong>Play Desktop</strong>. Keep the launcher open while playing.</li>
+  <li>Choose <strong>Play</strong>. Prim tries VR if available and otherwise opens in desktop mode. Use <strong>Enter VR</strong> or <strong>Leave VR</strong> in the Room menu while staying connected. Keep the launcher open while playing.</li>
 </ol>
 <p>Allow several GB of free space for the game and update staging. If you used the earlier localhost test launcher, download this version once to switch to the friends update feed.</p>
 <details>
@@ -30,7 +30,8 @@ nix-shell prim-shell.nix --run 'prim-launcher-fhs -c ./Prim-friends-linux.AppIma
 <p>The launcher's install buttons preserve this FHS wrapper in the installed shortcut. Keep the runtime root while using it.</p>
 </details>
 <h2>Sharing a video</h2>
-<p>The room host can open <strong>Sharing → Share file</strong> to choose a local video, or paste its path. Friends receive it automatically. Set an upload limit, and approve individual viewers if they need a relay. Voice remains connected while media waits for approval. Received files are cached temporarily, not saved as downloads.</p>
+<p>Anyone can browse, paste or drop a local video in <strong>Movie</strong>, then choose to share it with the room or play it only locally. Friends receive shared videos automatically. The provider can set an upload limit and approve individual viewers if they need a relay in <strong>Sharing</strong>. Voice remains connected while media waits for approval. Received files are cached temporarily, not saved as downloads.</p>
+<p>For a livestream, paste its playback URL in Movie. Prim supports externally hosted streams, including RTSP over TCP; configure OBS and your streaming server separately.</p>
 <h2>Updates and troubleshooting</h2>
 <p>The launcher checks for updates on startup. Read the changelog, click <strong>Download update</strong>, close prim, then click <strong>Install and restart</strong>. Nothing is installed automatically.</p>
 <p>If files seem broken, use <strong>Verify files</strong> or <strong>Repair installation</strong>. If the launcher itself cannot start, download it again here.</p>

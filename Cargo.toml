@@ -13,6 +13,7 @@ anyhow = "1"
 blake3 = "1"
 bytes = "1"
 futures-lite = "2"
+libloading = "0.9"
 godot = { version = "0.5.5", features = ["api-4-7", "experimental-threads"] }
 godot_network_audio = { path = "dependencies/godot-network-audio/gdext", default-features = false }
 iroh = "1.1.0"

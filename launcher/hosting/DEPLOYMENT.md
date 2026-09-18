@@ -1,6 +1,42 @@
 # Friends deployment
 
-Published 2026-09-13: https://prim.hiina.space/ — 0.3.5 for both launcher channels, combining host-file
+Published 2026-09-17: https://prim.hiina.space/ — **0.3.6 for Linux and Windows**.
+Includes desktop/VR session switching, participant file sharing, subtitles,
+reorganized desktop/VR menus, point-source spatial audio and live-stream playback.
+Everyone must update together (room protocol 4). The user accepted the Linux
+single-client headset/menu/audio/live checks before this release.
+
+Inputs: `dist/prim-0.3.6-{linux,windows}`; output:
+`.local/launcher-production/{linux,windows}`. Both Windows engine lifecycle
+patches and the point-source Steam Audio patch were rebuilt. Source is the dirty
+`main` checkout based on `015ce98`, with its release-time source hash inventory
+at `.local/release-036/source-manifest.json`; this publication did not commit or
+push source changes. New full/delta packages are approximately Linux 394/101 MiB
+and Windows 303/17 MiB. Previous feeds/bootstraps are retained on chirashi in
+`/mnt/nvme/prim/.backup-before-0.3.6`. Uploaded SHA256 hashes were verified before
+publication; signed feeds were replaced last. Public feeds/page, all referenced
+package ranges/cache headers and full Windows-installer/Linux-AppImage hashes
+match the local release.
+
+An isolated Ubuntu 0.3.5 installation authenticated the public feed, applied the
+0.3.6 delta, restarted into 0.3.6 and passed managed-file verification with `/nix`
+hidden. The first isolation run made `/var/tmp` read-only, so delta extraction
+failed and the updater successfully fell back to the full package; a repeat
+with writable temporary directories verified the delta itself. Both logs are
+retained (`natto-update.log`, `natto-delta-update.log` and their verify logs).
+
+Evidence under `.local/release-036/`: 9 native checks (public DHT test skipped),
+23 launcher self-checks on Linux and Windows/Wine, 29 packaged Windows playback
+checks, Linux packaged desktop startup/clean exit, and a three-client Linux plus
+two Windows/Wine participant-sharing session. The Ubuntu launcher passes probe,
+self-checks and file verification with `/nix` hidden. Wine's minimal endpoint
+advertised no addresses, so the mixed test enables normal networking for its
+explicitly addressed Windows clients and explicitly approves synthetic fixture
+relay traffic. It waits for actual convergence instead of a one-second decode
+delay. No shipping-code workaround was needed. Native Windows installation,
+SteamVR/WiVRn and longer Internet friend sessions remain human gates.
+
+Previous release, 2026-09-13: https://prim.hiina.space/ — 0.3.5 for both launcher channels, combining host-file
 streaming, voice-driven visemes, and the existing Linux portability fixes.
 Game inputs: `dist/prim-0.3.5-{linux,windows}`. Signed package output:
 `.local/launcher-production-035/{linux,windows}` in the streaming worktree.
@@ -74,11 +110,11 @@ using a fresh version number and the appropriate staged game folder:
 
 ```sh
 python3 tools/pack-launcher.py \
-  --platform linux --version 0.3.4 \
-  --game-dir dist/prim-avatar-portable-linux \
+  --platform linux --version 0.3.7 \
+  --game-dir dist/prim-0.3.7-linux \
   --feed-url https://prim.hiina.space/downloads \
   --key /home/s/.local/share/prim-release-signing/prim-release.pem \
-  --notes launcher/releases/0.3.4.md \
+  --notes launcher/releases/0.3.7.md \
   --output .local/launcher-production --fhs
 ```
 

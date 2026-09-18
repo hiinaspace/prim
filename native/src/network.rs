@@ -279,7 +279,7 @@ async fn establish(
 ) -> Result<()> {
     let expected = proof(&connection, &secret)?;
     let hello = Hello {
-        version: 3,
+        version: 4,
         proof: expected,
         address: Address::from_endpoint(&endpoint),
         name: state.name.clone(),
@@ -298,7 +298,7 @@ async fn establish(
         write_frame(&mut send, &hello).await?;
         remote
     };
-    if remote.version != 3 {
+    if remote.version != 4 {
         connection.close(1u8.into(), b"update prim: incompatible version");
         bail!("Incompatible Prim version; update all clients");
     }

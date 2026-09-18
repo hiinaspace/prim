@@ -23,7 +23,7 @@ fn media_identity_and_consent_are_scoped() {
     }
     assert_eq!(gate(2, "denied"), DENIED);
     let media = Media::new();
-    media.view.lock().unwrap().descriptor = Some(descriptor.clone());
+    media.view.lock().unwrap().publication = Some(descriptor.clone());
     media.view.lock().unwrap().viewers.insert(
         "viewer".into(),
         Viewer {
@@ -116,16 +116,17 @@ fn real_iroh_ranges_seek_cache_revoke_and_relay_gate() {
     std::fs::write(&path, &fixture).unwrap();
     let (host, client) = pair();
     assert!(host.shared.media.share(path.to_string_lossy().into()));
-    wait_until(|| host.shared.media.view.lock().unwrap().descriptor.is_some());
+    wait_until(|| host.shared.media.view.lock().unwrap().offered.is_some());
     let descriptor = host
         .shared
         .media
         .view
         .lock()
         .unwrap()
-        .descriptor
+        .offered
         .clone()
         .unwrap();
+    assert!(host.shared.media.publish(&descriptor.id));
     assert!(client.shared.media.receive(descriptor.clone()));
     wait_until(|| !client.shared.media.view.lock().unwrap().url.is_empty());
     let url = client.shared.media.view.lock().unwrap().url.clone();
@@ -174,17 +175,18 @@ fn real_iroh_ranges_seek_cache_revoke_and_relay_gate() {
     assert_eq!(body(&read.join().unwrap()), &fixture[2097152..2097253]);
     // Replacing a share revokes old capabilities and consent, even for the same path.
     assert!(host.shared.media.share(path.to_string_lossy().into()));
-    wait_until(|| host.shared.media.view.lock().unwrap().descriptor.is_some());
+    wait_until(|| host.shared.media.view.lock().unwrap().offered.is_some());
     let replacement = host
         .shared
         .media
         .view
         .lock()
         .unwrap()
-        .descriptor
+        .offered
         .clone()
         .unwrap();
     assert_ne!(replacement.id, descriptor.id);
+    assert!(host.shared.media.publish(&replacement.id));
     host.shared.media.test_path.store(1, Ordering::Release);
     assert!(client.shared.media.receive(replacement));
     wait_until(|| !client.shared.media.view.lock().unwrap().url.is_empty());
@@ -211,19 +213,81 @@ fn real_iroh_ranges_seek_cache_revoke_and_relay_gate() {
         "Range: bytes=2097152-2097162\r\n"
     ))
     .is_empty());
-    assert!(host
-        .shared
-        .media
-        .view
-        .lock()
-        .unwrap()
-        .status
-        .contains("changed"));
+    assert!(!host.shared.media.publication_active());
     host.shared.media.stop();
     client.shared.media.stop();
     assert!(request(&url, "GET", "").starts_with(b"HTTP/1.1 404"));
     assert!(host.shared.media.view.lock().unwrap().viewers.is_empty());
     drop(client);
     drop(host);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn nonhost_provider_preparation_preserves_receiving_and_old_publication() {
+    let path = std::env::temp_dir().join(format!("prim-provider-{}.bin", random_id()));
+    std::fs::write(&path, vec![17u8; (2 * BLOCK) as usize]).unwrap();
+    let (host, provider) = pair();
+    assert!(!provider.shared.is_host());
+    let prepare = |media: &Media| {
+        assert!(media.share(path.to_string_lossy().into()));
+        wait_until(|| media.view.lock().unwrap().offered.is_some());
+        media.view.lock().unwrap().offered.clone().unwrap()
+    };
+    let old = prepare(&host.shared.media);
+    assert!(host.shared.media.publish(&old.id));
+    assert!(provider.shared.media.receive(old));
+    wait_until(|| !provider.shared.media.view.lock().unwrap().url.is_empty());
+    let receiving = provider.shared.media.view.lock().unwrap().url.clone();
+    assert_eq!(
+        body(&request(&receiving, "GET", "Range: bytes=0-10\r\n")),
+        &[17; 11]
+    );
+    let offered = prepare(&provider.shared.media);
+    assert_eq!(provider.shared.media.view.lock().unwrap().url, receiving);
+    assert!(provider.shared.media.publish(&offered.id));
+    assert_eq!(provider.shared.media.view.lock().unwrap().url, receiving);
+    assert!(host.shared.media.receive(offered.clone()));
+    wait_until(|| !host.shared.media.view.lock().unwrap().url.is_empty());
+    let url = host.shared.media.view.lock().unwrap().url.clone();
+    assert_eq!(
+        body(&request(&url, "GET", "Range: bytes=0-10\r\n")),
+        &[17; 11]
+    );
+    let pending = prepare(&provider.shared.media);
+    provider.shared.media.cancel_offer();
+    assert!(!provider.shared.media.publish(&pending.id));
+    assert!(provider.shared.media.publication_active());
+    provider.shared.media.stop_publishing(&pending.id);
+    assert!(provider.shared.media.publication_active());
+    assert!(provider.shared.media.share("/no/such/prim-file".into()));
+    wait_until(|| {
+        provider
+            .shared
+            .media
+            .view
+            .lock()
+            .unwrap()
+            .offer_status
+            .contains("Cannot")
+    });
+    assert!(provider.shared.media.publication_active());
+    // A non-host provider owns relay permission, including for the room host.
+    provider.shared.media.test_path.store(2, Ordering::Release);
+    let host_id = host.shared.local.read().unwrap().clone();
+    let u = url.clone();
+    let pending_read =
+        std::thread::spawn(move || request(&u, "GET", "Range: bytes=1048576-1048586\r\n"));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        provider.shared.media.view.lock().unwrap().viewers[&host_id].consent,
+        "pending"
+    );
+    provider.shared.media.consent(&offered.id, &host_id, true);
+    assert_eq!(body(&pending_read.join().unwrap()), &[17; 11]);
+    provider.shared.media.stop_publishing(&offered.id);
+    assert!(!provider.shared.media.publication_active());
+    host.shared.stop();
+    provider.shared.stop();
     std::fs::remove_file(path).unwrap();
 }
