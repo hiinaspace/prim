@@ -2,7 +2,7 @@
 
 Updated 2026-09-19. The user subsequently authorized implementation of steps
 1–4. Step 5 remains deferred; the source/build/public-repo audit belongs to a
-separate task. Release 0.3.9 is being prepared at the user's request.
+separate task. Release 0.3.9 has been published to both updater channels at the user's request.
 
 ## Implementation and qualification
 
@@ -242,8 +242,9 @@ voice routing. Do not include host migration in this extraction.
 ## Next checks
 
 Retry the friend's Arch/Envision/WayVR setup with the compatibility option.
-Check the final headset-facing wrist layout, independent deafen with friends and
-media, then opt-in Windows SteamVR stereo with Index and streamed Quest setups.
+The user confirmed the final headset-facing wrist layout under Monado. Check
+independent deafen with friends and media, then opt-in Windows SteamVR stereo
+with Index and streamed Quest setups.
 Keep the foreground game running for a useful latency/performance comparison.
 If stereo is objectionable, compare the planned mono quad fallback before adding
 more rendering machinery. Step 5 requires its own later plan/work block.

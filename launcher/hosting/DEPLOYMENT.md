@@ -1,5 +1,60 @@
 # Friends deployment
 
+Published 2026-09-19 UTC: **0.3.9 for Linux and Windows**.
+Adds headset-facing wrist mic/deafen controls, tracked desktop yaw, peek stick
+locomotion, Envision/Monado status lookup and above-WayVR compatibility ordering,
+plus opt-in experimental SteamVR stereo peek. Room protocol remains 4.
+
+Companion source is committed/pushed as `65f6df8`. Existing avatar-preview and
+spring fixes are unchanged from the 0.3.8 release inventory and remain separate
+working-tree work. The exact build inputs are recorded in
+`.local/release-039/source-manifest.json`; game directories are
+`dist/prim-0.3.9-{linux,windows}`. The separate source-publication audit is deferred.
+
+User headset checks passed Linux SteamVR stereo/gesture/wrist interaction and
+the final Monado wrist layout/dwell. Automated companion/menu/policy checks from
+this work passed. Both packaged games passed desktop Vulkan startup (Windows
+under Wine), and both final launchers passed 23 self-checks. On Ubuntu 26.04.1,
+the final AppImage passed probe, self-checks, managed-file verification and an
+AMD Radeon 780M Vulkan game smoke with `/nix` hidden. The isolation fixture emits
+read-only font-cache and existing locale/XIM warnings; there were no game script
+or extension-load errors. Native Windows overlay, other controller profiles,
+friend-machine Arch composition and actual delta installation remain follow-ups.
+
+Linux full/delta packages are approximately 397/61 MiB; Windows 304/9.3 MiB,
+with deltas from 0.3.8. Both RSA-PSS feeds and new package hashes were checked
+before upload. Staged SHA256 hashes matched remotely; publication used the
+existing lock and installed immutable packages before signed feeds. Previous
+bootstraps/feeds are under `/mnt/nvme/prim/.backup-before-0.3.9`. Evidence and
+public verification results are in `.local/release-039/`. Public signed feeds,
+all 26 referenced package ranges, the download page and full HTTPS SHA256
+hashes of all three bootstraps were verified after publication.
+
+Published 2026-09-19 UTC: **0.3.8 for Linux and Windows**.
+Adds SteamVR background head/controller tracking and automatic ordinary OpenXR
+scene handoff, with confirmed deliberate takeover, plus the tested Monado
+companion overlay work. The Linux glibc 2.43 packaging fix is retained.
+Room protocol remains 4.
+
+Inputs are the tested `.local/steamvr-implementation/package-{linux,windows}`;
+launcher output is `.local/launcher-production/{linux,windows}`. Source remains
+the dirty main checkout at 434b3b3; `.local/release-038/source-manifest.json` records
+the release-time source inventory. No source commit or push was made.
+
+Linux SteamVR passed 35 live companion/remote-pose checks and the user headset
+check. Monado companion (68), menu (75), gesture (22), ownership policy (19),
+Linux helper portability, Windows cross-build and packaged Wine Vulkan startup
+passed. Both final launchers passed 23 self-checks. Native Windows SteamVR
+headset/eviction remains a friends-testing item.
+
+Both feeds were signed with the existing key. Uploaded artifacts matched SHA256
+before the publication lock was acquired; immutable packages were installed
+first and signed feeds last. Previous bootstraps/feeds are retained at
+`/mnt/nvme/prim/.backup-before-0.3.8`. Release evidence is in `.local/release-038/`.
+Public page and signed-feed bytes matched; all 22 referenced package ranges and
+cache headers passed. Full HTTPS downloads of the Linux AppImage, Windows
+installer and portable ZIP matched the local SHA256 hashes.
+
 Published 2026-09-19 UTC: **Linux 0.3.7; Windows remains 0.3.6**.
 Linux-only packaging hotfix for Envision/Monado requiring `GLIBC_2.43` from
 libm. The game uses a coherent glibc 2.43 set built by
@@ -138,11 +193,11 @@ using a fresh version number and the appropriate staged game folder:
 
 ```sh
 python3 tools/pack-launcher.py \
-  --platform linux --version 0.3.7 \
-  --game-dir dist/prim-0.3.7-linux \
+  --platform linux --version NEXT_VERSION \
+  --game-dir PATH_TO_TESTED_LINUX_BUILD \
   --feed-url https://prim.hiina.space/downloads \
   --key /home/s/.local/share/prim-release-signing/prim-release.pem \
-  --notes launcher/releases/0.3.7.md \
+  --notes launcher/releases/NEXT_VERSION.md \
   --output .local/launcher-production --fhs
 ```
 
