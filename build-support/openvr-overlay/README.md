@@ -35,3 +35,28 @@ running and an active headset/controllers. `PRIM_PEEK_INTERACTIVE=1` adds a
 2-minute gesture/wrist check. The test uses a rendering OpenXR reference game
 with a distinct executable name; a non-rendering ownership probe remains stuck
 on SteamVR's Next up screen, and shared executable identities can mix bindings.
+
+## Native Windows contributor test
+
+Use a Windows candidate with the helper/extension staged as described in
+[building](../../docs/BUILDING.md), or the corresponding official signed package.
+Record its exact version/revision, Windows/GPU/SteamVR versions, headset and
+controllers. This is a manual native-Windows test; the Python harness above is
+Linux-oriented and Wine does not substitute for headset qualification.
+
+1. For a custom candidate, package the same isolated development lobby configuration
+   for both peers. The packaged application currently reads the configuration from
+   its PCK, not a runtime room picker. With official packages, coordinate manual
+   testing with participants in their shared lobby instead. Verify voice and
+   ordinary head/hand tracking. Enable **Comfort → Experimental SteamVR peek**.
+2. Start another VR game. Verify it keeps the scene role while the peer still
+   receives your tracked avatar and voice. Check Prim's hidden/revealed states.
+3. Try lift/hide, latch/unlatch, explicit Hide and both wrist dwell controls.
+   Confirm visible stereo, correct eye placement, readable text and independent
+   mute/deafen. Record any missing controller bindings or unusual eye rendering.
+4. Exercise game exit → Prim scene → game again, then disable/re-enable VR.
+   Membership and microphone choice should persist; the other game should retain
+   its own controls. Report interference or unexpected scene takeover.
+5. Report actual observed behavior, logs with personal data removed, and any
+   untested cases. Measure foreground-game frame timing separately if making a
+   performance claim; a visually successful peek alone does not establish it.

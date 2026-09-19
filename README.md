@@ -1,5 +1,12 @@
 # prim
 
+Prim is a shared virtual living room: talk with friends, inhabit avatars, watch
+media, and stay together across activities. See [project direction](docs/DIRECTION.md)
+for the longer-term design and [contributing](CONTRIBUTING.md) for useful work.
+Agent-assisted fixes and exploratory draft PRs are welcome; start with
+[AGENTS.md](AGENTS.md). The official user-facing build is maintainer-signed and
+available at [prim.hiina.space](https://prim.hiina.space/).
+
 A six-person Godot theater prototype with synchronized local video, Steam Audio
 spatial voice, bundled VRM avatars, and a shared-secret Iroh/DHT lobby. Linux and
 Windows builds include the patched Godot/libmpv runtime, yt-dlp and Deno.
@@ -40,13 +47,23 @@ Repeat it after native changes; GDScript changes need only a restart. Use
 build can take a while; subsequent builds reuse Nix and Cargo caches.
 
 See [building](docs/BUILDING.md), [protocol boundaries](docs/PROTOCOL.md), and
-[private build testing](docs/TESTING.md). Automated Linux, six-client, public-DHT
+[testing](docs/TESTING.md). Automated Linux, six-client, public-DHT
 and mixed Linux/Windows-under-Wine checks have passed. Native Windows and headset
 validation are manual gates.
 
 A lost host stops shared-file playback and preserves ordinary local/URL playback; reconnecting can establish a new
 room. Build outputs and the generated lobby secret are excluded from Git. The
-secret belongs only in private packages, never DHT records or diagnostic logs.
+development secret creates an isolated test room. The initial public testing
+arrangement is a single shared friends-scale lobby; sharing its configuration
+does not provide private membership. Secret values stay out of DHT records and
+diagnostic logs. See [release and lobby policy](CONTRIBUTING.md#releases-compatibility-and-the-shared-lobby).
 
 Implementation and future media work: [direct file sharing and OBS livestreaming](docs/DIRECT_MEDIA_PLAN.md),
 with relay-use confirmation and a separate later overlay/remote-play track.
+
+Longer-term design: [the persistent living room and external experiences](docs/EXPERIENCE_CONTINUITY.md)
+records desktop/XR transitions, activity-aware voice, trusted game launch, and
+the first mech-vr solo spectator use case. It does not change current priorities.
+
+Original Prim source is [Unlicense](UNLICENSE). Third-party code, adapted viseme
+code and bundled avatars retain their own terms; see [licensing and attribution](LICENSES.md).

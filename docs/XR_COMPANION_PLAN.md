@@ -71,14 +71,15 @@ deciding whether Prim may accept ordinary controller input.
   currently lists headless for Monado and SteamVR, and overlay for Monado but
   not SteamVR. Installed extension enumeration and actual coexistence determine
   support; inventory is not a runtime test.
-- Local [libmonado API](/home/s/lib/monado/src/xrt/targets/libmonado/monado.h)
+- The libmonado API (see Prim's [optional client](../native/src/xr_monitor.rs))
   exposes client names and primary/active/visible/focused/overlay flags. Prefer
   its versioned C ABI to implementing raw Monado IPC. Load it optionally.
-- The [earlier Godot spike](/home/s/code/godot-openxr-overlay/docs/validation.md)
+- An earlier standalone Godot spike
   recorded concurrent Monado sessions, stereo submission and active Knuckles
   tracking. It did not establish perceived transparency, physical button
   behavior beside a game, or sustained performance. Reuse its extension wrapper
-  and small projection-alpha patch, not its old engine binary.
+  and small projection-alpha patch, not its old engine binary. The subsequent
+  Prim implementation/evidence is in [companion testing](XR_COMPANION_TEST.md).
 - A later SteamVR status adapter can inspect Valve's
   [OpenVR application API](https://github.com/ValveSoftware/openvr/blob/master/headers/openvr.h)
   (`GetCurrentSceneProcessId`). SteamVR rendering/overlay work is a separate
@@ -123,9 +124,8 @@ Implemented a small WayVR background-owner allowlist patch, documented in
 [build-support/wayvr](../build-support/wayvr/README.md). Prim is below WayVR;
 WayVR suppresses only its skybox while Prim's overlay is active. The live ownership
 transitions passed; final headset composition is still a human gate. Do not silently change its persistent configuration or introduce a dummy
-main session merely to change WayVR's visibility event. Source evidence:
-[layer submission](/home/s/code/wayvr/wayvr/src/backend/openxr/mod.rs:431),
-[overlay placement](/home/s/code/wayvr/wayvr/src/backend/openxr/helpers.rs:153).
+main session merely to change WayVR's visibility event. The relevant source
+context and patch are retained in [the WayVR notes](../build-support/wayvr/README.md).
 
 ## Runtime status and transitions
 

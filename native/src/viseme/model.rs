@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Basis OpenLipSync; see native/viseme-model/NOTICE.md.
 use anyhow::{ensure, Context, Result};
 use ort::{
     session::Session,

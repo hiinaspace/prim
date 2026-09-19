@@ -23,3 +23,16 @@
 - The file's own metadata instead names `Other` with a VRoid Hub license URL
   specifying redistribution and modification allowed. Both the source notice
   and this metadata distinction are recorded here; the VRM is unchanged.
+
+## Source publication license scope
+
+The root Unlicense does not apply to these models. The exact hashes above were
+checked again for source publication on 2026-09-19; neither VRM was modified.
+Alicia retains its embedded special-license link and use restrictions. Its
+[character terms](https://3d.nicovideo.jp/alicia/rule.html) apply, including their
+limits on use and sublicensing; do not present it as unrestricted Prim-authored art.
+For Vita, use the embedded permissions rather than treating the historical CC0
+source notice as a new license grant. Its exact
+[VRoid Hub terms](https://hub.vroid.com/license?allowed_to_use_user=everyone&characterization_allowed_user=everyone&corporate_commercial_use=allow&credit=unnecessary&modification=allow&personal_commercial_use=profit&redistribution=allow&sexual_expression=allow&version=1&violent_expression=allow)
+allow redistribution and alteration and do not require attribution; the original
+metadata and provenance are retained here anyway.

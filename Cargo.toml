@@ -2,7 +2,7 @@
 name = "prim_native"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Unlicense AND Apache-2.0"
 
 [lib]
 path = "native/src/lib.rs"

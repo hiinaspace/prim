@@ -1,12 +1,14 @@
-# Private build test
+# Building and testing a candidate
 
-Current friends launcher: **0.3.6**, https://prim.hiina.space/. Update everyone
-together (protocol 4). The Linux single-client XR/menu/audio/live batch was
-accepted by the user. Release evidence is in `.local/release-036/` and
-`launcher/hosting/DEPLOYMENT.md`; native Windows and multi-runtime friend sessions
-remain distinct tests.
+Use one matching candidate for all participants; see [protocol](PROTOCOL.md) for
+the current wire version and [building](BUILDING.md) for source setup. For the
+official signed build see [the download page](https://prim.hiina.space/).
+The records below describe particular earlier revisions, not a fresh test of
+your checkout. Current companion follow-up is in [COMPANION_NEXT_PLAN.md](COMPANION_NEXT_PLAN.md).
+Native Windows and individual runtime/headset combinations remain distinct checks.
 
-Extract the whole archive. Both packages share one private lobby configuration.
+Extract the whole archive. Matching friends packages use a shared lobby configuration;
+source builds generate an isolated one. See [lobby policy](../CONTRIBUTING.md#releases-compatibility-and-the-shared-lobby).
 Start in singleplayer; the microphone is muted until explicitly enabled after
 connecting. Allow the application through the firewall when prompted.
 
@@ -100,14 +102,15 @@ success is useful coverage but does not establish native Windows PCVR support.
 Please verify single-controller tracking transitions and menu use in a headset,
 and compare movie volume at a fixed seat versus walking away from the screen.
 
-## Direct file sharing worktree
+## Direct file sharing
 
-In `/home/s/code/prim-streaming-plan` (`codex/direct-media-plan`), connect as host,
-open **Sharing**, choose **Share file** (desktop native picker) or paste a path,
-and set the aggregate upload limit. Guests resolve the descriptor automatically.
-If a viewer needs a relay, the Theater status points to Sharing; choose Allow or
-Direct only for that viewer. Re-sharing resets approval. All clients need hello
-version 3. Stop sharing or leave the room to revoke the file.
+In the current checkout, connect, open **Movie → Browse… → Share with room**,
+and use **Sharing** for the aggregate upload limit and per-viewer relay approval.
+Any participant can provide the file; the room host still orders playback.
+Re-sharing resets approval. Stop sharing or leave the room to revoke the file.
+Use matching clients; [protocol](PROTOCOL.md) describes the current handshake.
+The evidence below was recorded during the initial host-only sharing experiment;
+later participant-sharing checks appear further down this document.
 
 Reproducible checks, after staging the patched Godot/libmpv runtime as described
 above (set `GODOT` and `LIBMPV_ZERO_MPV_LIBRARY` for custom runtime locations):
@@ -176,6 +179,7 @@ nix develop --command cargo clippy --all-targets -- -D warnings
 nix develop --command python3 tools/test-playback-controls.py
 PRIM_TEST_SHARED_FILE=1 PRIM_TEST_PROVIDER=client0 PRIM_TEST_PEERS=5 PRIM_TEST_CONTAINER=mkv nix develop --command python3 tools/test-integration.py
 PRIM_TEST_SCRIPT=sharing.gd PRIM_TEST_PEERS=2 PRIM_TEST_CONTAINER=mkv nix develop --command python3 tools/test-integration.py
+./run.sh --desktop --script res://tests/runtime_vrm.gd
 ```
 
 Use isolated `XDG_DATA_HOME` for direct test-script launches and a private X display
@@ -185,6 +189,8 @@ folder. `PRIM_TEST_WINDOWS_EXE` runs the exported Windows test package under Win
 use an isolated Wine prefix and export the corresponding test script first.
 
 Treat engine/script errors in logs as failures even if a test prints PASS.
+Runtime tests also check that every imported spring initializes in repeated
+avatar instances; exported packages exercise script remapping separately.
 
 Focused control fixtures exercise channel isolation, sample alignment, 5.1 center downmix, output
 switching, pause/seek, movie gain, subtitle enumeration/selection/Off, rendered
@@ -197,6 +203,13 @@ stop, provider departure, URL transitions, and independent subtitle choices.
 Native range tests retain byte equality, bounded cache, mutation rejection,
 revocation and controlled relay-policy checks; new preparation tests preserve
 an incoming stream and active publication during replacement/cancellation/errors.
+
+Runtime-import fixtures copy raw VRMs without import sidecars, check normalized
+fingers, first/third-person mesh data, spring initialization against actual bone
+indices, finite solved poses, and no repeated reset during ordinary movement.
+For exported packages, pass `PRIM_RUNTIME_VRM_FIXTURE` pointing to an external raw
+VRM file without an import sidecar. These fixtures do not prove all VRM versions
+or arbitrary proportions work.
 
 Manual follow-up: compare Direct stereo/Screen speakers in the headset; try the
 actual OS picker and desktop file drop on Linux/native Windows; compare local and

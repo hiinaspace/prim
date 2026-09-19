@@ -6,19 +6,23 @@ Use the same candidate on every room participant; older builds lack this mode.
 
 ## Publish and receive
 
-In an existing OBS setup, use Custom streaming service:
+Use a MediaMTX server you control and whose RTMP/RTSP listeners are reachable by
+the intended viewers. Substitute its hostname, configured ports and test stream
+path for `media.example.test:1935`, `media.example.test:8554` and `prim-test` below;
+these are placeholders, not a project-provided service. Supply any authentication
+required by your server. In OBS, use Custom streaming service:
 
-- Server: `rtmp://c.hiina.space`
-- Stream key/path: `test`
+- Server: `rtmp://media.example.test:1935`
+- Stream key/path: `prim-test`
 - For this first test use H.264 video and AAC audio.
 
-Start streaming, then paste **`rtsp://c.hiina.space/test`** into Movie and Open.
-MediaMTX listens on RTMP 1935 and RTSP 554. Prim explicitly selects TCP for
+Start streaming, then paste **`rtsp://media.example.test:8554/prim-test`** into Movie and Open.
+Use your configured listener ports. Prim explicitly selects TCP for
 RTSP; the URL remains `rtsp://`, without VRChat's `rtspt://` spelling.
 Standalone comparison:
 
 ```sh
-mpv --no-config --rtsp-transport=tcp rtsp://c.hiina.space/test
+mpv --no-config --rtsp-transport=tcp rtsp://media.example.test:8554/prim-test
 ```
 
 A 404 before the publisher starts is expected. Start OBS and use **Reconnect
@@ -98,7 +102,7 @@ Reproduce focused tests after staging the native extension:
 ```sh
 # Use the runtime environment from run.sh / docs/BUILDING.md.
 GODOT="$PWD/.local/godot/bin/godot" PRIM_TEST_SCRIPT=media_modes.gd \
-  PRIM_TEST_LIVE_URL=rtsp://c.hiina.space/test \
+  PRIM_TEST_LIVE_URL=rtsp://media.example.test:8554/prim-test \
   nix develop --command python tools/test-integration.py
 # Omit PRIM_TEST_LIVE_URL to test finite/local-only playback without a publisher.
 ```

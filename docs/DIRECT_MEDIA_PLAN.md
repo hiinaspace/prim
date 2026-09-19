@@ -1,9 +1,12 @@
 # Direct media sharing
 
-Research and implementation plan, 2026-09-13. **Initial host-file range streaming
-is implemented in this worktree.** See [protocol](PROTOCOL.md) for the concrete
-wire format and [testing](TESTING.md#direct-file-sharing-worktree) for evidence
-and outstanding qualification. Livestreaming and overlays remain planned.
+Historical research and implementation plan, 2026-09-13. Initial host-file range
+streaming was implemented during this work. Current code supports participant
+providers and live URL playback, with later companion/peek work; see
+[protocol](PROTOCOL.md), [testing](TESTING.md#direct-file-sharing),
+[live input](LIVESTREAM_TEST.md) and [companion follow-up](COMPANION_NEXT_PLAN.md).
+The ordered experiments below are the original media proposal, not a current
+implementation checklist. Integrated capture/delivery and RGBD remain design work.
 
 Later product context (2026-09-16): [living room and external experiences](EXPERIENCE_CONTINUITY.md)
 adds the mech-vr solo playtest/mirror use case, continuing avatar/voice presence,
@@ -502,14 +505,13 @@ the existing theater.
 
 ### Overlay and virtual-room peek
 
-Reuse `/home/s/code/godot-openxr-overlay` for Linux/Monado and evaluate
-`/mnt/s/code/godot-openvr-overlay` for Windows/SteamVR. The current local
-[Monado validation record](/home/s/code/godot-openxr-overlay/docs/validation.md)
-documents stereo submission, alpha flags, tracking and orderly coexistence;
-physical transparency/stereo/input/haptics and real-game integration remain
-manual gates. This research read that record; it did not rerun headset tests.
-The [OpenVR project](/mnt/s/code/godot-openvr-overlay/README.md) documents
-projective overlays, a right-eye copy and tracking/timing limitations.
+The original research used separate local Monado/OpenVR spikes; their useful
+findings were stereo submission, alpha handling, tracking and orderly coexistence,
+with physical transparency/input/haptics needing separate headset checks. Later
+Prim work is recorded in [Monado companion testing](XR_COMPANION_TEST.md) and
+[OpenVR implementation/qualification](../build-support/openvr-overlay/README.md),
+including projective overlays, the right-eye copy and timing limitations. Those
+in-repository records replace the old off-repository checkout prerequisites.
 
 Abstract runtime capabilities rather than promising one universal OpenXR mode.
 Prototype background voice/pose while the Prim room is hidden, a small visible
@@ -566,9 +568,9 @@ desktop-wide keyboard/mouse control is a separate scope. Streaming enables games
 that already support local multiplayer; it does not add multiplayer to arbitrary
 single-player games.
 
-## Worktree and integration handoff
+## Historical worktree and integration handoff
 
-This plan lives in `/home/s/code/prim-streaming-plan`, branch
+This plan originated in a separate development worktree, branch
 `codex/direct-media-plan`, created from committed Prim `0f6345c` and rebased onto merged main `cd2138f`
 (visemes and launcher). It deliberately
 does not copy the live viseme/launcher changes. The committed GNA submodule was initialized here and native/Godot checks run

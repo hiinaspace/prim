@@ -1,8 +1,11 @@
 # Monado companion VR: implementation and test card
 
-Implemented locally on September 17, 2026; no new public release.
+Historical implementation/test record from September 17, 2026. Several behaviors
+below were superseded: see [companion follow-up](COMPANION_NEXT_PLAN.md) for tracked
+desktop yaw, peek locomotion, explicit reveal on unknown status and wrist controls,
+and [OpenVR qualification](../build-support/openvr-overlay/README.md) for SteamVR.
 Start with `./run.sh --desktop`, then **Enable VR**. The current Linux engine and
-native extension are staged by the normal development launcher.
+native extension are staged by `./build.sh`; `./run.sh` launches without rebuilding.
 
 ## Behavior
 
@@ -57,11 +60,11 @@ placement 5, above Prim, and suppresses only its skybox while Prim is active.
 It was applied to `/home/s/code/wayvr` and the debug service was restarted;
 Monado itself was not restarted. No persistent WayVR setting was changed.
 
-Monado is the qualified backend here. Existing ordinary scene VR remains the
-fallback on runtimes without the overlay extension; Windows/SteamVR companion
-mode and true headless remain unimplemented. `PRIM_XR_SCENE=1` explicitly selects
-the old scene role for development comparisons. Missing/stale Monado observation
-leaves companion interaction gated, not silently promoted to the room.
+This initial record qualified Monado. `PRIM_XR_SCENE=1` selects the ordinary scene
+role for development comparisons. SteamVR background tracking and experimental
+peek were added later; unknown Monado status now permits deliberate reveal while
+ordinary scene interaction remains gated. Follow the documents above for current
+behavior and outstanding platform checks. True headless operation remains separate.
 
 ## Recorded evidence
 

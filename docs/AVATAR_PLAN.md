@@ -323,7 +323,11 @@ No runtime compatibility, IK quality, headset alignment, or six-avatar performan
 has been demonstrated by this planning pass. Those are the explicit delivery
 gates above.
 
-## Local source references
+## Historical source references
+
+These paths record inputs to the original research, not contributor prerequisites.
+The resulting fit/tracking decisions and maintained implementation entry points
+are in [AVATARS.md](AVATARS.md); product direction is in [DIRECTION.md](DIRECTION.md).
 
 - Prim: `project/main.gd`, `project/main.tscn`, `project/net/avatar.gd`,
   `project/net/pose.gd`, `project/xr/controller_visual.gd`, `native/src/network.rs`,
@@ -342,6 +346,8 @@ gates above.
   `godot/addons/godot_vr_humanoid_pose/scripts/vr_humanoid_pose_modifier.gd`.
 - Basis: `/mnt/s/code/Basis/Basis/Packages/com.basis.framework/IK/BasisLocalHeightCalculator.cs`,
   `IK/BasisAvatarScaleModifier.cs`, `Drivers/Common/BasisHeightDriver.cs`.
-- Project context: `/home/s/org/projects/godot-vrchat-clone.md`,
-  `/home/s/org/projects/vr-humanoid-pose.md` (source checkouts take precedence
-  over older status notes).
+- Project context: preserve tracked human head/hand coordinates, avatar-specific
+  fit, head-anchored voice and graceful missing-tracker fallback. Compare actual
+  headset/body alignment and remote presentation; a finite solver result alone
+  does not qualify subjective fit. See [AVATARS.md](AVATARS.md) for the current
+  implementation and remaining validation.

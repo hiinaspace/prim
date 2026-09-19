@@ -1,5 +1,9 @@
 # Friends deployment
 
+Maintainer operations and historical release evidence. Contributor builds use
+[BUILDING.md](../../docs/BUILDING.md) and do not need this production host or key.
+Local artifact paths below identify past evidence, not required checkout files.
+
 Published 2026-09-19 UTC: **0.3.9 for Linux and Windows**.
 Adds headset-facing wrist mic/deafen controls, tracked desktop yaw, peek stick
 locomotion, Envision/Monado status lookup and above-WayVR compatibility ordering,
@@ -181,22 +185,23 @@ and preview mirroring fixes have automated regression coverage.
 - Feed base: `https://prim.hiina.space/downloads`; channels `friends-linux` and
   `friends-windows`. Signed manifests use no-store; versioned nupkgs are immutable.
 - Local production packages: `.local/launcher-production/{linux,windows}`.
-- **Persistent release signing key:**
-  `/home/s/.local/share/prim-release-signing/prim-release.pem` (private, outside the
-  build cache). Keep and back up this key; do not generate a new one per release.
+- **Persistent release signing key:** selected locally through
+  `PRIM_RELEASE_SIGNING_KEY` (private, outside the build cache). Keep and back up
+  the existing key; do not generate a new one per release.
   It was not uploaded to the webserver. This is update-feed signing, not Authenticode.
 
 ## Next release
 
 Build sequentially from the repository root inside `nix-shell launcher/shell.nix`,
-using a fresh version number and the appropriate staged game folder:
+using a fresh version number and the appropriate staged game folder. Set
+`PRIM_RELEASE_SIGNING_KEY` to the existing private signing-key file first:
 
 ```sh
 python3 tools/pack-launcher.py \
   --platform linux --version NEXT_VERSION \
   --game-dir PATH_TO_TESTED_LINUX_BUILD \
   --feed-url https://prim.hiina.space/downloads \
-  --key /home/s/.local/share/prim-release-signing/prim-release.pem \
+  --key "$PRIM_RELEASE_SIGNING_KEY" \
   --notes launcher/releases/NEXT_VERSION.md \
   --output .local/launcher-production --fhs
 ```

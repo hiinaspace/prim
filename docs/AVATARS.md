@@ -63,13 +63,17 @@ names and speaking state remain attached to the tracked head across model change
 The driver accepts tracking data rather than reading XR devices or network state.
 A future Basis/humanoid-pose driver can consume the same input. A general solver
 plugin framework is unnecessary at this stage. Full body poses and secondary
-motion are solved on each receiver. The native handshake version is now 2, so
-all room participants need an updated build.
+motion are solved on each receiver. See [protocol](PROTOCOL.md) for the current
+native handshake version; room participants should use the same candidate build.
 
-Deferred: robust arbitrary-proportion fitting, polished seated behavior, gesture
+Not implemented yet: robust arbitrary-proportion fitting, polished seated behavior, gesture
 expressions/emotes, animation menus, FBT, eye/face tracking, OSC and
 sender-solved body replication. VRM springs do not implement interactive
 PhysBone grabbing/stretching or inter-avatar collisions.
+
+End-to-end FBT prototypes, including necessary protocol changes, are welcome;
+see [contribution scope](../CONTRIBUTING.md#useful-contributions). This status list
+does not prohibit contributions.
 
 Voice-driven visemes now run locally from capture and remotely from decoded
 playout using Basis’s streaming OpenLipSync model. Alicia and Vita use their five
@@ -162,3 +166,31 @@ helper is not the future user-model loading/distribution feature.
 Verified locally with `hiibcot2_v6.vrm`: the importer retains all 15 authored
 visemes and the comparison mode uses five authored vowels plus approximations.
 `testsana.vrm` only has five vowels, so it cannot demonstrate full-set fidelity.
+
+## Runtime VRM import proof
+
+`./run.sh --desktop --runtime-vrm /absolute/path/model.vrm` reads a local binary
+VRM directly through `GLTFDocument.append_from_buffer`. It does not invoke the
+editor importer or require a `.import` sidecar. The resulting scene uses the
+existing RenIK, fingers, expressions and first-/third-person layers. The preview
+is offline, does not save a custom selection, and blocks Connect until a bundled
+avatar is selected again. Downloading or sending personal avatars remains later work.
+
+The loader limits input to 32 MiB and 4 MiB JSON, requires a self-contained GLB,
+rejects URI references, bounds node/material/image counts, and requires the
+normalized humanoid bones. This is a local-file proof, not the complete validation
+and resource budgeting required for network-supplied avatars. Both VRM extension
+families are registered; current tested fixtures are Alicia and Vita (VRM 0.x).
+
+FPSloppa was fast-forwarded from `a873edb` to `b0fc725` for reference. Its runtime
+extension-registration pattern informed this loader. Two narrow upstream spring
+corrections were ported: initialize from the actual skeleton bone index, and
+handle root/missing parents safely. These correctness fixes do not establish the
+cause of the reported intermittent multiplayer movement reset.
+
+Set `PRIM_TRACE_SPRINGS=1` when launching for reset telemetry. Each avatar reports
+at most once per second: instance ID, avatar ID, reason, cumulative reset count,
+and frame time. No names or pose coordinates are logged. Reasons distinguish
+sender reset/tracking, proximity visibility, local snap turn, recenter, frame stall,
+and large position jumps. Keep human comparison of the affected wearer and a
+remote viewer as the remaining reproduction gate.

@@ -11,8 +11,9 @@ The model is trained with LibriSpeech train-clean-100; the original notice
 contains its CC BY 4.0 attribution. The notice's 128-channel architecture text
 is historical: config.json and the pinned graph describe the 256-channel model.
 
-Prim's `native/src/viseme/frontend.rs` and `model.rs` are a Rust adaptation,
-2026-09-13, retaining the sample geometry, HTK filters, raw-dB normalization
+Prim's `native/src/viseme/frontend.rs` and `model.rs` are a Rust adaptation dated
+2026-09-13, released under Apache-2.0 with this notice and license retained.
+They retain the sample geometry, HTK filters, raw-dB normalization
 contract, 48-tap resampling filter and streaming cache layout. The resampler
 uses an exact rational sample clock to eliminate chunk-dependent phase drift.
 The worker uses bounded audio queues and owns all inference outside Godot's

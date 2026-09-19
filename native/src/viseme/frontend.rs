@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Adapted from Basis OpenLipSync; see native/viseme-model/NOTICE.md.
 //! OpenLipSync's paired raw-dB HTK mel frontend. See native/viseme-model/NOTICE.md.
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::{collections::VecDeque, f64::consts::PI, sync::Arc};

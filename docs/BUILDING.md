@@ -1,6 +1,26 @@
 # Building prim
 
-Use a native Linux filesystem for build outputs. Initialize submodules recursively.
+The supported helper targets Linux x86-64. Install Git and Nix with the `nix-command`
+and `flakes` experimental features enabled (for example, `experimental-features =
+nix-command flakes` in your Nix configuration). Use a native Linux filesystem for
+build outputs and a Vulkan-capable driver for the rendered application. A headset
+is optional for desktop development; audio tests also need a PulseAudio-compatible
+server. The build downloads pinned sources and runtimes from the network.
+
+Once repository access is available:
+
+```sh
+git clone --recurse-submodules https://github.com/hiinaspace/prim.git
+cd prim
+./build.sh
+./run.sh --desktop
+```
+
+For an existing clone, use `git submodule update --init --recursive` to initialize
+missing dependencies. Source builds require no production signing key, maintainer
+notes or prebuilt friends package. Initial build time/disk requirements still need
+measurement in the [publication clean-build pass](PUBLICATION_PLAN.md).
+
 The prototype expects the paired Godot build with the three interop/lifetime
 patches in `dependencies/godot-libmpv-zero/patches/godot` plus
 `build-support/godot/0004-restartable-openxr.patch`,
@@ -66,7 +86,8 @@ and `project/bin/linux`, respectively. Put the Steam Audio output (its `bin` and
 library is `target/debug/libprim_native.so`; `tools/stage-linux.sh` can also copy
 these from an already-staged video demo using `PRIM_VIDEO_PROJECT`.
 
-Generate the private lobby input once; distribute the same value in both builds:
+For an isolated development room, generate the lobby input once; distribute the
+same value privately to the builds participating in that test:
 
 ```sh
 python3 - <<'PY'
@@ -78,7 +99,10 @@ with os.fdopen(fd, 'w') as f:
 PY
 ```
 
-Never commit that file. Export presets include it in private PCKs. The initial
+Do not commit that local file. Export presets include it in PCKs, so anyone with
+such a package can obtain its room configuration; this is not a private-membership
+guarantee for the official shared lobby. See [lobby policy](../CONTRIBUTING.md#releases-compatibility-and-the-shared-lobby).
+The initial
 native descriptor is created by `tools/stage-linux.sh`; compatibility is Godot 4.7.
 
 ```sh
