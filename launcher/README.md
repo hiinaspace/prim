@@ -3,7 +3,7 @@
 Avalonia 12.1.2, self-contained .NET 10, Velopack 1.2.0. See
 [the design and deferred multiplayer work](../docs/LAUNCHER_PLAN.md).
 
-The friends deployment is live at https://prim.hiina.space/ (0.3.6 for Linux and Windows). See
+The friends deployment is live at https://prim.hiina.space/ (Linux 0.3.7, Windows 0.3.6). See
 [deployment details and the persistent signing-key location](hosting/DEPLOYMENT.md)
 for subsequent releases. The generic key-generation example below is only for a
 new deployment, not this existing feed.
@@ -12,6 +12,19 @@ new deployment, not this existing feed.
 
 The launcher consumes the existing platform game packages; it does not rebuild
 Godot/native dependencies. Use matching fresh game exports for real releases.
+Linux packaging installs the pinned, matched glibc 2.43 runtime from
+`build-support/linux-glibc.nix`, so host-loaded Monado builds can resolve their
+libm symbols. `tools/package-linux.py --glibc /path/to/glibc` accepts an explicit
+prebuilt runtime; otherwise Nix builds the pin. Never replace libm alone.
+
+For a packaging-only hotfix, first copy the verified released game directory,
+then run `python3 tools/package-linux-glibc.py --game-dir /path/to/copy` in a
+shell with Python, Nix, patchelf and binutils. This preserves the exact shipped
+PCK, engine and extensions. `tools/test-linux-glibc.py OLD_GAME NEW_GAME OUTPUT`
+checks a dynamically loaded library requiring `atanhf@GLIBC_2.43` against both
+bundles (requires a C compiler). Also test the AppImage with `/nix` hidden before
+publishing; the symbol regression alone does not qualify headset behavior.
+
 The NuGet lockfile pins library dependencies. Build each platform sequentially.
 The vpk CLI additionally needs a .NET 8 runtime on the build machine; clients do not.
 

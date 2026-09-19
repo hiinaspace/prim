@@ -1,5 +1,33 @@
 # Friends deployment
 
+Published 2026-09-19 UTC: **Linux 0.3.7; Windows remains 0.3.6**.
+Linux-only packaging hotfix for Envision/Monado requiring `GLIBC_2.43` from
+libm. The game uses a coherent glibc 2.43 set built by
+`build-support/linux-glibc.nix`; the ordinary Linux packager now installs it.
+No engine, PCK, native extension, avatar, or room-protocol changes are included.
+
+Built in `/home/s/code/prim-linux-monado-glibc`, branch
+`codex/linux-monado-glibc`, independently of the concurrent main-checkout work.
+All 269 base game files matched the shipped 0.3.6 AppImage content manifest
+before applying the runtime-only update. Input copy: `dist/prim-0.3.7-linux`;
+output: `.local/launcher-production/linux`; evidence: `.local/release-037/`.
+Full package is 394.2 MiB; delta from 0.3.6 is 2.3 MiB.
+
+Validation: a dlopen fixture requiring `atanhf@GLIBC_2.43` fails with the old
+bundle and succeeds with the new one. The final AppImage passed probe, all 23
+launcher checks, managed-file verification, and a 90-frame Vulkan desktop smoke
+on Ubuntu 26.04.1 with `/nix` hidden (AMD Radeon 780M, exit 0; Steam Audio and
+libmpv initialized). Existing locale/XIM warnings remain; CUDA is unavailable
+on that AMD host. A follow-up delta-install test could not be staged because
+the test host ran out of disk space; its incomplete test copy was removed.
+Actual friend headset/Monado validation remains pending.
+
+Uploaded artifacts were SHA256-verified, packages installed before the signed
+feed, and previous Linux bootstraps/feeds/page saved in
+`/mnt/nvme/prim/.backup-before-0.3.7`. The public signed feed, complete AppImage
+and delta hashes, page, and all referenced Linux/Windows package ranges passed.
+The Windows channel still advertises 0.3.6. Do not reuse version 0.3.7.
+
 Published 2026-09-17: https://prim.hiina.space/ — **0.3.6 for Linux and Windows**.
 Includes desktop/VR session switching, participant file sharing, subtitles,
 reorganized desktop/VR menus, point-source spatial audio and live-stream playback.

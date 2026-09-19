@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Bundle a staged Linux runtime; keep graphics drivers supplied by the host."""
-import argparse, json, os, re, shutil, subprocess
+import argparse, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
 parser.add_argument('--godot',required=True)
 parser.add_argument('--mpv',required=True)
 parser.add_argument('--out',default=str(root/'dist/prim-linux'))
+parser.add_argument('--glibc', help='Prebuilt matched glibc runtime; defaults to pinned Nix build')
 args=parser.parse_args()
 out=Path(args.out).resolve(); out.mkdir(parents=True,exist_ok=True)
 lib=out/'lib'; lib.mkdir(exist_ok=True)
@@ -95,6 +96,9 @@ subprocess.run([args.godot,'--headless','--path',str(root/'project'),'--xr-mode'
 # Keep machine paths in local build evidence, not the distributable manifest.
 (root/'.local/linux-bundle-inputs.json').write_text(json.dumps({name:str(path) for name,path in dependencies.items()},indent=2))
 (out/'runtime-libraries.json').write_text(json.dumps(sorted(dependencies),indent=2))
+glibc_command = [sys.executable, str(root/'tools/package-linux-glibc.py'), '--game-dir', str(out)]
+if args.glibc: glibc_command += ['--glibc', args.glibc]
+subprocess.run(glibc_command, check=True)
 print('Linux bundle:',out)
 
 # Keep bundled avatar and vendored implementation notices readable outside the PCK.
