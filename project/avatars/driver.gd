@@ -32,11 +32,11 @@ var ready_pose := false
 var last_view := Transform3D.IDENTITY
 var avatar_id := ""
 
-func configure(id: String, height: float, local_body: bool) -> bool:
-	if not Catalog.MODELS.has(id): return false
+func configure(id: String, height: float, local_body: bool, runtime_scene: RefCounted = null) -> bool:
+	if runtime_scene == null and not Catalog.MODELS.has(id): return false
 	avatar_id = id
 	eye_height = height
-	model = Catalog.MODELS[id].scene.instantiate()
+	model = runtime_scene.instantiate() if runtime_scene != null else Catalog.MODELS[id].scene.instantiate()
 	skeleton = find_skeleton(model)
 	if not skeleton:
 		model.free()

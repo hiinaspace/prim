@@ -18,6 +18,8 @@ var avatar_id := "alicia"
 var avatar_height := 1.6
 var avatar_epoch := 0
 var avatar_reset_epoch := 0
+var runtime_avatar_scene: RefCounted
+var runtime_avatar_loader = preload("res://avatars/runtime_vrm.gd")
 var grips: Array[XRController3D] = []
 var calibration_remaining := 0.0
 var calibration_samples: Array[float] = []
@@ -236,6 +238,8 @@ func _ready() -> void:
 	add_child(pointer)
 	var source := OS.get_environment("PRIM_MEDIA")
 	if not source.is_empty(): playback.request_source(source)
+	var preview := OS.get_environment("PRIM_RUNTIME_VRM")
+	if not preview.is_empty(): preview_runtime_vrm(preview)
 	if OS.get_environment("PRIM_AUTOJOIN") == "1": toggle_connection()
 	xr_viewport = SubViewport.new()
 	xr_viewport.name = "HeadsetViewport"
@@ -414,6 +418,9 @@ func toggle_connection() -> void:
 	if session.is_active():
 		set_muted(true)
 		session.leave_room()
+		return
+	if runtime_avatar_scene != null:
+		status_text = "Local VRM preview: choose a bundled avatar before connecting."
 		return
 	var config: Variant = JSON.parse_string(FileAccess.get_file_as_string("res://private_lobby.json")) if FileAccess.file_exists("res://private_lobby.json") else null
 	if not config is Dictionary or not config.get("secret", "") is String:
@@ -728,11 +735,12 @@ func rebuild_local_avatar() -> void:
 		local_avatar.queue_free()
 	local_avatar = AvatarDriver.new()
 	add_child(local_avatar)
-	local_avatar.configure(avatar_id, avatar_height if has_vr_tracking() else 1.6, true)
+	local_avatar.configure(avatar_id, avatar_height if has_vr_tracking() else 1.6, true, runtime_avatar_scene)
 	for visual in controller_visuals: visual.set_avatar_visible(true)
 
 func select_avatar(id: String) -> void:
 	if not AvatarCatalog.MODELS.has(id): return
+	runtime_avatar_scene = null
 	avatar_id = id
 	save_setting("avatar", "id", id)
 	avatar_configuration_changed()
@@ -804,6 +812,21 @@ func update_calibration(delta: float) -> void:
 func reset_avatar_motion(reason: String = "recenter") -> void:
 	avatar_reset_epoch = (avatar_reset_epoch + 1) & 0xffffffff
 	if local_avatar: local_avatar.request_motion_reset(reason)
+
+func preview_runtime_vrm(path: String) -> bool:
+	if session.is_active():
+		menu.avatar_status.text = "Disconnect before previewing a local VRM."
+		return false
+	var result: Dictionary = runtime_avatar_loader.load_scene(path)
+	if result.has("error"):
+		menu.avatar_status.text = result.error
+		return false
+	runtime_avatar_scene = result.scene
+	avatar_id = "local_preview"
+	rebuild_local_avatar()
+	menu.avatar_status.text = "Local VRM preview: %s. Choose Alicia or Vita to return to room play." % path.get_file()
+	menu.tabs.current_tab = menu.avatar_picker.get_parent().get_index()
+	return true
 
 func controllers_are_neutral() -> bool:
 	for controller in [left, right]:

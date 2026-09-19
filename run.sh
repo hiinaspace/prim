@@ -4,7 +4,7 @@ set -euo pipefail
 prim_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$prim_root"
 if [[ ${1:-} == --help ]]; then
-    echo 'Usage: ./run.sh [--desktop|--editor] [--test-vrm /path/model.vrm] [Godot arguments...]'
+    echo 'Usage: ./run.sh [--desktop|--editor] [--test-vrm /path/model.vrm | --runtime-vrm /path/model.vrm] [Godot arguments...]'
     echo 'Default: try VR, fall back to desktop. Build first with ./build.sh. Example smoke: ./run.sh --desktop --headless --quit-after 90'
     exit 0
 fi
@@ -28,6 +28,10 @@ while (( $# )); do
     if [[ $1 == --test-vrm ]]; then
         if (( $# < 2 )); then echo '--test-vrm requires a file path' >&2; exit 2; fi
         prim_project=$(python3 tools/prepare-vrm-preview.py "$2")
+        shift 2
+    elif [[ $1 == --runtime-vrm ]]; then
+        if (( $# < 2 )); then echo '--runtime-vrm requires a file path' >&2; exit 2; fi
+        export PRIM_RUNTIME_VRM=$(realpath -- "$2")
         shift 2
     else
         forwarded+=("$1")

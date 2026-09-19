@@ -29,7 +29,9 @@ static func from_to_rotation_safe(from: Vector3, to: Vector3) -> Quaternion:
 
 
 func get_global_pose(skel: Skeleton3D) -> Transform3D:
-	return skel.get_bone_global_pose(parent_idx) * skel.get_bone_pose(bone_idx)
+	if bone_idx < 0 or bone_idx >= skel.get_bone_count(): return Transform3D.IDENTITY
+	var parent := skel.get_bone_global_pose(parent_idx) if parent_idx >= 0 and parent_idx < skel.get_bone_count() else Transform3D.IDENTITY
+	return parent * skel.get_bone_pose(bone_idx)
 
 
 func get_local_pose_rotation(skel: Skeleton3D) -> Quaternion:
