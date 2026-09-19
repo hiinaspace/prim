@@ -18,8 +18,10 @@ cd prim
 
 For an existing clone, use `git submodule update --init --recursive` to initialize
 missing dependencies. Source builds require no production signing key, maintainer
-notes or prebuilt friends package. Initial build time/disk requirements still need
-measurement in the [publication clean-build pass](PUBLICATION_PLAN.md).
+notes or prebuilt friends package. The [publication check](PUBLICATION_PLAN.md) built an isolated checkout with four
+jobs and existing Nix/download caches. Source, native outputs and imported assets
+used roughly 4.5 GiB before extra test/package artifacts; the Nix store and download
+caches require additional space. A cold patched-engine build will take longer.
 
 The prototype expects the paired Godot build with the three interop/lifetime
 patches in `dependencies/godot-libmpv-zero/patches/godot` plus
@@ -54,8 +56,13 @@ choose a bundled avatar to connect again. See [avatars](AVATARS.md#runtime-vrm-i
 Additional arguments go to Godot, for example:
 
 ```sh
-./run.sh --desktop --headless --quit-after 90
+./run.sh --desktop --quit-after 90
 ```
+
+This smoke needs a display and a Vulkan rendering device. The full application
+is not a headless media runtime: `--headless` disables the rendering device and
+the video probe reports an error, even if Godot exits with status zero. Headless
+editor import and selected script fixtures are separate checks.
 
 A new checkout gets a random private lobby secret if none exists. Peers must
 share that same private file to discover each other. These helpers build a local

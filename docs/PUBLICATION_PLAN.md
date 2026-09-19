@@ -1,122 +1,99 @@
-# Source publication preparation
+# Public source preparation and validation
 
-Preparation and validation record, 2026-09-19. The maintainer approved the source
-license, dependency publication, intentional snapshot and GitHub visibility change.
-Source publication
-and opening contributions are separate from distributing new binaries. The
-maintainer accepts an initially shared public lobby at friends-only scale.
+2026-09-19. The maintainer approved Unlicense for original code, publication of
+missing dependency commits, a reviewed source snapshot and making the GitHub
+repository public. The official signed application remains at
+[prim.hiina.space](https://prim.hiina.space/); this work does not publish a new binary
+release or alter its update feeds.
 
-## Proposed sequence
+## Source snapshot
 
-1. Review [direction](DIRECTION.md), [agent guidance](../AGENTS.md) and
-   [contribution scope](../CONTRIBUTING.md). Finalize the
-   [license treatment](LICENSING_PLAN.md). Keep useful design rationale here.
-2. Prepare an intentional source snapshot, preserving unrelated work in progress.
-   Include the currently untracked design docs referenced by the guides. Normalize
-   public-facing instructions and finish the targeted source/history review.
-3. Validate anonymous dependency access and a fresh source build without the
-   maintainer's staged outputs, personal configuration, private room or notes.
-   First publish the missing libmpv-zero dependency commit identified below, after
-   reviewing its contents. Have a fresh-context agent attempt the documented build
-   workflow. Record failures and fix the instructions/code as needed.
-4. Review the exact publication commit, license/notices, remaining platform limits
-   and contribution docs. Then explicitly choose to make the repository public.
-   Do not rewrite history for harmless personal paths; address actual sensitive
-   material if the targeted review finds it.
-5. After publication, verify anonymous recursive clone and linked documentation.
-   Seed a small set of scoped contribution issues, with acceptance criteria and
-   hardware needs. Add a minimal PR template and optional CI once the workflow
-   and checks have been agreed and reproduced.
+- Existing offline VRM preview/import work and its regression fixtures are recorded
+  in `584077e`. It remains an offline experiment, not avatar distribution.
+- Contributor docs, the previously local design plans and licensing are recorded
+  in `e751e9f`. [AGENTS.md](../AGENTS.md) is 26 lines; detailed contracts/workflow are
+  in [DEVELOPMENT.md](DEVELOPMENT.md), and conditional architecture context is in
+  [DIRECTION.md](DIRECTION.md).
+- The previously unavailable libmpv-zero commit
+  `293d895d0e11eca1b3665a654fe4438e2d9ea031` was reviewed and published to that
+  dependency's public `main`. The isolated checkout fetched it anonymously.
+- `b3110b7` fixes the fresh-build header path: Nix appends `-dev` for the development
+  output, so the output-link prefix must be `.local/mpv`, not `.local/mpv-dev`.
+  Both `build.sh` and the manual build recipe now use the correct prefix.
+- [UNLICENSE](../UNLICENSE) covers original material. [LICENSES.md](../LICENSES.md)
+  identifies third-party/asset exceptions and the Apache-2.0 viseme adaptations;
+  native crate metadata is `Unlicense AND Apache-2.0`. See the
+  [licensing record](LICENSING_PLAN.md) for binary-distribution responsibilities.
 
-## Inspection so far
+## Validation
 
-- The root has no `LICENSE`; `Cargo.toml` declares MIT for the native crate. The
-  maintainer prefers Unlicense/WTFPL; the recommendation is Unlicense for original
-  code with explicit exceptions. See [licensing findings](LICENSING_PLAN.md). Keep
-  third-party code, models, engine patches and runtime notices under their own
-  terms. [Avatar provenance](../project/avatars/models/ATTRIBUTION.md) already
-  records different asset terms and a Vita source-notice/metadata discrepancy;
-  resolve the distribution basis before making blanket licensing claims.
-- **Missing public dependency commit:** Prim's committed libmpv-zero gitlink is
-  `293d895d0e11eca1b3665a654fe4438e2d9ea031` (subtitle/live controls). Anonymous
-  GitHub commit lookup returns "No commit found"; public `main`/HEAD still points
-  to `11c6e22bd07496bb278ed2d2836de9370e73d2d8`. An anonymous fetch in a new bare
-  repository also failed with `not our ref`. Publishing Prim alone cannot make
-  that dependency available. Review/publish the intended dependency commit before
-  the fresh recursive-clone gate; do not silently downgrade its pin.
-- Exact pins for godot-network-audio, godot-cpp, the patched
-  videocall-rs, mpv and the separately fetched OpenVR overlay are anonymously
-  accessible through GitHub's commit API. This is not a complete recursive fetch
-  or downloaded-artifact/build check.
-- `build.sh` uses repository-relative paths, initializes missing submodules,
-  enters Nix, stages its patched engine/extensions and creates a new ignored lobby
-  secret. This is promising, but an existing successful developer tree is not
-  evidence of a fresh build. Windows remains a multi-stage cross-build recipe.
-- A narrow scan of tracked text found no private-key blocks or GitHub/AWS token
-  patterns. No tracked private-lobby/key/env filenames appeared in the selected
-  filename-history check. This was not a comprehensive history/content scan.
-- Existing unrelated runtime/avatar changes and several untracked plans are in
-  the working tree. Do not publish by blindly staging the whole directory.
-- A fresh-context subagent, restricted to repository documents/code, correctly
-  interpreted the living-room direction, direct fixes, end-to-end FBT, matching
-  candidate clients and exploratory architecture PRs. It found the policy inviting.
-  Its stale-link/status and packaged-Windows test-room findings were corrected.
-  This was a reading exercise, not a fresh build or hardware qualification.
+Tested source/runtime revision: `b3110b7`. Subsequent preparation edits are help
+text and documentation, including these results.
 
-## Documentation cleanup inventory
+- Cloned the candidate without local Git object sharing, then initialized all
+  submodules through their public HTTPS URLs with global/system Git configuration
+  disabled. OpenVR's separate pinned repository was also fetched by the build.
+- Ran the documented `./build.sh` with four build jobs in the isolated checkout.
+  It had no borrowed `.local`, `target`, imported assets or lobby configuration.
+  Normal host Nix/store and dependency-download caches were available; this was
+  not a cold build of every dependency or a source build on a Nix-free machine.
+- The first attempt compiled Rust, then exposed the output-link bug above. After
+  fixing it, one retry was interrupted by temporary disk pressure from an unrelated
+  optional test-tool evaluation. Nix cleaned up that failed temporary copy. The
+  resumed build completed, including C++ extensions, runtime/tool fetching and
+  Godot/VRM import, with no script/import errors. No staged outputs were copied in
+  from the maintainer's original checkout.
+- Native tests: **12 passed, 1 public-DHT test intentionally ignored**.
+- Offline raw-VRM import fixture: **passed** for the bundled models, including
+  repeated instances, spring initialization, finite poses and invalid-file rejection.
+- Rendered two-process integration on a private X display: **passed** with a client
+  providing a shared MKV to the host, synchronized playback, voice, avatars,
+  pause/seek/resume, mute and main-thread stall coverage. Both peers reported no
+  failures; no script/engine errors appeared in their logs. Tests used synthetic
+  audio, isolated preferences and a local-only test room.
+- Full-app `--headless` startup exits zero but reports a missing rendering device;
+  it is **not** a passing media smoke. The helper's example and build documentation
+  now require a rendered display for the normal application. Headless import and
+  selected script fixtures remain useful separate checks.
+- Exported a disposable Linux bundle/test PCK from the fresh build and ran it on
+  the Ubuntu test machine with `/nix` hidden. **All eight packaged-media checks
+  passed**: load, advancing playback, video dimensions, changing rendered frames,
+  nonfinite-speed rejection, accepted tempo correction, observed tempo and pause.
+  A captured frame was visually checked. This used software Vulkan (`llvmpipe`),
+  not hardware GPU/headset validation. Locale/Compose/XIM warnings were present;
+  no script errors or missing-rendering-device error occurred. No official package
+  or update feed was replaced.
 
-| Finding | Public-source treatment |
-| --- | --- |
-| Private tracker links in `AVATAR_PLAN.md` and `EXPERIENCE_CONTINUITY.md` | Entry-point rationale has been inlined and private tracker requirements removed in this drafting pass. Keep historical credit/provenance where useful. |
-| Local source paths in avatar, viseme, XR and media research plans | Label them as historical inspection context, replace actionable links with a public pinned reference or an in-repo explanation. Never require access to those checkouts. |
-| Live test URLs in `LIVESTREAM_TEST.md` | The normal recipe now uses a reader-controlled MediaMTX endpoint. The maintainer's test server is not shared contributor infrastructure. |
-| Host and signing-key paths in `launcher/hosting/DEPLOYMENT.md` | Separate a reusable local packaging recipe from historical production operations; parameterize actionable examples. A private key path is not the key, so it alone is not a history-rewrite reason. |
-| Old "current" release/protocol claims in `TESTING.md`, `AVATARS.md`, `LAUNCHER_PLAN.md` | Distinguish current instructions from dated evidence; use `PROTOCOL.md` as the wire-reference entry point and identify the exact tested release when preserving reports. |
-| Design documents currently untracked | Include selected docs in the publication commit and verify all relative links in that commit, not only on disk. |
-| No simple contributor entry point | The new direction/agent/contribution drafts provide purpose, scope examples, code entry points and evidence expectations. |
+Local evidence is retained under the maintainer's ignored `.local/publication/`
+(build attempts, native/script/integration logs and audit summaries). Those logs
+are not required to build or contribute and are not part of the public source.
 
-The first documentation pass should fix broken requirements and misleading
-instructions. It need not erase every developer name, local path or historical
-experiment. Avoid copying raw private notes/support reports into the repository.
+## Publication review
 
-## Clean-build and publication evidence to collect
+- Scanned 558 reachable Prim history blobs with high-confidence private-key,
+  GitHub/AWS token patterns and the exact ignored local lobby value: no matches.
+  The dependency history was also checked. A URL-credential example was reviewed
+  separately and is an intentional launcher redaction fixture. This bounded scan
+  is not a guarantee against every possible kind of sensitive data.
+- Kept history intact. Private tracker prerequisites were replaced with in-repo
+  rationale; live tests use reader-controlled server placeholders. Production
+  operations are marked as maintainer history and signing-key examples are
+  parameterized. Harmless historical machine paths are not treated as credentials.
+- A repository-only fresh-agent review found the 26-line guidance clear and the
+  contribution policy welcoming. It correctly distinguished useful end-to-end FBT
+  and focused fixes from architecture experiments whose assumptions need review.
+- Repository documentation links were checked against tracked files, including
+  the previously untracked plans. Remaining platform/device gaps are explicit.
 
-- A selected commit can be cloned recursively without owner credentials; every
-  submodule, Git dependency and pinned source revision is accessible anonymously.
-- On Linux x86-64 with Nix configured for flakes, the documented build and desktop
-  launch work in an isolated checkout without borrowed `.local`, `target`, imported
-  assets, or a maintainer lobby. Record revision, environment, time/disk needs and
-  failures. No root/production credentials should be needed after prerequisites.
-- A second isolated build/configuration can use an explicitly shared test secret
-  for a room smoke test; unrelated friends cannot be joined accidentally.
-- Relevant Rust and focused script checks pass. Actual native Windows, headset,
-  WAN/relay and runtime/controller coverage stay explicitly limited to tested cases.
-- Review tracked assets/notices and the selected history for real credentials,
-  embedded private room values and restricted material. Report candidate paths
-  privately without printing secret values. Preserve history unless findings
-  require a specific remedy; rotate/revoke any exposed credential if applicable.
-- Documentation links resolve from the selected commit, including a clear build
-  route, purpose, contribution boundaries, and the source license.
+## Remaining scope
 
-## Agreed contribution policy
+Windows source builds still use the documented multi-stage cross-build recipe;
+there is no one-command native Windows build. Native Windows headset/overlay,
+other controller profiles, WAN/relay behavior, cold build cost and broader OS
+coverage are not established by this source-publication pass. Contributors can
+help reproduce and improve those workflows.
 
-- Exploratory draft PRs are welcome before architecture agreement. Explain
-  conflicts/assumptions; the maintainer decides adoption, merging and releases.
-- End-to-end FBT, including necessary wire changes, is welcome. A working
-  prototype remains useful even if its protocol is later revised.
-- The maintainer-signed build at prim.hiina.space is the official user-facing
-  release. Test branches can require matching clients; broad version/fork
-  compatibility is not a current requirement.
-- One shared lobby at friends-only scale is acceptable initially, with private
-  rooms/lobby UX likely to evolve. Automated tests still use isolated rooms.
-- Prefer Unlicense/WTFPL for original code; accept required dependency copyleft.
-
-Remaining review: exact license/third-party treatment, intended publication
-snapshot, source-build evidence, and how source users obtain the intentionally
-shared lobby configuration if they want it. Keep the default generated development
-room isolated. Seed one UI/nameplate issue, an end-to-end FBT prototype, and one
-specific runtime qualification issue when opening contributions.
-
-Source commits and the GitHub visibility change are authorized. Binary release
-publication and production configuration changes are outside this source pass.
-No history rewrite is planned.
+The initial shared lobby remains friends-scale. Source builds generate an
+isolated room by default; coordinated manual testing can use an intentionally
+shared configuration. This is not a promise of private admission or moderation.
+No general cross-version/fork compatibility promise or CI requirement was added.
