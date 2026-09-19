@@ -71,7 +71,7 @@ Cargo, CMake, Ninja, media fixture tools, bindgen, and Rust LLVM utilities.
 ```sh
 ./tools/build-godot.sh
 nix build ./dependencies/godot-libmpv-zero#mpv -o .local/mpv
-nix build ./dependencies/godot-libmpv-zero#mpv.dev -o .local/mpv-dev
+nix build ./dependencies/godot-libmpv-zero#mpv.dev -o .local/mpv
 ./tools/build-steam-audio.sh
 nix develop
 cargo build

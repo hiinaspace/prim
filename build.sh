@@ -35,7 +35,8 @@ mkdir -p .local project/bin/linux project/addons/godot-steam-audio
 for item in mpv mpv.dev; do
     case "$item" in mpv.dev) link=mpv-dev;; *) link=$item;; esac
     if (( refresh_deps )) || [[ ! -e .local/$link ]]; then
-        nix build "./dependencies/godot-libmpv-zero#$item" -o ".local/$link"
+        # Nix appends the output name: mpv.dev with this prefix creates mpv-dev.
+        nix build "./dependencies/godot-libmpv-zero#$item" -o .local/mpv
     else
         echo "Using staged $link (.local/$link); --refresh-deps rebuilds pinned dependencies."
     fi

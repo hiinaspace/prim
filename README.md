@@ -59,7 +59,8 @@ does not provide private membership. Secret values stay out of DHT records and
 diagnostic logs. See [release and lobby policy](CONTRIBUTING.md#releases-compatibility-and-the-shared-lobby).
 
 Implementation and future media work: [direct file sharing and OBS livestreaming](docs/DIRECT_MEDIA_PLAN.md),
-with relay-use confirmation and a separate later overlay/remote-play track.
+with relay-use confirmation. Companion/peek paths are experimental; integrated
+capture, richer spectator output and remote play remain separate future work.
 
 Longer-term design: [the persistent living room and external experiences](docs/EXPERIENCE_CONTINUITY.md)
 records desktop/XR transitions, activity-aware voice, trusted game launch, and
