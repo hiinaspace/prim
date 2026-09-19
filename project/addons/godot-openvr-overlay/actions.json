@@ -1,0 +1,73 @@
+{
+  "default_bindings": [
+    {
+      "controller_type": "index_controller",
+      "binding_url": "bindings_index_controller.json"
+    },
+    {
+      "controller_type": "knuckles",
+      "binding_url": "bindings_knuckles.json"
+    }
+  ],
+  "actions": [
+    { "name": "/actions/main/in/aim",                   "type": "pose",    "requirement": "mandatory" },
+    { "name": "/actions/main/in/grip",                  "type": "pose",    "requirement": "mandatory" },
+    { "name": "/actions/main/in/left_trigger",          "type": "vector1" },
+    { "name": "/actions/main/in/right_trigger",         "type": "vector1" },
+    { "name": "/actions/main/in/left_grip",             "type": "vector1" },
+    { "name": "/actions/main/in/right_grip",            "type": "vector1" },
+    { "name": "/actions/main/in/left_thumbstick",       "type": "vector2" },
+    { "name": "/actions/main/in/right_thumbstick",      "type": "vector2" },
+    { "name": "/actions/main/in/left_trackpad",         "type": "vector2" },
+    { "name": "/actions/main/in/right_trackpad",        "type": "vector2" },
+    { "name": "/actions/main/in/left_trigger_click",    "type": "boolean" },
+    { "name": "/actions/main/in/right_trigger_click",   "type": "boolean" },
+    { "name": "/actions/main/in/left_grip_click",       "type": "boolean" },
+    { "name": "/actions/main/in/right_grip_click",      "type": "boolean" },
+    { "name": "/actions/main/in/left_a",                "type": "boolean" },
+    { "name": "/actions/main/in/right_a",               "type": "boolean" },
+    { "name": "/actions/main/in/left_b",                "type": "boolean" },
+    { "name": "/actions/main/in/right_b",               "type": "boolean" },
+    { "name": "/actions/main/in/left_thumbstick_click", "type": "boolean" },
+    { "name": "/actions/main/in/right_thumbstick_click","type": "boolean" },
+    { "name": "/actions/main/in/left_trackpad_click",   "type": "boolean" },
+    { "name": "/actions/main/in/right_trackpad_click",  "type": "boolean" },
+    { "name": "/actions/main/in/left_system",           "type": "boolean" },
+    { "name": "/actions/main/in/right_system",          "type": "boolean" },
+    { "name": "/actions/main/out/haptic",               "type": "vibration", "requirement": "suggested" }
+  ],
+  "action_sets": [
+    { "name": "/actions/main", "usage": "leftright" }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/main":                         "Main",
+      "/actions/main/in/aim":                  "Aim Pose",
+      "/actions/main/in/grip":                 "Grip Pose",
+      "/actions/main/in/left_trigger":         "Left Trigger (analog)",
+      "/actions/main/in/right_trigger":        "Right Trigger (analog)",
+      "/actions/main/in/left_grip":            "Left Grip (analog)",
+      "/actions/main/in/right_grip":           "Right Grip (analog)",
+      "/actions/main/in/left_thumbstick":      "Left Thumbstick",
+      "/actions/main/in/right_thumbstick":     "Right Thumbstick",
+      "/actions/main/in/left_trackpad":        "Left Trackpad",
+      "/actions/main/in/right_trackpad":       "Right Trackpad",
+      "/actions/main/in/left_trigger_click":   "Left Trigger Click",
+      "/actions/main/in/right_trigger_click":  "Right Trigger Click",
+      "/actions/main/in/left_grip_click":      "Left Grip Click",
+      "/actions/main/in/right_grip_click":     "Right Grip Click",
+      "/actions/main/in/left_a":               "Left A Button",
+      "/actions/main/in/right_a":              "Right A Button",
+      "/actions/main/in/left_b":               "Left B Button",
+      "/actions/main/in/right_b":              "Right B Button",
+      "/actions/main/in/left_thumbstick_click":  "Left Thumbstick Click",
+      "/actions/main/in/right_thumbstick_click": "Right Thumbstick Click",
+      "/actions/main/in/left_trackpad_click":  "Left Trackpad Click",
+      "/actions/main/in/right_trackpad_click": "Right Trackpad Click",
+      "/actions/main/in/left_system":          "Left System Button",
+      "/actions/main/in/right_system":         "Right System Button",
+      "/actions/main/out/haptic":              "Haptic Feedback"
+    }
+  ]
+}

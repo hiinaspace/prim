@@ -29,6 +29,14 @@ var playback
 var avatars := {}
 var settings := ConfigFile.new()
 var xr := false
+var background_tracking := false
+var background_align := false
+var background_anchor := Transform3D.IDENTITY
+var background_origin := Transform3D.IDENTITY
+var background_origin_saved := false
+var background_epoch := -1
+var background_poses: Array[Transform3D] = [Transform3D.IDENTITY, Transform3D.IDENTITY, Transform3D.IDENTITY]
+var background_valid := [false, false, false]
 var xr_lifecycle: Node
 var desktop_camera: Camera3D
 @onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
@@ -43,6 +51,11 @@ var last_physical_head := Transform3D.IDENTITY
 var audio_listener: Node3D
 var xr_anchor: Transform3D
 var align_xr_head := false
+var wrist_controls: Node3D
+var deafened := false
+var voice_bus := -1
+var peek_locomotion_ready := false
+var was_peeking := false
 var muted := true
 var display_name := "Friend"
 var smooth_turn := false
@@ -104,6 +117,11 @@ func _ready() -> void:
 		movie_bus = AudioServer.bus_count
 		AudioServer.add_bus()
 		AudioServer.set_bus_name(movie_bus, "Movie")
+	voice_bus = AudioServer.get_bus_index("Voice")
+	if voice_bus < 0:
+		voice_bus = AudioServer.bus_count
+		AudioServer.add_bus()
+		AudioServer.set_bus_name(voice_bus, "Voice")
 	var stereo_output := AudioStreamPlayer.new()
 	stereo_output.name = "DirectStereo"
 	stereo_output.bus = "Movie"
@@ -165,6 +183,7 @@ func _ready() -> void:
 	menu.seek_requested.connect(func(seconds): playback.request_action("seek_to", seconds))
 	menu.connection_toggled.connect(toggle_connection)
 	menu.microphone_toggled.connect(toggle_microphone)
+	menu.deafen_toggled.connect(func(): set_deafened(not deafened))
 	menu.device_selected.connect(select_device)
 	menu.gain_changed.connect(func(value):
 		if sender.has_method("set_input_gain_db"): sender.set_input_gain_db(value)
@@ -225,10 +244,31 @@ func _ready() -> void:
 	xr_viewport.render_target_update_mode = SubViewport.UPDATE_DISABLED
 	xr_viewport.msaa_3d = get_viewport().msaa_3d
 	add_child(xr_viewport)
+	wrist_controls = preload("res://xr/wrist_controls.gd").new()
+	add_child(wrist_controls)
+	wrist_controls.activated.connect(func(action, hand):
+		if action == "mute": toggle_microphone()
+		else: set_deafened(not deafened)
+		grips[hand].trigger_haptic_pulse("haptic", 0.0, 0.25, 0.05, 0.0))
 	xr_lifecycle = preload("res://xr/session_lifecycle.gd").new()
+	xr_lifecycle.openvr_peek = settings.get_value("xr", "openvr_peek", false) or OS.get_environment("PRIM_OPENVR_PEEK") == "1"
+	menu.xr_openvr.set_pressed_no_signal(xr_lifecycle.openvr_peek)
+	xr_lifecycle.overlay_above = settings.get_value("xr", "above_overlays", false)
+	menu.xr_order.set_pressed_no_signal(xr_lifecycle.overlay_above)
 	xr_lifecycle.render_viewport = xr_viewport
 	add_child(xr_lifecycle)
 	xr_lifecycle.mode_changed.connect(set_xr_mode)
+	xr_lifecycle.background_mode_changed.connect(set_background_tracking)
+	xr_lifecycle.takeover_confirmation_requested.connect(menu.confirm_xr_takeover)
+	menu.xr_reveal_requested.connect(xr_lifecycle.show_reveal)
+	menu.xr_openvr_changed.connect(func(enabled):
+		save_setting("xr", "openvr_peek", enabled)
+		xr_lifecycle.set_openvr_peek(enabled))
+	menu.xr_order_changed.connect(func(above):
+		save_setting("xr", "above_overlays", above)
+		xr_lifecycle.set_overlay_above(above))
+	menu.xr_open_requested.connect(xr_lifecycle.request_open_room)
+	menu.xr_takeover_confirmed.connect(xr_lifecycle.confirm_takeover)
 	xr_lifecycle.presentation_changed.connect(update_xr_presentation)
 	xr_lifecycle.changed.connect(menu.set_xr_state)
 	menu.xr_toggled.connect(xr_lifecycle.toggle)
@@ -244,6 +284,9 @@ func _ready() -> void:
 func set_xr_mode(enabled: bool) -> void:
 	if xr == enabled: return
 	var head := camera.global_transform
+	if not enabled:
+		background_origin = rig.global_transform
+		background_origin_saved = xr_lifecycle.enabled_intent and xr_lifecycle.bridge != null
 	xr = enabled
 	menu.set_vr_mode(enabled)
 	if xr:
@@ -267,6 +310,7 @@ func set_xr_mode(enabled: bool) -> void:
 		for controller in [left, right]:
 			var visuals := preload("res://xr/controller_visual.gd").new()
 			visuals.controller = controller
+			visuals.openxr_models = not xr_lifecycle.openvr_active
 			visuals.hand = OpenXRRenderModelManager.RENDER_MODEL_TRACKER_LEFT_HAND if controller == left else OpenXRRenderModelManager.RENDER_MODEL_TRACKER_RIGHT_HAND
 			rig.add_child(visuals)
 			controller_visuals.append(visuals)
@@ -295,6 +339,59 @@ func set_xr_mode(enabled: bool) -> void:
 	avatar_configuration_changed()
 	reset_avatar_motion("xr_mode_changed")
 	if menu.visible: menu.open_at(camera)
+
+func has_vr_tracking() -> bool:
+	return xr or background_tracking
+
+func set_background_tracking(enabled: bool) -> void:
+	if background_tracking == enabled: return
+	var head := camera.global_transform
+	background_tracking = enabled
+	background_valid = [false, false, false]
+	background_epoch = -1
+	if enabled:
+		background_anchor = head
+		menu.set_headset_input_allowed(false)
+		background_align = not background_origin_saved
+		if background_origin_saved: rig.global_transform = background_origin
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+		menu.xr_controls.text = "Tracking alongside game • desktop Tab menu / WASD • game keeps controller input"
+	else:
+		background_align = false
+		background_origin = rig.global_transform
+		background_origin_saved = xr_lifecycle.enabled_intent
+		# Reconstitute the desktop camera without baking its physical pose into
+		# both the room origin and local camera transform.
+		rig.global_transform = Transform3D(Basis(Vector3.UP, head.basis.get_euler().y), Vector3(head.origin.x, 0, head.origin.z))
+		camera.position = Vector3(0, head.origin.y, 0)
+		camera.rotation = Vector3(clampf(head.basis.get_euler().x, -1.45, 1.45), 0, 0)
+		menu.xr_controls.text = "Desktop: WASD moves • mouse looks • Tab or Esc opens menu"
+	avatar_configuration_changed()
+	reset_avatar_motion("background_tracking_changed")
+
+func update_background_tracking() -> void:
+	background_valid = [false, false, false]
+	if not xr_lifecycle.bridge: return
+	var sample: Dictionary = xr_lifecycle.bridge.snapshot()
+	if int(sample.get("age_ms", 9999)) > 500 or not sample.has("poses"): return
+	var epoch := int(sample.get("epoch", 0))
+	if background_epoch >= 0 and epoch != background_epoch:
+		background_anchor = camera.global_transform
+		background_align = true
+		reset_avatar_motion("background_recenter")
+	background_epoch = epoch
+	for i in range(3):
+		background_valid[i] = bool(sample.poses[i].get("valid", false))
+		if background_valid[i]: background_poses[i] = xr_lifecycle.OpenVRBridge.pose_transform(sample.poses[i])
+	if background_valid[0]:
+		camera.transform = background_poses[0]
+		if background_align:
+			background_align = false
+			rotate_about_head(background_anchor.basis.get_euler().y - camera.global_basis.get_euler().y)
+			var displacement := background_anchor.origin - camera.global_position
+			displacement.y = 0
+			rig.global_position += displacement
+		last_physical_head = camera.global_transform
 
 func align_to_first_xr_pose() -> void:
 	var tracker: XRPositionalTracker = XRServer.get_tracker("head")
@@ -330,6 +427,12 @@ func toggle_connection() -> void:
 
 func toggle_microphone() -> void:
 	set_muted(not muted)
+
+func set_deafened(value: bool) -> void:
+	deafened = value
+	AudioServer.set_bus_mute(movie_bus, value)
+	AudioServer.set_bus_mute(voice_bus, value)
+	menu.set_deafened(value)
 
 func set_muted(value: bool) -> void:
 	muted = value
@@ -389,20 +492,20 @@ func pose_received(peer: String, bytes: PackedByteArray) -> void:
 	if not pose.is_empty(): avatars[peer].apply_frame(pose)
 
 func capture_desktop_pointer() -> void:
-	if xr or camera == null or (menu != null and menu.visible): return
+	if camera == null or not get_window().has_focus() or (menu != null and menu.visible): return
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	ignore_pointer_until_release = true
 
 func _notification(what: int) -> void:
-	if xr or camera == null: return
-	if what == NOTIFICATION_WM_WINDOW_FOCUS_IN:
+	if camera == null: return
+	if what == NOTIFICATION_WM_WINDOW_FOCUS_IN and not has_vr_tracking():
 		capture_desktop_pointer()
 	elif what == NOTIFICATION_WM_WINDOW_FOCUS_OUT:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 
 func _input(event: InputEvent) -> void:
 	if menu == null: return
-	if not xr and not menu.visible and event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+	if not menu.visible and event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
 		capture_desktop_pointer()
 		get_viewport().set_input_as_handled()
 		return
@@ -415,9 +518,9 @@ func _input(event: InputEvent) -> void:
 	elif menu.desktop_surface.visible and event is InputEventKey:
 		menu.forward_key(event)
 		get_viewport().set_input_as_handled()
-	elif not xr and event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		rotate_about_head(-event.relative.x * 0.002)
-		camera.rotation.x = clampf(camera.rotation.x - event.relative.y * 0.002, -1.45, 1.45)
+		if not has_vr_tracking(): camera.rotation.x = clampf(camera.rotation.x - event.relative.y * 0.002, -1.45, 1.45)
 
 static func locomotion_axes(left_active: bool, right_active: bool, left_stick: Vector2, right_stick: Vector2) -> Vector3:
 	if left_active and right_active: return Vector3(left_stick.x, left_stick.y, right_stick.x)
@@ -437,6 +540,7 @@ func toggle_menu(desktop := false) -> void:
 
 func _process(delta: float) -> void:
 	if camera == null: return
+	if background_tracking: update_background_tracking()
 	if align_xr_head: align_to_first_xr_pose()
 	if delta > 0.25: reset_avatar_motion("frame_stall")
 	var allow_controllers := false
@@ -449,7 +553,7 @@ func _process(delta: float) -> void:
 		if gesture_epoch != xr_lifecycle.gesture_epoch:
 			gesture_epoch = xr_lifecycle.gesture_epoch
 			reveal_gesture.reset()
-		if not xr_lifecycle.room_primary:
+		if xr_lifecycle.overlay_active and not xr_lifecycle.room_primary:
 			var amount: float = reveal_gesture.update(delta, camera.global_transform, head_valid,
 				[grips[0].global_transform, grips[1].global_transform],
 				[grips[0].get_has_tracking_data(), grips[1].get_has_tracking_data()],
@@ -462,8 +566,20 @@ func _process(delta: float) -> void:
 		if head_valid and xr_lifecycle.room_primary and not controller_neutral:
 			controller_neutral = controllers_are_neutral()
 		allow_controllers = head_valid and xr_lifecycle.room_primary and controller_neutral
+	var peeking: bool = xr and xr_lifecycle.overlay_active and not xr_lifecycle.room_primary and xr_lifecycle.head_valid and xr_lifecycle.presentation_fraction >= 0.9
+	if wrist_controls:
+		wrist_controls.update_view(delta, peeking, camera.global_transform,
+			[grips[0].global_transform, grips[1].global_transform],
+			[grips[0].get_has_tracking_data(), grips[1].get_has_tracking_data()],
+			reveal_gesture.owner, muted, deafened)
+	if peeking != was_peeking:
+		peek_locomotion_ready = false
+		snap_ready = false
+		was_peeking = peeking
+	if peeking and not peek_locomotion_ready:
+		peek_locomotion_ready = left.get_vector2("primary").length() < 0.2 and right.get_vector2("primary").length() < 0.2
 	var movement := Vector2.ZERO
-	if xr and allow_controllers:
+	if xr and (allow_controllers or (peeking and peek_locomotion_ready)):
 		var left_active := left.get_has_tracking_data()
 		var right_active := right.get_has_tracking_data()
 		var axes := locomotion_axes(left_active, right_active, left.get_vector2("primary"), right.get_vector2("primary"))
@@ -476,10 +592,11 @@ func _process(delta: float) -> void:
 		elif snap_ready:
 			rotate_about_head(-signf(turn) * deg_to_rad(30))
 			snap_ready = false
-		var menu_down := (left_active and left.is_button_pressed("by_button")) or (right_active and right.is_button_pressed("by_button"))
-		if menu_down and menu_ready: toggle_menu()
-		menu_ready = not menu_down
-		update_mute_button((left_active and left.is_button_pressed("ax_button")) or (right_active and right.is_button_pressed("ax_button")))
+		if allow_controllers:
+			var menu_down := (left_active and left.is_button_pressed("by_button")) or (right_active and right.is_button_pressed("by_button"))
+			if menu_down and menu_ready: toggle_menu()
+			menu_ready = not menu_down
+			update_mute_button((left_active and left.is_button_pressed("ax_button")) or (right_active and right.is_button_pressed("ax_button")))
 	if get_window().has_focus() and not menu.visible:
 		movement += Vector2(float(Input.is_physical_key_pressed(KEY_D)) - float(Input.is_physical_key_pressed(KEY_A)), float(Input.is_physical_key_pressed(KEY_W)) - float(Input.is_physical_key_pressed(KEY_S))).limit_length()
 	var forward := -camera.global_basis.z
@@ -603,7 +720,7 @@ func create_avatar_floor() -> void:
 	add_child(floor_body)
 
 func local_avatar_state() -> Dictionary:
-	return {"type":"avatar_state", "avatar":avatar_id, "revision":AvatarCatalog.REVISION, "eye_height":avatar_height if xr else 1.6, "epoch":avatar_epoch}
+	return {"type":"avatar_state", "avatar":avatar_id, "revision":AvatarCatalog.REVISION, "eye_height":avatar_height if has_vr_tracking() else 1.6, "epoch":avatar_epoch}
 
 func rebuild_local_avatar() -> void:
 	if local_avatar:
@@ -611,7 +728,7 @@ func rebuild_local_avatar() -> void:
 		local_avatar.queue_free()
 	local_avatar = AvatarDriver.new()
 	add_child(local_avatar)
-	local_avatar.configure(avatar_id, avatar_height if xr else 1.6, true)
+	local_avatar.configure(avatar_id, avatar_height if has_vr_tracking() else 1.6, true)
 	for visual in controller_visuals: visual.set_avatar_visible(true)
 
 func select_avatar(id: String) -> void:
@@ -652,10 +769,18 @@ func sample_avatar_frame() -> Dictionary:
 			var wrist := HandPose.wrist(rig, grips[i], tracker, i == 0)
 			poses[i+1] = wrist.pose
 			if wrist.valid: tracked |= 1 << i
+	if background_tracking:
+		tracked = 4 if background_valid[0] else 0
+		for i in range(2):
+			var wrist := rig.global_transform * background_poses[i + 1]
+			wrist.origin += wrist.basis.y * 0.06
+			wrist.basis = wrist.basis * HandPose.controller_basis(i == 0)
+			poses[i + 1] = wrist
+			if background_valid[i + 1]: tracked |= 1 << i
 	return {"poses":poses,"tracked":tracked,"fingers":fingers,"masks":masks,"curls":curls}
 
 func start_calibration() -> void:
-	if not xr:
+	if not has_vr_tracking():
 		menu.avatar_status.text = "Height measurement uses the VR headset; desktop uses a 1.60 m viewpoint."
 		return
 	calibration_remaining = 3.5
@@ -698,6 +823,7 @@ func update_xr_presentation(primary: bool, amount: float) -> void:
 		menu_ready = false
 		mute_ready = false
 		snap_ready = false
+	menu.xr_reveal_button.visible = xr and xr_lifecycle.overlay_active and not primary
 	menu.set_headset_input_allowed(primary)
 	menu.xr_hide_button.visible = xr and xr_lifecycle.overlay_active and not primary
 	menu.xr_hide_button.disabled = amount <= 0.001
@@ -705,7 +831,7 @@ func update_xr_presentation(primary: bool, amount: float) -> void:
 	if xr and not primary:
 		laser.visible = false
 		pointer.visible = false
-		menu.xr_controls.text = "Game active: lift to peek • desktop Tab menu / WASD • game keeps controller input"
+		menu.xr_controls.text = "Lift to peek • sticks move while visible • desktop WASD / mouse yaw • game keeps input"
 
 func on_xr_recentered() -> void:
 	if xr:

@@ -49,6 +49,7 @@ func setup(display_name: String, stream: AudioStream) -> void:
 	receive_stream = stream
 	voice = ClassDB.instantiate("SteamAudioPlayer")
 	voice.name = "Voice"
+	voice.bus = "Voice"
 	voice.distance_attenuation = false
 	voice.volume_linear = 0.0
 	voice.ambisonics = true

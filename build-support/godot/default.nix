@@ -8,6 +8,7 @@ pkgs.godot_4.overrideAttrs (old: {
     ./0004-restartable-openxr.patch
     ./0005-restore-stereo-on-xr-reentry.patch
     ./0006-companion-overlay.patch
+    ./0007-steamvr-vulkan-interop.patch
   ];
   sconsFlags = builtins.filter (flag: flag != "debug_symbols=true") old.sconsFlags
     ++ [ "use_static_cpp=false" "debug_symbols=false" ];

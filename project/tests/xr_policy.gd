@@ -41,6 +41,14 @@ func run() -> void:
 	life.observation["age_ms"] = 2000
 	life._process(0.1)
 	check(not life.room_primary and runtime.hidden and life.reveal_fraction == 0, "stale IPC cancels reveal and fails closed")
+	life.set_reveal_fraction(1)
+	life._process(0.1)
+	check(not runtime.hidden and not life.room_primary, "unknown IPC still permits deliberate gesture reveal without scene controls")
+	life.hide_reveal()
+	life.show_reveal()
+	life._process(0.1)
+	check(not runtime.hidden, "desktop reveal works without status IPC")
+	life.hide_reveal()
 	life.observation = {"runtime":"Monado", "activity":"idle", "age_ms":0}
 	life._process(0.5)
 	check(life.room_primary, "confirmed exit automatically restores room")

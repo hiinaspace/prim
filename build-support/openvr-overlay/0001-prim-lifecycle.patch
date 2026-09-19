@@ -1,0 +1,201 @@
+diff --git a/src/xr_interface_openvr_overlay.cpp b/src/xr_interface_openvr_overlay.cpp
+index 4136655..df7d2c6 100644
+--- a/src/xr_interface_openvr_overlay.cpp
++++ b/src/xr_interface_openvr_overlay.cpp
+@@ -2,6 +2,7 @@
+ #include "openvr_math.h"
+ 
+ #include <godot_cpp/classes/engine.hpp>
++#include <godot_cpp/classes/dir_access.hpp>
+ #include <godot_cpp/classes/file_access.hpp>
+ #include <godot_cpp/classes/project_settings.hpp>
+ #include <godot_cpp/classes/rd_texture_format.hpp>
+@@ -21,6 +22,8 @@ using namespace godot;
+ // ============================================================
+ 
+ void XRInterfaceOpenVROverlay::_bind_methods() {
++    ClassDB::bind_method(D_METHOD("set_overlay_hidden", "hidden"), &XRInterfaceOpenVROverlay::set_overlay_hidden);
++    ClassDB::bind_method(D_METHOD("is_runtime_exiting"), &XRInterfaceOpenVROverlay::is_runtime_exiting);
+     ClassDB::bind_method(D_METHOD("set_overlay_alpha", "alpha"), &XRInterfaceOpenVROverlay::set_overlay_alpha);
+     ClassDB::bind_method(D_METHOD("get_overlay_alpha"),          &XRInterfaceOpenVROverlay::get_overlay_alpha);
+     ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "overlay_alpha", PROPERTY_HINT_RANGE, "0,1,0.01"),
+@@ -61,6 +64,8 @@ bool XRInterfaceOpenVROverlay::_initialize() {
+     if (m_initialized)
+         return true;
+ 
++    m_runtime_exiting = false;
++    m_hidden = true;
+     vr::EVRInitError error = vr::VRInitError_None;
+     vr::VR_Init(&error, vr::VRApplication_Overlay);
+     if (error != vr::VRInitError_None) {
+@@ -103,7 +108,7 @@ bool XRInterfaceOpenVROverlay::_initialize() {
+         vr::VROverlay()->SetOverlayInputMethod(handle, vr::VROverlayInputMethod_None);
+         vr::VROverlay()->SetOverlayFlag(handle, vr::VROverlayFlags_NoDashboardTab, true);
+         vr::VROverlay()->SetOverlayFlag(handle, vr::VROverlayFlags_SortWithNonSceneOverlays, true);
+-        vr::VROverlay()->ShowOverlay(handle);
++        vr::VROverlay()->HideOverlay(handle);
+     }
+ 
+     // Get recommended render target size
+@@ -111,11 +116,23 @@ bool XRInterfaceOpenVROverlay::_initialize() {
+     UtilityFunctions::print("OpenVR Overlay: recommended RT size = ",
+                             (int64_t)m_rt_width, "x", (int64_t)m_rt_height);
+ 
+-    // Load action manifest from the addon first, then fall back to the old sample-project path.
+-    String actions_res_path = "res://addons/godot-openvr-overlay/actions.json";
+-    if (!FileAccess::file_exists(actions_res_path))
+-        actions_res_path = "res://actions.json";
+-    String actions_path = ProjectSettings::get_singleton()->globalize_path(actions_res_path);
++    // SteamVR reads files itself; res:// paths inside a PCK are not OS files.
++    String input_dir = ProjectSettings::get_singleton()->globalize_path("user://openvr-input");
++    DirAccess::make_dir_recursive_absolute(input_dir);
++    for (const char *name : {"actions.json", "bindings_index_controller.json", "bindings_knuckles.json"}) {
++        String source = String("res://addons/godot-openvr-overlay/") + name;
++        Ref<FileAccess> dest = FileAccess::open(input_dir.path_join(name), FileAccess::WRITE);
++        if (dest.is_null() || !FileAccess::file_exists(source)) {
++            UtilityFunctions::push_error("OpenVR Overlay: cannot extract input manifest/bindings");
++            vr::VROverlay()->DestroyOverlay(m_left_overlay);
++            vr::VROverlay()->DestroyOverlay(m_right_overlay);
++            m_left_overlay = m_right_overlay = vr::k_ulOverlayHandleInvalid;
++            vr::VR_Shutdown();
++            return false;
++        }
++        dest->store_buffer(FileAccess::get_file_as_bytes(source));
++    }
++    String actions_path = input_dir.path_join("actions.json");
+     std::string actions_utf8 = actions_path.utf8().get_data();
+     vr::EVRInputError ie = vr::VRInput()->SetActionManifestPath(actions_utf8.c_str());
+     if (ie != vr::VRInputError_None)
+@@ -238,16 +255,31 @@ void XRInterfaceOpenVROverlay::_process() {
+     if (!m_initialized)
+         return;
+ 
++    // Hidden viewports do not submit frames. Hide independently of _end_frame
++    // so the compositor cannot retain the final revealed image.
++    if (m_hidden.load()) {
++        vr::VROverlay()->HideOverlay(m_left_overlay);
++        vr::VROverlay()->HideOverlay(m_right_overlay);
++    }
+     // Poll overlay events
+     vr::VREvent_t event;
+     while (vr::VROverlay()->PollNextOverlayEvent(m_left_overlay, &event, sizeof(event))) {
+         if (event.eventType == vr::VREvent_Quit) {
+-            if (Engine::get_singleton()->get_main_loop())
+-                Object::cast_to<SceneTree>(Engine::get_singleton()->get_main_loop())->quit();
++            m_runtime_exiting = true;
+             return;
+         }
+     }
+ 
++    vr::VREvent_t system_event;
++    while (vr::VRSystem()->PollNextEvent(&system_event, sizeof(system_event))) {
++        if (system_event.eventType == vr::VREvent_Quit) { m_runtime_exiting = true; return; }
++    }
++    _ensure_action_handles();
++    if (m_handles_ready) {
++        vr::VRActiveActionSet_t active{};
++        active.ulActionSet = m_action_set;
++        vr::VRInput()->UpdateActionState(&active, sizeof(active), 1);
++    }
+     // Get HMD and controller poses
+     vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
+     vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(
+@@ -262,6 +294,10 @@ void XRInterfaceOpenVROverlay::_process() {
+         m_has_pose = false;
+     }
+ 
++    if (m_head_tracker.is_valid()) {
++        if (m_has_pose) m_head_tracker->set_pose("default", ovr_math::to_godot(m_tracking_from_head), Vector3(), Vector3(), XRPose::XR_TRACKING_CONFIDENCE_HIGH);
++        else m_head_tracker->invalidate_pose("default");
++    }
+     // Update controller trackers
+     _update_tracker_pose(m_left_tracker,  m_left_handles,  m_left_source,  vr::TrackedControllerRole_LeftHand,  poses);
+     _update_tracker_pose(m_right_tracker, m_right_handles, m_right_source, vr::TrackedControllerRole_RightHand, poses);
+@@ -269,10 +305,6 @@ void XRInterfaceOpenVROverlay::_process() {
+     // Update action inputs
+     _ensure_action_handles();
+     if (m_handles_ready) {
+-        vr::VRActiveActionSet_t active{};
+-        active.ulActionSet = m_action_set;
+-        vr::VRInput()->UpdateActionState(&active, sizeof(active), 1);
+-
+         _update_tracker_inputs(m_left_tracker,  m_left_handles,  m_left_source);
+         _update_tracker_inputs(m_right_tracker, m_right_handles, m_right_source);
+     }
+@@ -284,8 +316,13 @@ void XRInterfaceOpenVROverlay::_post_draw_viewport(const RID &p_render_target, c
+ }
+ 
+ void XRInterfaceOpenVROverlay::_end_frame() {
+-    if (!m_initialized || !m_has_pose)
+-        return;
++    if (!m_initialized || m_runtime_exiting) return;
++    const bool show = m_has_pose && !m_hidden.load();
++    for (auto handle : {m_left_overlay, m_right_overlay}) {
++        if (show) vr::VROverlay()->ShowOverlay(handle);
++        else vr::VROverlay()->HideOverlay(handle);
++    }
++    if (!show) return;
+     if (!m_texture_rid.is_valid())
+         return;
+ 
+@@ -341,6 +378,10 @@ void XRInterfaceOpenVROverlay::_init_trackers() {
+     XRServer *xr = XRServer::get_singleton();
+     if (!xr) return;
+ 
++    m_head_tracker.instantiate();
++    m_head_tracker->set_tracker_name("head");
++    m_head_tracker->set_tracker_type(XRServer::TRACKER_HEAD);
++    xr->add_tracker(m_head_tracker);
+     m_left_tracker.instantiate();
+     m_left_tracker->set_tracker_name("left_hand");
+     m_left_tracker->set_tracker_desc("Left Hand");
+@@ -359,7 +400,11 @@ void XRInterfaceOpenVROverlay::_init_trackers() {
+ void XRInterfaceOpenVROverlay::_shutdown_trackers() {
+     XRServer *xr = XRServer::get_singleton();
+     if (xr) {
+-        if (m_left_tracker.is_valid())  xr->remove_tracker(m_left_tracker);
++        if (m_head_tracker.is_valid()) {
++        if (XRServer::get_singleton()) XRServer::get_singleton()->remove_tracker(m_head_tracker);
++        m_head_tracker.unref();
++    }
++    if (m_left_tracker.is_valid())  xr->remove_tracker(m_left_tracker);
+         if (m_right_tracker.is_valid()) xr->remove_tracker(m_right_tracker);
+     }
+     m_left_tracker.unref();
+@@ -745,3 +790,7 @@ float XRInterfaceOpenVROverlay::get_far_z() const { return m_far_z; }
+ 
+ void XRInterfaceOpenVROverlay::set_overlay_key(const String &p_key) { m_overlay_key = p_key; }
+ String XRInterfaceOpenVROverlay::get_overlay_key() const { return m_overlay_key; }
++
++void XRInterfaceOpenVROverlay::set_overlay_hidden(bool hidden) {
++    m_hidden = hidden;
++}
+diff --git a/src/xr_interface_openvr_overlay.h b/src/xr_interface_openvr_overlay.h
+index aec6ffc..a7a28a9 100644
+--- a/src/xr_interface_openvr_overlay.h
++++ b/src/xr_interface_openvr_overlay.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <atomic>
+ 
+ #include <godot_cpp/classes/rd_texture_format.hpp>
+ #include <godot_cpp/classes/rd_texture_view.hpp>
+@@ -32,6 +33,8 @@ public:
+     void _end_frame() override;
+     void _trigger_haptic_pulse(const String &action_name, const StringName &tracker_name, double frequency, double amplitude, double duration_sec, double delay_sec) override;
+ 
++    void set_overlay_hidden(bool hidden);
++    bool is_runtime_exiting() const { return m_runtime_exiting.load(); }
+     // --- Exported properties ---
+     void     set_overlay_alpha(float p_alpha);
+     float    get_overlay_alpha() const;
+@@ -48,6 +51,9 @@ protected:
+ private:
+     // --- State ---
+     bool m_initialized = false;
++    std::atomic<bool> m_hidden{true};
++    std::atomic<bool> m_runtime_exiting{false};
++    Ref<XRPositionalTracker> m_head_tracker;
+ 
+     vr::VROverlayHandle_t m_left_overlay  = vr::k_ulOverlayHandleInvalid;
+     vr::VROverlayHandle_t m_right_overlay = vr::k_ulOverlayHandleInvalid;

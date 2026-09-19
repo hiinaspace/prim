@@ -29,9 +29,17 @@ impl IRefCounted for PrimXRMonitor {
         let (out, run, active) = (snapshot.clone(), running.clone(), connected_runtime.clone());
         let worker = std::thread::Builder::new().name("prim-xr-status".into()).spawn(move || {
             #[cfg(target_os = "linux")]
-            let mut monado = None;
+            let mut monado: Option<Monado> = None;
+            #[cfg(target_os = "linux")]
+            let mut retry_at = Instant::now();
+            #[cfg(target_os = "linux")]
+            let mut last_selection = String::new();
+            #[cfg(target_os = "linux")]
+            let mut status_error = String::new();
             while run.load(Ordering::Relaxed) {
-                let mut state = configured_runtime();
+                let state = configured_runtime();
+                #[cfg(target_os = "linux")]
+                let mut state = state;
                 #[cfg(target_os = "linux")]
                 {
                     let selected = state["runtime"] == "Monado" || active.load(Ordering::Relaxed);
@@ -40,11 +48,30 @@ impl IRefCounted for PrimXRMonitor {
                         std::fs::read_to_string(entry.path().join("comm")).is_ok_and(|s| s.trim() == "monado-service")
                     }));
                     if selected && (service_up || active.load(Ordering::Relaxed)) {
-                        if monado.is_none() { monado = unsafe { Monado::open().ok() }; }
-                        state = match monado.as_mut().and_then(|m| unsafe { m.poll().ok() }) {
-                            Some(clients) => classify_clients(&clients),
-                            None => { monado = None; json!({"runtime":"Monado", "activity":"unknown", "detail":"Client status unavailable"}) }
-                        };
+                        let selection = state["library"].to_string();
+                        if selection != last_selection {
+                            monado = None; retry_at = Instant::now(); last_selection = selection;
+                        }
+                        if monado.is_none() && Instant::now() >= retry_at {
+                            retry_at = Instant::now() + Duration::from_secs(15);
+                            match unsafe { Monado::open(&state) } {
+                                Ok(client) => { status_error.clear(); monado = Some(client); }
+                                Err(message) => { if status_error != message { eprintln!("PRIM_XR_MONITOR {message}"); } status_error = message; }
+                            }
+                        }
+                        if let Some(client) = monado.as_mut() {
+                            match unsafe { client.poll() } {
+                                Ok(clients) => {
+                                    let mut observed = classify_clients(&clients);
+                                    observed["manifest"] = state["manifest"].clone();
+                                    observed["library"] = state["library"].clone();
+                                    observed["status_library"] = json!(client.path);
+                                    state = observed;
+                                }
+                                Err(_) => { monado = None; status_error = "Monado status connection lost; explicit reveal remains available".into(); }
+                            }
+                        }
+                        if monado.is_none() { state["activity"] = json!("unknown"); state["detail"] = json!(status_error); }
                     } else {
                         monado = None;
                         if selected { state["activity"] = json!("unavailable"); }
@@ -81,6 +108,10 @@ impl Drop for PrimXRMonitor {
 #[godot_api]
 impl PrimXRMonitor {
     #[func]
+    fn configured_runtime_json(&self) -> GString {
+        GString::from(configured_runtime().to_string().as_str())
+    }
+    #[func]
     fn set_monado_session_active(&mut self, active: bool) {
         self.connected_runtime.store(active, Ordering::Relaxed);
     }
@@ -100,6 +131,10 @@ fn configured_runtime() -> Value {
     if let Some(path) = std::env::var_os("XR_RUNTIME_JSON") {
         paths.push(std::path::PathBuf::from(path));
     } else {
+        #[cfg(target_os = "windows")]
+        if let Some(path) = windows_runtime_path() {
+            paths.push(path);
+        }
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
@@ -129,13 +164,62 @@ fn configured_runtime() -> Value {
                 } else {
                     "OpenXR"
                 };
-                return json!({"runtime":name, "activity":"unknown"});
+                let manifest = std::fs::canonicalize(&path).unwrap_or(path.clone());
+                let raw = value["runtime"]["library_path"].as_str().unwrap_or("");
+                let resolved = resolve_runtime_library(&manifest, raw);
+                return json!({"runtime":name, "activity":"unknown", "manifest":manifest, "library":resolved});
             }
         }
     }
     json!({"runtime":"Undetected", "activity":"unknown"})
 }
 
+fn resolve_runtime_library(manifest: &std::path::Path, library: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(library);
+    let resolved = if path.is_absolute() { path.to_owned() }
+        else { manifest.parent().unwrap_or(std::path::Path::new(".")).join(path) };
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
+}
+
+#[cfg(target_os = "linux")]
+fn monado_candidates(runtime: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Ok(path) = std::env::var("PRIM_LIBMONADO") { paths.push(path); }
+    if let Some(library) = runtime["library"].as_str() {
+        if let Some(directory) = std::path::Path::new(library).parent() {
+            for name in ["libmonado.so", "libmonado.so.25"] {
+                paths.push(directory.join(name).to_string_lossy().into_owned());
+            }
+        }
+    }
+    paths.extend(["libmonado.so".into(), "libmonado.so.25".into(), "/run/current-system/sw/lib/libmonado.so".into()]);
+    paths.dedup();
+    paths
+}
+
+#[cfg(target_os = "windows")]
+fn windows_runtime_path() -> Option<std::path::PathBuf> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(key: *mut c_void, subkey: *const u16, value: *const u16,
+            flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
+    }
+    let subkey: Vec<u16> = "SOFTWARE\\Khronos\\OpenXR\\1\0".encode_utf16().collect();
+    let value: Vec<u16> = "ActiveRuntime\0".encode_utf16().collect();
+    let mut data = vec![0u16; 4096];
+    let mut size = (data.len() * 2) as u32;
+    // HKLM, REG_SZ, explicitly use the 64-bit runtime registration.
+    let result = unsafe { RegGetValueW(0x80000002u32 as i32 as isize as *mut c_void,
+        subkey.as_ptr(), value.as_ptr(), 0x00010002, std::ptr::null_mut(),
+        data.as_mut_ptr().cast(), &mut size) };
+    if result != 0 { return None; }
+    let end = data.iter().position(|c| *c == 0)?;
+    Some(std::ffi::OsString::from_wide(&data[..end]).into())
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn classify_clients(clients: &[(u32, String, u32)]) -> Value {
     // Ignore *all* overlays, not only known app names. A live unfocused main app
     // still owns gameplay input; visibility alone is not evidence it has exited.
@@ -154,25 +238,27 @@ fn classify_clients(clients: &[(u32, String, u32)]) -> Value {
 
 #[cfg(target_os = "linux")]
 struct Monado {
+    path: String,
     lib: libloading::Library,
     root: *mut std::ffi::c_void,
 }
 #[cfg(target_os = "linux")]
 impl Monado {
-    unsafe fn open() -> Result<Self, ()> {
-        let mut candidates = Vec::new();
-        if let Ok(path) = std::env::var("PRIM_LIBMONADO") {
-            candidates.push(path);
+    unsafe fn open(runtime: &Value) -> Result<Self, String> {
+        let mut failed = Vec::new();
+        for path in monado_candidates(runtime) {
+            if let Ok(mut client) = Self::open_one(&path) {
+                if client.poll().is_ok() {
+                    eprintln!("PRIM_XR_MONITOR connected status_library={path}");
+                    return Ok(client);
+                }
+            }
+            failed.push(path);
         }
-        candidates.extend([
-            "libmonado.so".into(),
-            "libmonado.so.25".into(),
-            "/run/current-system/sw/lib/libmonado.so".into(),
-        ]);
-        let lib = candidates
-            .iter()
-            .find_map(|p| libloading::Library::new(p).ok())
-            .ok_or(())?;
+        Err(format!("No compatible Monado status client (load/API/IPC probe failed): {}. Explicit reveal remains available.", failed.join(", ")))
+    }
+    unsafe fn open_one(path: &str) -> Result<Self, ()> {
+        let lib = libloading::Library::new(path).map_err(|_| ())?;
         let version = lib
             .get::<unsafe extern "C" fn(*mut u32, *mut u32, *mut u32)>(b"mnd_api_get_version\0")
             .map_err(|_| ())?;
@@ -191,7 +277,7 @@ impl Monado {
         if create(&mut root) < 0 || root.is_null() {
             return Err(());
         }
-        Ok(Self { lib, root })
+        Ok(Self { path: path.to_owned(), lib, root })
     }
     unsafe fn poll(&mut self) -> Result<Vec<(u32, String, u32)>, ()> {
         type Root = *mut std::ffi::c_void;

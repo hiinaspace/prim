@@ -251,3 +251,42 @@ starts its own Monado/QWERTY runtime, a main XR app and two Prim clients; it doe
 not stop the host runtime. Gesture and policy tests are `res://tests/xr_gesture.gd`
 and `res://tests/xr_policy.gd`. Always set an isolated `XDG_DATA_HOME` for UI tests;
 Linux `res://tests/menu.gd` now refuses to run without one because it saves controls.
+
+## SteamVR companion
+
+`tools/test-steamvr-companion.py --allow-scene-takeover` exercises real Linux
+SteamVR background tracking and ordinary OpenXR handoffs, with a second local
+Prim client checking avatar delivery. It deliberately replaces the headset
+scene, uses isolated profiles and cleans up its disposable applications. Build
+both `tools/build-steamvr-probe.sh` and `tools/build-openvr-helper.sh linux`
+first. Wear the headset and hold both controllers for the grip-origin diagnostic;
+unworn/standby action poses are not useful for that comparison.
+
+`res://tests/steamvr_policy.gd` covers ownership, stale data and pose conversion
+without a runtime. See [STEAMVR_COMPANION_PLAN.md](STEAMVR_COMPANION_PLAN.md) for
+local evidence and the short Windows friends checklist. Linux live tests and Wine
+loading are not native Windows headset qualification.
+
+## Companion follow-up controls and visibility
+
+- `nix develop --command python3 tools/test-monado-status.py`: rejected status
+  library + runtime-local Envision-layout fallback, without using real IPC.
+- `tools/test-xr-companion.py`: private Monado real sessions, placement 1/10,
+  XR-only composition restart, neutral-gated peek sticks and explicit-hide latch.
+- `project/tests/menu.gd`: isolated-profile menu regression, independent deafen
+  buses, tracked mouse yaw/head pivot and pointer focus behavior.
+- `project/tests/wrist_controls.gd`: dwell/rearm arbitration; `wrist_render.gd`
+  writes a layout preview to `PRIM_WRIST_IMAGE` using the actual 3D UI.
+- With SteamVR already running and headset/controllers active,
+  `nix develop --command python3 tools/test-steamvr-companion.py --allow-scene-takeover --peek`
+  checks the experimental projective overlay and OpenXR scene handoffs.
+  `PRIM_PEEK_INTERACTIVE=1` adds a two-minute headset test. This replaces the
+  current scene with a disposable rendering reference game. SteamVR's Linux
+  launcher requires the Steam client/runtime launch service; a bare ownership
+  probe displaying “Next up” is not a rendering or controller-input test.
+
+[Arch/Envision retry instructions](ARCH_COMPANION_TEST.md) identify the remaining
+friend-machine composition check. OpenVR Linux headset success and Windows
+cross-build success are separate from Windows headset, other controller profiles,
+and performance qualification. Deafen needs a friends/audio listening check in
+addition to assertions on the final output buses.

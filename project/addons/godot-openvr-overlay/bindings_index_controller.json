@@ -1,0 +1,184 @@
+{
+  "json_id": "input_binding",
+  "controller_type": "index_controller",
+  "name": "Godot OpenVR Overlay Index Controller",
+  "description": "Default bindings for Godot OpenVR Overlay on Valve Index controllers",
+  "bindings": {
+    "/actions/main": {
+      "haptics": [
+        {
+          "output": "/actions/main/out/haptic",
+          "path": "/user/hand/left/output/haptic"
+        },
+        {
+          "output": "/actions/main/out/haptic",
+          "path": "/user/hand/right/output/haptic"
+        }
+      ],
+      "poses": [
+        {
+          "output": "/actions/main/in/grip",
+          "path": "/user/hand/left/pose/handgrip"
+        },
+        {
+          "output": "/actions/main/in/grip",
+          "path": "/user/hand/right/pose/handgrip"
+        },
+        {
+          "output": "/actions/main/in/aim",
+          "path": "/user/hand/left/pose/tip"
+        },
+        {
+          "output": "/actions/main/in/aim",
+          "path": "/user/hand/right/pose/tip"
+        }
+      ],
+      "sources": [
+        {
+          "path": "/user/hand/left/input/trigger",
+          "mode": "trigger",
+          "inputs": {
+            "pull": {
+              "output": "/actions/main/in/left_trigger"
+            },
+            "click": {
+              "output": "/actions/main/in/left_trigger_click"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/trigger",
+          "mode": "trigger",
+          "inputs": {
+            "pull": {
+              "output": "/actions/main/in/right_trigger"
+            },
+            "click": {
+              "output": "/actions/main/in/right_trigger_click"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/grip",
+          "mode": "force_sensor",
+          "inputs": {
+            "force": {
+              "output": "/actions/main/in/left_grip"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/grip",
+          "mode": "force_sensor",
+          "inputs": {
+            "force": {
+              "output": "/actions/main/in/right_grip"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/thumbstick",
+          "mode": "joystick",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/left_thumbstick"
+            },
+            "click": {
+              "output": "/actions/main/in/left_thumbstick_click"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/thumbstick",
+          "mode": "joystick",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/right_thumbstick"
+            },
+            "click": {
+              "output": "/actions/main/in/right_thumbstick_click"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/trackpad",
+          "mode": "trackpad",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/left_trackpad"
+            },
+            "click": {
+              "output": "/actions/main/in/left_trackpad_click"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/trackpad",
+          "mode": "trackpad",
+          "inputs": {
+            "position": {
+              "output": "/actions/main/in/right_trackpad"
+            },
+            "click": {
+              "output": "/actions/main/in/right_trackpad_click"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/a",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/left_a"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/a",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/right_a"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/b",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/left_b"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/b",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/right_b"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/left/input/system",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/left_system"
+            }
+          }
+        },
+        {
+          "path": "/user/hand/right/input/system",
+          "mode": "button",
+          "inputs": {
+            "click": {
+              "output": "/actions/main/in/right_system"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

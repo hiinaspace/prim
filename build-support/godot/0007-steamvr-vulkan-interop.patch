@@ -1,0 +1,13 @@
+diff --git a/drivers/vulkan/rendering_device_driver_vulkan.cpp b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+--- a/drivers/vulkan/rendering_device_driver_vulkan.cpp
++++ b/drivers/vulkan/rendering_device_driver_vulkan.cpp
+@@ -564,6 +564,9 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
+ 	if (GLOBAL_GET("xr/openxr/runtime_switching")) {
+ 		_register_requested_device_extension(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME, false);
+ 		_register_requested_device_extension(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, false);
++		// SteamVR requires the extension name even on Vulkan 1.2 devices.
++		// The libplacebo interop patch already enables the supported feature.
++		_register_requested_device_extension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME, false);
+ 		_register_requested_device_extension(VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME, false);
+ 		_register_requested_device_extension(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME, false);
+ 		_register_requested_device_extension(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, false);

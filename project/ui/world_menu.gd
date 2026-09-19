@@ -5,6 +5,8 @@ signal avatar_selected(id: String)
 signal height_changed(height: float)
 signal xr_hide_requested
 signal xr_toggled
+signal xr_open_requested
+signal xr_takeover_confirmed
 signal calibration_requested
 
 signal stereo_changed(enabled: bool)
@@ -20,6 +22,10 @@ signal media_limit_changed(mbps: int)
 signal playback_toggled
 signal seek_requested(seconds: float)
 signal connection_toggled
+signal deafen_toggled
+signal xr_reveal_requested
+signal xr_order_changed(above: bool)
+signal xr_openvr_changed(enabled: bool)
 signal microphone_toggled
 signal device_selected(device: String)
 signal gain_changed(db: float)
@@ -69,9 +75,15 @@ var relay_signature := ""
 var share_summary: Label
 var upload_limit: SpinBox
 var xr_button: Button
+var xr_open_button: Button
+var xr_takeover_dialog: ConfirmationDialog
 var xr_hide_button: Button
 var xr_status: Label
 var xr_controls: Label
+var deafen_button: Button
+var xr_reveal_button: Button
+var xr_order: CheckButton
+var xr_openvr: CheckButton
 var display_name: LineEdit
 var connection_button: Button
 var mic_button: Button
@@ -180,6 +192,13 @@ func _ready() -> void:
 	row = horizontal(column)
 	xr_button = button(row, "Enable VR", func(): xr_toggled.emit())
 	xr_button.custom_minimum_size = Vector2(260, 58)
+	xr_open_button = button(row, "Open Prim in headset", func(): xr_open_requested.emit())
+	xr_open_button.visible = false
+	xr_takeover_dialog = ConfirmationDialog.new()
+	xr_takeover_dialog.title = "Open Prim in headset?"
+	xr_takeover_dialog.ok_button_text = "Open Prim"
+	xr_takeover_dialog.confirmed.connect(func(): xr_takeover_confirmed.emit())
+	add_child(xr_takeover_dialog)
 	xr_hide_button = button(row, "Hide room view", func(): xr_hide_requested.emit())
 	xr_hide_button.visible = false
 	var room_column := column
@@ -306,6 +325,8 @@ func _ready() -> void:
 	label(column, "VOICE")
 	row = horizontal(column)
 	mic_button = button(row, "MIC MUTED • Unmute", func(): microphone_toggled.emit())
+	deafen_button = button(row, "LISTENING • Deafen", func(): deafen_toggled.emit())
+	deafen_button.tooltip_text = "Silence Prim voices and media. Your microphone is unchanged."
 	mic_button.custom_minimum_size = Vector2(450, 80)
 	mic_button.add_theme_font_size_override("font_size", 32)
 	row = horizontal(column)
@@ -358,6 +379,19 @@ func _ready() -> void:
 	column.add_theme_constant_override("separation", 14)
 	tabs.add_child(column)
 	label(column, "COMFORT")
+	xr_order = CheckButton.new()
+	xr_order.text = "Draw Prim above other overlays"
+	xr_order.tooltip_text = "Compatibility with unpatched WayVR. Covers its panels while Prim is visible. Changing this restarts VR only."
+	xr_order.toggled.connect(func(value): xr_order_changed.emit(value))
+	column.add_child(xr_order)
+	xr_openvr = CheckButton.new()
+	xr_openvr.text = "Experimental SteamVR peek"
+	xr_openvr.tooltip_text = "Stereo projective overlay while a game runs. Disable to use tracking only. Restarts VR."
+	xr_openvr.disabled = not ClassDB.class_exists("XRInterfaceOpenVROverlay")
+	xr_openvr.toggled.connect(func(value): xr_openvr_changed.emit(value))
+	column.add_child(xr_openvr)
+	xr_reveal_button = button(column, "Reveal Prim room", func(): xr_reveal_requested.emit())
+	xr_reveal_button.visible = false
 	row = horizontal(column)
 	smooth = CheckButton.new()
 	smooth.text = "Smooth turn"
@@ -728,11 +762,20 @@ func update_subtitles(tracks: Array, selected: int) -> void:
 		if int(track.id) == selected: subtitles.select(subtitles.item_count - 1)
 
 func set_xr_state(state: String, message: String) -> void:
-	xr_button.text = {"desktop": "Enable VR", "starting": "Enabling VR…", "xr": "Disable VR", "stopping": "Disabling VR…"}.get(state, "Enable VR")
+	xr_button.text = {"desktop": "Enable VR", "starting": "Enabling VR…", "xr": "Disable VR", "background": "Disable VR", "stopping": "Disabling VR…"}.get(state, "Enable VR")
 	xr_button.disabled = state == "starting" or state == "stopping"
+	xr_open_button.visible = state == "background"
+	if state != "background": xr_takeover_dialog.hide()
 	xr_status.text = message
 	xr_button.tooltip_text = message
-	if state != "xr": xr_hide_button.visible = false
+	if state != "xr":
+		xr_hide_button.visible = false
+		xr_reveal_button.visible = false
+
+func confirm_xr_takeover(app: String) -> void:
+	if app.is_empty(): app = "the current VR app"
+	xr_takeover_dialog.dialog_text = "SteamVR may close %s to open Prim. Continue?" % app
+	xr_takeover_dialog.popup_centered(Vector2i(480, 160))
 
 func release_pointer() -> void:
 	if last_pressed and is_instance_valid(viewport):
@@ -748,7 +791,7 @@ func set_headset_input_allowed(allowed: bool) -> void:
 	if headset_input_allowed == allowed: return
 	release_pointer()
 	headset_input_allowed = allowed
-	if not allowed and not desktop_in_vr: visible = false
+	if not allowed and vr_mode and not desktop_in_vr: visible = false
 	update_presentation()
 
 func open_desktop() -> void:
@@ -763,3 +806,7 @@ func open_headset(camera: Camera3D) -> void:
 	desktop_in_vr = false
 	open_at(camera)
 	update_presentation()
+
+func set_deafened(value: bool) -> void:
+	deafen_button.text = "DEAFENED • Listen" if value else "LISTENING • Deafen"
+	deafen_button.modulate = Color("ffbf75") if value else Color.WHITE

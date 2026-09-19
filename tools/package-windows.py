@@ -12,6 +12,9 @@ p.add_argument('--strip', default='x86_64-w64-mingw32-strip')
 p.add_argument('--runtime-directory', type=Path, action='append', default=[])
 a = p.parse_args(); build=a.build_directory.resolve(); out=a.out.resolve(); out.mkdir(parents=True,exist_ok=True)
 seeds = {
+    root/'project/bin/windows/libgodot-openvr-overlay.windows.template_debug.x86_64.dll': 'libgodot-openvr-overlay.windows.template_debug.x86_64.dll',
+    root/'project/bin/windows/prim-openvr-helper.exe': 'prim-openvr-helper.exe',
+    root/'project/bin/windows/openvr_api.dll': 'openvr_api.dll',
     root/'project/bin/windows/onnxruntime.dll': 'onnxruntime.dll',
     build/'godot/bin/godot.windows.template_debug.x86_64.exe': 'prim.exe',
     build/'rust-build/x86_64-pc-windows-gnu/debug/prim_native.dll': 'prim_native.dll',
@@ -24,7 +27,7 @@ index = {p.name.lower():p for folder in search for p in folder.glob('*.dll')}
 for source, name in seeds.items(): shutil.copy2(source,out/name)
 for source in (build/'sdk/lib/windows-x64').glob('*.dll'): shutil.copy2(source,out/source.name)
 index.update({p.name.lower():p for p in out.glob('*.dll')})
-queue = list(out.glob('*.dll'))+[out/'prim.exe']; seen=set(); external=set()
+queue = list(out.glob('*.dll'))+list(out.glob('*.exe')); seen=set(); external=set()
 while queue:
     source=queue.pop()
     if source.name.lower() in seen: continue
@@ -50,6 +53,11 @@ for launcher,flags in [('Play.bat',''),('Desktop.bat','-- --desktop'),('VR.bat',
 subprocess.run([a.godot,'--headless','--xr-mode','off','--path',str(root/'project'),'--export-pack','Windows',str(out/'prim.pck')],check=True)
 (out/'system-runtime-imports.json').write_text(json.dumps(sorted(external),indent=2)+'\n')
 print('Windows bundle:',out)
+openvr_notices = out / 'licenses' / 'openvr'
+openvr_notices.mkdir(parents=True, exist_ok=True)
+shutil.copy2(root/'.local/openvr-helper-windows/share/licenses/openvr/LICENSE', openvr_notices/'LICENSE')
+shutil.copy2(root/'project/addons/godot-openvr-overlay/LICENSE.md', openvr_notices/'godot-openvr-overlay-LICENSE.md')
+shutil.copy2(root/'project/addons/godot-openvr-overlay/LICENSE.godot-cpp.txt', openvr_notices/'godot-cpp-LICENSE.txt')
 
 # Keep bundled avatar and vendored implementation notices readable outside the PCK.
 notices = out / 'licenses' / 'avatars'

@@ -294,5 +294,34 @@ func run() -> void:
 		await click(probe_button)
 		check(button_events.size() == prior_events + 1, "desktop button works after actual XR viewport resize")
 	XRServer.remove_interface(sized_xr)
+	app.set_deafened(true)
+	check(app.muted and app.deafened, "deafen preserves muted microphone")
+	check(AudioServer.is_bus_mute(app.movie_bus) and AudioServer.is_bus_mute(app.voice_bus), "deafen silences media and receive voice buses")
+	app.set_deafened(false)
+	check(app.muted and not AudioServer.is_bus_mute(app.voice_bus), "undeafen restores listening without unmuting microphone")
+	app.muted = false # Avoid opening a real microphone in this UI fixture.
+	app.set_deafened(true)
+	check(not app.muted, "deafen leaves a live microphone state unchanged")
+	app.set_deafened(false)
+	app.muted = true
+	app.menu.visible = false
+	app.background_tracking = true
+	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
+	app._notification(Node.NOTIFICATION_WM_WINDOW_FOCUS_IN)
+	check(Input.mouse_mode == Input.MOUSE_MODE_VISIBLE, "tracked desktop focus does not capture pointer")
+	var saved_rig: Transform3D = app.rig.global_transform
+	var pivot: Vector3 = app.camera.global_position
+	var pitch: float = app.camera.rotation.x
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	var yaw_motion := InputEventMouseMotion.new()
+	yaw_motion.relative = Vector2(80, 60)
+	app._input(yaw_motion)
+	check(app.camera.global_position.distance_to(pivot) < 0.001, "tracked mouse yaw preserves head pivot")
+	check(not app.rig.global_basis.is_equal_approx(saved_rig.basis), "tracked mouse yaw rotates playspace")
+	check(is_equal_approx(app.camera.rotation.x, pitch), "tracked mouse input does not add pitch")
+	app._notification(Node.NOTIFICATION_WM_WINDOW_FOCUS_OUT)
+	check(Input.mouse_mode == Input.MOUSE_MODE_VISIBLE, "tracked desktop blur releases pointer")
+	app.background_tracking = false
+	app.rig.global_transform = saved_rig
 	print("MENU_RESULT ", JSON.stringify(failures))
 	quit(0 if failures.is_empty() else 1)

@@ -53,6 +53,10 @@ func run() -> void:
 		if not await wait_for(func(): return app.xr_lifecycle.state == "xr"):
 			check(false, "overlay initialized")
 			break
+		if cycle == 1:
+			await app.xr_lifecycle.set_overlay_above(true)
+			check(await wait_for(func(): return app.xr_lifecycle.state == "xr"), "composition change restarts only XR")
+		check(int(app.xr_lifecycle.interface.get_overlay_status().get("placement", -1)) == (10 if cycle == 1 else 1), "runtime receives cooperative or above-overlay placement")
 		check(app.xr_lifecycle.overlay_active, "actual overlay session selected")
 		check(not root.use_xr and app.xr_viewport.use_xr, "desktop window and XR viewport separated")
 		check(await wait_for(func(): return app.sample_avatar_frame().tracked == 7), "physical head and both hands track")
@@ -107,6 +111,7 @@ func run() -> void:
 		app.move_body(Vector3(0.1,0,0))
 		check(app.rig.global_position.distance_to(offset + Vector3(0.1,0,0)) < 0.001, "desktop movement translates playspace anchor")
 		check(app.camera.global_position.distance_to(head + Vector3(0.1,0,0)) < 0.001, "physical head moves with room anchor")
+		if cycle == 0: await check_peek_locomotion()
 		# Exercise presentation independently of physical gesture input.
 		app.set_process(false)
 		app.xr_lifecycle.set_reveal_fraction(0.5)
@@ -192,3 +197,43 @@ func check_desktop_menu_controls() -> void:
 	app.menu.visible = false
 	app.left.tracker = original_tracker
 	XRServer.remove_tracker(test_tracker)
+
+func check_peek_locomotion() -> void:
+	var original: StringName = app.left.tracker
+	var tracker := XRControllerTracker.new()
+	tracker.type = XRServer.TRACKER_CONTROLLER
+	tracker.name = &"/test/peek-controller"
+	tracker.set_pose(app.left.pose, Transform3D.IDENTITY, Vector3.ZERO, Vector3.ZERO, XRPose.XR_TRACKING_CONFIDENCE_HIGH)
+	tracker.set_input("primary", Vector2(0, 1))
+	XRServer.add_tracker(tracker)
+	app.left.tracker = tracker.name
+	app.xr_lifecycle.show_reveal()
+	check(await wait_for(func(): return app.xr_lifecycle.presentation_fraction > 0.9 and app.left.get_has_tracking_data()), "peek controls acquire tracked controller")
+	var before: Vector3 = app.rig.global_position
+	await create_timer(0.12).timeout
+	check(app.rig.global_position.distance_to(before) < 0.001, "held gameplay stick cannot move Prim on peek entry")
+	tracker.set_input("primary", Vector2.ZERO)
+	await process_frame
+	await process_frame
+	tracker.set_input("primary", Vector2(0, 1))
+	await create_timer(0.12).timeout
+	check(app.rig.global_position.distance_to(before) > 0.05, "neutral then stick moves Prim during peek")
+	tracker.set_input("primary", Vector2.ZERO)
+	var muted: bool = app.muted
+	tracker.set_input("ax_button", true)
+	tracker.set_input("by_button", true)
+	await process_frame
+	await process_frame
+	check(app.muted == muted and not app.menu.quad.visible and not app.laser.visible, "peek keeps mic menu and laser gameplay bindings disabled")
+	app.reveal_gesture.latched = true
+	app.reveal_gesture.fraction = 1.0
+	app.xr_lifecycle.hide_reveal()
+	await process_frame
+	await process_frame
+	check(not app.reveal_gesture.latched and app.xr_lifecycle.presentation_fraction == 0, "explicit hide clears a latched lift gesture")
+	before = app.rig.global_position
+	tracker.set_input("primary", Vector2(0, 1))
+	await create_timer(0.12).timeout
+	check(app.rig.global_position.distance_to(before) < 0.001, "hidden Prim ignores game locomotion")
+	app.left.tracker = original
+	XRServer.remove_tracker(tracker)

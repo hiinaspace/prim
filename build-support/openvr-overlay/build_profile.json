@@ -1,0 +1,1 @@
+{"enabled_classes": ["XRInterfaceExtension", "XRPositionalTracker", "XRControllerTracker", "XRServer", "RenderingServer", "RenderingDevice", "RDTextureFormat", "RDTextureView", "Engine", "FileAccess", "DirAccess", "ProjectSettings", "SceneTree", "OS", "XRPose"]}

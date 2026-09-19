@@ -4,6 +4,7 @@ var avatar_visible := false
 
 var controller: XRController3D
 var hand: int
+var openxr_models := true
 var fallback: MeshInstance3D
 var models: Array[Node3D] = []
 
@@ -16,6 +17,7 @@ func _ready() -> void:
 	material.albedo_color = Color("a6d8ca")
 	fallback.material_override = material
 	controller.add_child(fallback)
+	if not openxr_models: return
 	var manager := OpenXRRenderModelManager.new()
 	manager.tracker = hand
 	manager.render_model_added.connect(func(model): models.append(model))

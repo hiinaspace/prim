@@ -29,6 +29,8 @@ fi
 mkdir -p .local project/bin/linux project/addons/godot-steam-audio
 # Always resolve the engine derivation so an old staged engine cannot omit XR fixes.
 ./tools/build-godot.sh
+./tools/build-openvr-helper.sh
+./tools/build-openvr-overlay.sh
 ./tools/build-steam-audio.sh
 for item in mpv mpv.dev; do
     case "$item" in mpv.dev) link=mpv-dev;; *) link=$item;; esac

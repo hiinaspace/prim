@@ -278,3 +278,8 @@ after failure remains the existing default. No extra permission round is needed
 for routine implementation choices within this plan. WayVR's ownership transitions
 have live evidence; actual headset composition, VTOL input and gesture feel remain
 human gates.
+
+
+September 18: see [SteamVR fallback sequencing](STEAMVR_COMPANION_PLAN.md) for
+the next backend, verified installed extensions, OpenVR background tracking
+probe, interview decisions and Windows friends qualification.

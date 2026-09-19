@@ -3,7 +3,7 @@
 Avalonia 12.1.2, self-contained .NET 10, Velopack 1.2.0. See
 [the design and deferred multiplayer work](../docs/LAUNCHER_PLAN.md).
 
-The friends deployment is live at https://prim.hiina.space/ (Linux 0.3.7, Windows 0.3.6). See
+The friends deployment is live at https://prim.hiina.space/ (0.3.9 for Linux and Windows). See
 [deployment details and the persistent signing-key location](hosting/DEPLOYMENT.md)
 for subsequent releases. The generic key-generation example below is only for a
 new deployment, not this existing feed.

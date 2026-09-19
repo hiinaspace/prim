@@ -16,6 +16,9 @@ def copy(source,destination):
     destination.parent.mkdir(parents=True,exist_ok=True)
     shutil.copy2(source,destination); destination.chmod(0o755)
 seeds={Path(args.godot).resolve():out/'prim.bin',Path(args.mpv).resolve():out/'bin/linux/libmpv.so.2'}
+helper = root/'project/bin/linux/prim-openvr-helper'
+if not helper.is_file(): raise RuntimeError('Run tools/build-openvr-helper.sh first')
+seeds[helper] = out/'tools/prim-openvr-helper'
 runtime = root / 'project/bin/linux/libonnxruntime.so'
 if not runtime.is_file(): raise RuntimeError('Run tools/fetch-viseme-runtime.py --platform linux first')
 for path in (root/'project/bin/linux').glob('*.so'):seeds[path]=out/'bin/linux'/path.name
@@ -82,6 +85,7 @@ for directory in /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64 /usr
     if [[ -d "$directory" ]]; then runtime_library_path+=":$directory"; fi
 done
 export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export PRIM_RUNTIME_LIBRARY_PATH="$runtime_library_path"
 exec "$app_dir/lib/ld-linux-x86-64.so.2" --argv0 "$app_dir/prim.bin" --library-path "$runtime_library_path" "$app_dir/prim.bin" --path "$app_dir" --main-pack "$app_dir/prim.pck" "$@"
 '''
 (out/'prim').write_text(launcher);(out/'prim').chmod(0o755)
@@ -100,6 +104,11 @@ glibc_command = [sys.executable, str(root/'tools/package-linux-glibc.py'), '--ga
 if args.glibc: glibc_command += ['--glibc', args.glibc]
 subprocess.run(glibc_command, check=True)
 print('Linux bundle:',out)
+openvr_notices = out / 'licenses' / 'openvr'
+openvr_notices.mkdir(parents=True, exist_ok=True)
+shutil.copy2(root/'.local/openvr-helper-linux/share/licenses/openvr/LICENSE', openvr_notices/'LICENSE')
+shutil.copy2(root/'project/addons/godot-openvr-overlay/LICENSE.md', openvr_notices/'godot-openvr-overlay-LICENSE.md')
+shutil.copy2(root/'project/addons/godot-openvr-overlay/LICENSE.godot-cpp.txt', openvr_notices/'godot-cpp-LICENSE.txt')
 
 # Keep bundled avatar and vendored implementation notices readable outside the PCK.
 notices = out / 'licenses' / 'avatars'

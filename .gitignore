@@ -6,6 +6,7 @@ project/addons/*
 !project/addons/vrm/
 !project/addons/Godot-MToon-Shader/
 !project/addons/renik/
+!project/addons/godot-openvr-overlay/
 project/bin/
 project/private_lobby.json
 *.log

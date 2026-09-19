@@ -4,8 +4,9 @@ Use a native Linux filesystem for build outputs. Initialize submodules recursive
 The prototype expects the paired Godot build with the three interop/lifetime
 patches in `dependencies/godot-libmpv-zero/patches/godot` plus
 `build-support/godot/0004-restartable-openxr.patch`,
-`build-support/godot/0005-restore-stereo-on-xr-reentry.patch`, and
-`build-support/godot/0006-companion-overlay.patch`; stock Godot is not a
+`build-support/godot/0005-restore-stereo-on-xr-reentry.patch`,
+`build-support/godot/0006-companion-overlay.patch`, and
+`build-support/godot/0007-steamvr-vulkan-interop.patch`; stock Godot is not a
 supported runtime for this build.
 
 ## Local build and launch helper
@@ -109,8 +110,9 @@ These are the tested recipe stages; compiler paths are supplied locally:
    `NIX_LDFLAGS`; add the Windows sysroot's include/lib directories instead.
 2. Copy the pinned Godot 4.7.2 source from nixpkgs; apply the three media Godot patches,
    then `build-support/godot/0004-restartable-openxr.patch`,
-   `build-support/godot/0005-restore-stereo-on-xr-reentry.patch`, and
-   `build-support/godot/0006-companion-overlay.patch`. The overlay hook is optional
+   `build-support/godot/0005-restore-stereo-on-xr-reentry.patch`,
+   `build-support/godot/0006-companion-overlay.patch`, and
+   `build-support/godot/0007-steamvr-vulkan-interop.patch`. The overlay hook is optional
    at runtime; SteamVR continues to use an ordinary scene session.
    Build with `scons platform=windows arch=x86_64 target=template_debug
    use_mingw=yes use_static_cpp=yes d3d12=no opengl3=yes debug_symbols=no
@@ -204,3 +206,29 @@ speech test. The regular process integration test also checks live visemes.
 For packaged tests export `tests/visemes.gd` with `export-test-pack.py`, replace
 `prim.pck` in a disposable test bundle, and pass the PCM fixture environment
 variable (a Windows path under Wine). Templates may reject `--main-pack`.
+
+### SteamVR background helper
+
+`./build.sh` stages the Linux helper through `tools/build-openvr-helper.sh linux`.
+For Windows, run `tools/build-openvr-helper.sh windows`; it stages the helper EXE,
+OpenVR DLL and SDK license under `project/bin/windows`. Both targets use the
+pinned nixpkgs OpenVR source. Windows links its C++/thread support statically.
+The packagers require the helper, copy its license and include its runtime
+libraries. Linux's helper uses the same private glibc loader as the main app.
+
+The Windows Godot build needs `MINGW_PREFIX` to name a toolchain **directory**
+containing `bin/x86_64-w64-mingw32-*`, not an executable prefix. Put that bin
+folder on PATH as well, since windres and gcc-ar invoke companion tools. Ensure
+its gcc/g++ entries use the wrappers from step 1 above; SCons selects them from
+the prefix and can override command-line CC/CXX assignments.
+
+### Experimental OpenVR peek extension
+
+`build.sh` now includes `tools/build-openvr-overlay.sh linux`. The helper pins
+upstream plus Prim's lifecycle patch and stages the extension next to the native
+libraries. Windows: run `tools/build-openvr-overlay.sh windows` after preparing
+the existing engine cross toolchain, then the normal Windows packager. Override
+`MINGW_PREFIX` for another toolchain location. Action/binding JSON is explicitly
+included in both export presets and extracted to a writable per-user directory
+when SteamVR starts; do not rely on source-checkout paths in a packaged build.
+See [the patch/build notes](../build-support/openvr-overlay/README.md).
