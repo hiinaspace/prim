@@ -18,6 +18,8 @@ use std::{
 use tokio::sync::mpsc;
 
 const ALPN: &[u8] = b"prim/friends/1";
+const AUTH: &[u8] = b"prim-friends-auth-v2";
+const VERSION: u8 = 5;
 const MAX_MESSAGE: usize = 16 * 1024;
 const MAX_PEERS: usize = 5;
 const VOICE: u8 = 1;
@@ -263,12 +265,21 @@ async fn read_frame<T: for<'a> Deserialize<'a>>(
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn proof(connection: &Connection, secret: &[u8; 32]) -> Result<[u8; 32]> {
+/// Room-secret MAC over TLS exporter material for one side of a connection.
+/// The role is the exporter context, so the dialer's and acceptor's proofs
+/// differ and neither side can pass by echoing the proof it received.
+pub(crate) fn proof(
+    connection: &Connection,
+    secret: &[u8; 32],
+    label: &[u8],
+    dialer: bool,
+) -> Result<blake3::Hash> {
+    let role: &[u8] = if dialer { b"dialer" } else { b"acceptor" };
     let mut material = [0; 32];
     connection
-        .export_keying_material(&mut material, b"prim-friends-auth-v1", b"")
+        .export_keying_material(&mut material, label, role)
         .map_err(|_| anyhow::anyhow!("TLS key export failed"))?;
-    Ok(*blake3::keyed_hash(secret, &material).as_bytes())
+    Ok(blake3::keyed_hash(secret, &material))
 }
 async fn establish(
     endpoint: Endpoint,
@@ -277,10 +288,11 @@ async fn establish(
     state: Arc<Shared>,
     secret: [u8; 32],
 ) -> Result<()> {
-    let expected = proof(&connection, &secret)?;
+    let own = proof(&connection, &secret, AUTH, outgoing)?;
+    let expected = proof(&connection, &secret, AUTH, !outgoing)?;
     let hello = Hello {
-        version: 4,
-        proof: expected,
+        version: VERSION,
+        proof: *own.as_bytes(),
         address: Address::from_endpoint(&endpoint),
         name: state.name.clone(),
         hosting: state.is_host(),
@@ -290,21 +302,25 @@ async fn establish(
     } else {
         connection.accept_bi().await?
     };
-    let remote: Hello = if outgoing {
+    // The dialer speaks first; the acceptor answers only after the dialer's proof
+    // checks out, so an unauthenticated dialer learns nothing about the member.
+    if outgoing {
         write_frame(&mut send, &hello).await?;
-        read_frame(&mut recv).await?
-    } else {
-        let remote = read_frame(&mut recv).await?;
-        write_frame(&mut send, &hello).await?;
-        remote
-    };
-    if remote.version != 4 {
+    }
+    let remote: Hello = read_frame(&mut recv).await?;
+    if remote.version != VERSION {
         connection.close(1u8.into(), b"update prim: incompatible version");
         bail!("Incompatible Prim version; update all clients");
     }
-    if remote.proof != expected || remote.address.id != connection.remote_id().to_string() {
+    // blake3::Hash equality is constant-time.
+    if blake3::Hash::from(remote.proof) != expected
+        || remote.address.id != connection.remote_id().to_string()
+    {
         connection.close(1u8.into(), b"incompatible room");
         bail!("room authentication failed");
+    }
+    if !outgoing {
+        write_frame(&mut send, &hello).await?;
     }
     let id = remote.address.id.clone();
     let (tx, mut rx) = mpsc::channel(64);
@@ -702,6 +718,76 @@ mod tests {
         wait(&client, |e| matches!(e, Event::Error(_)));
         assert!(host.shared.peers.read().unwrap().is_empty());
         assert!(client.shared.peers.read().unwrap().is_empty());
+    }
+    #[test]
+    fn proofs_agree_across_connection_and_differ_by_role() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let bind = || {
+                Endpoint::builder(presets::Minimal)
+                    .alpns(vec![ALPN.to_vec()])
+                    .bind()
+            };
+            let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+            let accepting = b.clone();
+            let accepted =
+                tokio::spawn(async move { accepting.accept().await.unwrap().await.unwrap() });
+            let dialed = a.connect(b.addr(), ALPN).await.unwrap();
+            let accepted = accepted.await.unwrap();
+            let secret = [11; 32];
+            for dialer in [true, false] {
+                assert_eq!(
+                    proof(&dialed, &secret, AUTH, dialer).unwrap(),
+                    proof(&accepted, &secret, AUTH, dialer).unwrap()
+                );
+            }
+            assert_ne!(
+                proof(&dialed, &secret, AUTH, true).unwrap(),
+                proof(&dialed, &secret, AUTH, false).unwrap()
+            );
+            assert_ne!(
+                proof(&dialed, &secret, AUTH, true).unwrap(),
+                proof(&dialed, &[12; 32], AUTH, true).unwrap()
+            );
+            assert_ne!(
+                proof(&dialed, &secret, AUTH, true).unwrap(),
+                proof(&dialed, &secret, b"prim-media-auth-v2", true).unwrap()
+            );
+            a.close().await;
+            b.close().await;
+        });
+    }
+    #[test]
+    fn echoed_proof_never_admits_dialed_endpoint() {
+        // A dialed endpoint without the secret replays the member's own hello.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let attacker = runtime
+            .block_on(
+                Endpoint::builder(presets::Minimal)
+                    .alpns(vec![ALPN.to_vec()])
+                    .bind(),
+            )
+            .unwrap();
+        let address = Address::from_endpoint(&attacker);
+        let echo = attacker.clone();
+        runtime.spawn(async move {
+            let connection = echo.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut hello: Hello = read_frame(&mut recv).await.unwrap();
+            hello.address = Address::from_endpoint(&echo);
+            hello.hosting = true;
+            write_frame(&mut send, &hello).await.unwrap();
+            connection.closed().await;
+        });
+        let member = Handle::start([10; 32], "Member".into(), Some(address), true).unwrap();
+        wait(
+            &member,
+            |e| matches!(e, Event::Error(m) if m.contains("room authentication failed")),
+        );
+        assert!(member.shared.peers.read().unwrap().is_empty());
+        assert!(member.shared.host.read().unwrap().is_empty());
+        drop(member);
+        runtime.block_on(attacker.close());
     }
     #[test]
     fn published_record_has_no_room_secret() {

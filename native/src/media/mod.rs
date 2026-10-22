@@ -398,12 +398,13 @@ impl Media {
             tokio::time::timeout(Duration::from_secs(10), endpoint.connect(addr, ALPN)).await??;
         let result = tokio::time::timeout(Duration::from_secs(8), async {
             let (mut send, mut recv) = connection.open_bi().await?;
-            send.write_all(&auth(&connection, &secret)?).await?;
+            send.write_all(auth(&connection, &secret, true)?.as_bytes())
+                .await?;
             send.finish()?;
             let mut reply = [0; 32];
             recv.read_exact(&mut reply).await?;
             ensure!(
-                reply == auth(&connection, &secret)?,
+                blake3::Hash::from(reply) == auth(&connection, &secret, false)?,
                 "media authentication failed"
             );
             anyhow::Ok(())
@@ -442,11 +443,8 @@ impl Media {
 fn random_id() -> String {
     iroh::SecretKey::generate().public().to_string()
 }
-fn auth(c: &Connection, secret: &[u8; 32]) -> Result<[u8; 32]> {
-    let mut material = [0; 32];
-    c.export_keying_material(&mut material, b"prim-media-auth-v1", b"")
-        .map_err(|_| anyhow::anyhow!("key export failed"))?;
-    Ok(*blake3::keyed_hash(secret, &material).as_bytes())
+fn auth(c: &Connection, secret: &[u8; 32], dialer: bool) -> Result<blake3::Hash> {
+    crate::network::proof(c, secret, b"prim-media-auth-v2", dialer)
 }
 // 0 unknown, 1 selected direct, 2 selected relay. Presence alone is insufficient.
 fn selected_path(c: &Connection) -> u8 {
@@ -476,8 +474,12 @@ pub async fn accept(connection: Connection, state: Arc<Shared>, secret: [u8; 32]
         let (mut send, mut recv) = connection.accept_bi().await?;
         let mut proof = [0; 32];
         recv.read_exact(&mut proof).await?;
-        ensure!(proof == auth(&connection, &secret)?, "wrong room");
-        send.write_all(&proof).await?;
+        ensure!(
+            blake3::Hash::from(proof) == auth(&connection, &secret, true)?,
+            "wrong room"
+        );
+        send.write_all(auth(&connection, &secret, false)?.as_bytes())
+            .await?;
         send.finish()?;
         anyhow::Ok(())
     })

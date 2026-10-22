@@ -8,6 +8,12 @@ The decoder/playout stream feeds Steam Audio at each remote avatar's head.
 The shared secret derives the DHT record signing key. Records contain expiring
 endpoint addresses, not the secret. Connections prove knowledge of the secret
 using TLS exporter material before accepting membership or application traffic.
+Each side's proof is a keyed BLAKE3 MAC (key: room secret) over 32 bytes of
+TLS exporter output with label `prim-friends-auth-v2` and the sender's
+connection side, `dialer` or `acceptor`, as the exporter context. Each side
+checks the peer's proof against the opposite side, so an endpoint without the
+secret cannot pass by echoing the proof it received. The dialer sends its hello
+first; the acceptor replies only after verifying it.
 The record is a discovery hint, not an admission credential. Peers form a full
 mesh capped at six people. A single host orders playback changes. This is a
 trusted-friends protocol, with no roles or moderation framework.
@@ -33,7 +39,7 @@ pause/seek requests to that clock; its own player remains independent. Returning
 to room playback reloads/seeks to that clock. A new room source ends the local
 override. Local subtitle/audio settings still apply to the local player.
 
-The authenticated connection hello is version 4; older builds must be updated.
+The authenticated connection hello is version 5; older builds must be updated.
 Reliable `avatar_state` carries `avatar` (a catalog ID), `revision` (catalog
 revision 1), `eye_height` (0.5–2.5 meters), and a uint32 configuration `epoch`.
 Unknown IDs or catalog revisions use cubes. A body swap preserves the peer's
@@ -94,8 +100,9 @@ are doubles). No provider path or receiver-local URL is broadcast. Re-sharing th
 same file creates a new ID and clears relay consent.
 
 The existing endpoint dispatches `prim/media-range/1` to a separate connection.
-It requires an active room member and a keyed BLAKE3 proof over the connection's
-TLS exporter (`prim-media-auth-v1`), using the room secret. Any active room member
+It requires an active room member and the same role-bound proof exchange with
+exporter label `prim-media-auth-v2`: the viewer sends its `dialer` proof, and the
+provider answers with its own `acceptor` proof. Any active room member
 can serve its own publication. One dedicated media connection per viewer admits at most four
 concurrent range streams, separate from room control and voice queues.
 
@@ -145,7 +152,7 @@ Publication and receiving have separate cancellation/lifecycle state.
 offer. The host can stop any current source. Replacement revokes the old provider;
 provider departure clears the source. File preparation, stale acknowledgements,
 and stale stop messages cannot restore a previous video. This does not introduce
-room-host migration. All participants must update to hello version 4.
+room-host migration. All participants must update to hello version 5.
 
 Subtitle choices and direct-stereo preferences stay local and generate no room
 control messages. Runtime VRM import is currently an offline local-file preview;
