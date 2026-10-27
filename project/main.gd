@@ -8,6 +8,7 @@ const Menu = preload("res://ui/world_menu.gd")
 const Avatar = preload("res://net/avatar.gd")
 const Pose = preload("res://net/pose.gd")
 const Playback = preload("res://media/playback.gd")
+const Friends = preload("res://net/friends.gd")
 @onready var rig: XROrigin3D = $XROrigin3D
 @onready var left: XRController3D = $XROrigin3D/LeftController
 @onready var right: XRController3D = $XROrigin3D/RightController
@@ -81,6 +82,17 @@ var voice_volume_percent := 150.0
 var voice_near_radius := 3.0
 var voice_far_radius := 15.0
 var status_text := "Singleplayer"
+var identity_key := PackedByteArray()
+var identity_id := ""
+var friends := Friends.new()
+# "" | "friends" | "invite": the instance this session hosts.
+var hosting_mode := ""
+# Friends the host ticked for an Invite instance (kept in memory per instance).
+var invited := {}
+var peer_names := {}
+# Last network error of the current session, so a refused join stays visible after the session ends.
+var session_error := ""
+var friends_signature := ""
 
 func _ready() -> void:
 	settings.load("user://settings.cfg")
@@ -138,6 +150,7 @@ func _ready() -> void:
 		speaker.point_source_binaural = true
 	session = ClassDB.instantiate("PrimSession")
 	add_child(session)
+	load_identity()
 	sender = ClassDB.instantiate("NetworkAudioSender")
 	sender.capture_on_worker = true
 	add_child(sender)
@@ -184,6 +197,21 @@ func _ready() -> void:
 	menu.playback_toggled.connect(func(): playback.request_action("toggle"))
 	menu.seek_requested.connect(func(seconds): playback.request_action("seek_to", seconds))
 	menu.connection_toggled.connect(toggle_connection)
+	menu.host_requested.connect(host_instance)
+	menu.join_friend_requested.connect(join_friend)
+	menu.friend_code_added.connect(func(code, friend_name):
+		var problem := friends.add_by_code(code, friend_name)
+		menu.set_friend_notice(problem if not problem.is_empty() else "Added.", problem.is_empty()))
+	menu.friend_removed.connect(func(id):
+		friends.remove(id)
+		invited.erase(id))
+	menu.friend_invite_toggled.connect(func(id, on):
+		if on: invited[id] = true
+		else: invited.erase(id)
+		update_admission())
+	menu.peer_friend_requested.connect(func(peer): friends.request(peer, peer_names.get(peer, "")))
+	menu.peer_friend_accepted.connect(func(peer): friends.accept(peer))
+	friends.changed.connect(update_admission)
 	menu.microphone_toggled.connect(toggle_microphone)
 	menu.deafen_toggled.connect(func(): set_deafened(not deafened))
 	menu.device_selected.connect(select_device)
@@ -195,6 +223,7 @@ func _ready() -> void:
 	menu.name_changed.connect(func(value):
 		display_name = value.strip_edges().left(32)
 		if display_name.is_empty(): display_name = "Friend"
+		friends.my_name = display_name
 		save_setting("user", "name", display_name)
 		session.broadcast_control(JSON.stringify({"type":"name", "name":display_name})))
 	menu.smooth_turn_changed.connect(func(value):
@@ -207,7 +236,9 @@ func _ready() -> void:
 		video_volume_db = value
 		update_video_volume())
 	session.status_changed.connect(func(message): status_text = message)
-	session.network_error.connect(func(message): status_text = message)
+	session.network_error.connect(func(message):
+		status_text = message
+		session_error = message)
 	session.host_changed.connect(func(_peer): playback.host_changed())
 	session.peer_connected.connect(peer_connected)
 	session.peer_disconnected.connect(peer_disconnected)
@@ -414,6 +445,71 @@ func save_setting(section: String, key: String, value: Variant) -> void:
 	settings.set_value(section, key, value)
 	settings.save("user://settings.cfg")
 
+# 32 raw bytes at user://identity.key are the iroh endpoint secret key; the
+# endpoint ID derived from it is this install's friend code.
+func load_identity() -> void:
+	var identity = ClassDB.instantiate("PrimIdentity")
+	var path := "user://identity.key"
+	if FileAccess.file_exists(path):
+		identity_key = FileAccess.get_file_as_bytes(path)
+	if identity_key.size() != 32:
+		identity_key = identity.generate_key()
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		if file != null:
+			file.store_buffer(identity_key)
+			file.close()
+			FileAccess.set_unix_permissions(path, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
+		else:
+			push_warning("Could not persist identity.key; this identity lasts until exit.")
+	identity_id = identity.key_id(identity_key)
+	session.set_identity(identity_key)
+	friends.own_id = identity_id
+	friends.my_name = display_name
+	friends.send = func(peer, json): return session.send_control(peer, json)
+	friends.load_file()
+
+func admission_ids() -> PackedStringArray:
+	if hosting_mode == "invite":
+		var result := PackedStringArray()
+		for id in friends.ids():
+			if invited.has(id): result.append(id)
+		return result
+	return friends.ids()
+
+func update_admission() -> void:
+	if not hosting_mode.is_empty() and session.is_active(): session.set_admission(admission_ids())
+
+func start_guard() -> bool:
+	if session.is_active(): return false
+	if runtime_avatar_scene != null:
+		status_text = "Local VRM preview: choose a bundled avatar before connecting."
+		return false
+	return true
+
+func host_instance(mode: String) -> void:
+	if not start_guard(): return
+	session_error = ""
+	set_muted(true)
+	invited.clear()
+	hosting_mode = mode
+	if session.host_instance(mode, admission_ids(), display_name):
+		session.attach_sender(sender)
+		status_text = "Starting %s instance…" % mode
+	else:
+		hosting_mode = ""
+
+func join_friend(id: String) -> void:
+	if not start_guard(): return
+	session_error = ""
+	set_muted(true)
+	hosting_mode = ""
+	# Tests run local-only and pass the host's full address through PRIM_TEST_HOST.
+	var target := OS.get_environment("PRIM_TEST_HOST")
+	if target.is_empty(): target = id
+	if session.join_friend(target, display_name):
+		session.attach_sender(sender)
+		status_text = "Joining %s…" % (friends.friend_name(id) if friends.has_friend(id) else "friend")
+
 func toggle_connection() -> void:
 	if session.is_active():
 		set_muted(true)
@@ -427,6 +523,7 @@ func toggle_connection() -> void:
 		status_text = "Private room configuration is missing from this build."
 		return
 	set_muted(true)
+	hosting_mode = ""
 	var test_host := OS.get_environment("PRIM_TEST_HOST")
 	if session.join_room(config.secret, display_name, test_host):
 		session.attach_sender(sender)
@@ -462,6 +559,7 @@ func select_device(device: String) -> void:
 
 func peer_connected(peer: String, peer_name: String) -> void:
 	if avatars.has(peer): return
+	peer_names[peer] = peer_name
 	var avatar := Avatar.new()
 	add_child(avatar)
 	avatar.setup(peer_name, session.receive_stream(peer))
@@ -472,16 +570,22 @@ func peer_connected(peer: String, peer_name: String) -> void:
 	playback.peer_joined(peer)
 
 func peer_disconnected(peer: String) -> void:
+	peer_names.erase(peer)
+	friends.peer_left(peer)
 	visemes.remove_source(peer)
 	if avatars.has(peer):
 		avatars[peer].retire()
 		avatars.erase(peer)
 
 func left_room() -> void:
+	hosting_mode = ""
+	invited.clear()
+	friends.clear_pending()
 	set_muted(true)
 	for peer in avatars.keys(): peer_disconnected(peer)
 	playback.left_room()
-	status_text = "Singleplayer — disconnected"
+	status_text = ("Singleplayer — " + session_error) if not session_error.is_empty() else "Singleplayer — disconnected"
+	session_error = ""
 
 func message_received(peer: String, json: String) -> void:
 	var message: Variant = JSON.parse_string(json)
@@ -490,6 +594,10 @@ func message_received(peer: String, json: String) -> void:
 		if avatars.has(peer): avatars[peer].configure(message)
 	elif message.get("type") == "name" and message.get("name") is String and avatars.has(peer):
 		avatars[peer].nameplate.text = message.name.left(32)
+		peer_names[peer] = message.name.left(32)
+	elif message.get("type") == "friend_request":
+		# The sender is the authenticated peer ID; any id inside the payload is ignored.
+		friends.receive(peer, message)
 	else:
 		playback.message_received(peer, message)
 
@@ -653,6 +761,7 @@ func _process(delta: float) -> void:
 		sequence = (sequence + 1) & 0xffffffff
 		session.send_pose(Pose.encode(sequence, avatar_frame.poses, avatar_frame.tracked, avatar_frame.fingers, avatar_frame.masks, avatar_frame.curls, avatar_epoch, avatar_reset_epoch))
 	menu.connection_button.text = "Disconnect" if session.is_active() else "Connect to friends"
+	menu.update_friends(identity_id, friends, invited, hosting_mode, session.is_active(), peer_names)
 	menu.avatar_mic_button.text = "Unmute microphone" if muted else "Mute microphone"
 	menu.avatar_mic_status.text = "Speak to animate your avatar. Local preview only." if not session.is_active() else "Microphone audio is shared with this room when unmuted."
 	var mic_status := "mic muted" if muted else ("MIC LIVE" if session.is_active() else "MIC LOCAL PREVIEW")

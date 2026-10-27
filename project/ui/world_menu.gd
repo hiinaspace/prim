@@ -22,6 +22,13 @@ signal media_limit_changed(mbps: int)
 signal playback_toggled
 signal seek_requested(seconds: float)
 signal connection_toggled
+signal host_requested(mode: String)
+signal join_friend_requested(id: String)
+signal friend_code_added(code: String, friend_name: String)
+signal friend_removed(id: String)
+signal friend_invite_toggled(id: String, on: bool)
+signal peer_friend_requested(peer: String)
+signal peer_friend_accepted(peer: String)
 signal deafen_toggled
 signal xr_reveal_requested
 signal xr_order_changed(above: bool)
@@ -86,6 +93,16 @@ var xr_order: CheckButton
 var xr_openvr: CheckButton
 var display_name: LineEdit
 var connection_button: Button
+var host_friends_button: Button
+var host_invite_button: Button
+var own_code: LineEdit
+var code_input: LineEdit
+var friend_name_input: LineEdit
+var friend_notice: Label
+var friend_mode_label: Label
+var friend_rows: VBoxContainer
+var peer_rows: VBoxContainer
+var friends_signature := ""
 var mic_button: Button
 var play_button: Button
 var devices: OptionButton
@@ -190,6 +207,10 @@ func _ready() -> void:
 	display_name.focus_exited.connect(func(): name_changed.emit(display_name.text))
 	row.add_child(display_name)
 	row = horizontal(column)
+	host_friends_button = button(row, "Host Friends instance", func(): host_requested.emit("friends"))
+	host_invite_button = button(row, "Host Invite instance", func(): host_requested.emit("invite"))
+	friend_mode_label = label(row, "")
+	row = horizontal(column)
 	xr_button = button(row, "Enable VR", func(): xr_toggled.emit())
 	xr_button.custom_minimum_size = Vector2(260, 58)
 	xr_open_button = button(row, "Open Prim in headset", func(): xr_open_requested.emit())
@@ -202,6 +223,7 @@ func _ready() -> void:
 	xr_hide_button = button(row, "Hide room view", func(): xr_hide_requested.emit())
 	xr_hide_button.visible = false
 	var room_column := column
+	build_friends_menu(tabs)
 	column = VBoxContainer.new()
 	column.name = "Movie"
 	column.add_theme_constant_override("separation", 14)
@@ -642,6 +664,95 @@ func build_avatar_menu(tabs: TabContainer) -> void:
 	preview.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	column.add_child(preview)
 	label(column, "Experimental standing avatars • Alicia fit based on Mainspring")
+
+func build_friends_menu(parent: TabContainer) -> void:
+	var column := VBoxContainer.new()
+	column.name = "Friends"
+	column.add_theme_constant_override("separation", 12)
+	parent.add_child(column)
+	parent.move_child(column, 1)
+	label(column, "FRIENDS")
+	var row := horizontal(column)
+	label(row, "Your friend code")
+	own_code = LineEdit.new()
+	own_code.editable = false
+	own_code.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(own_code)
+	button(row, "Copy", func(): DisplayServer.clipboard_set(own_code.text))
+	row = horizontal(column)
+	code_input = LineEdit.new()
+	code_input.placeholder_text = "Friend code"
+	code_input.max_length = 128
+	code_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(code_input)
+	button(row, "Paste", func(): code_input.text = DisplayServer.clipboard_get().strip_edges())
+	friend_name_input = LineEdit.new()
+	friend_name_input.placeholder_text = "Name for them"
+	friend_name_input.max_length = 32
+	friend_name_input.custom_minimum_size.x = 220
+	row.add_child(friend_name_input)
+	button(row, "Add", func(): friend_code_added.emit(code_input.text, friend_name_input.text))
+	friend_notice = label(column, "")
+	friend_notice.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label(column, "In this room")
+	peer_rows = VBoxContainer.new()
+	peer_rows.add_theme_constant_override("separation", 8)
+	column.add_child(peer_rows)
+	column.add_child(HSeparator.new())
+	label(column, "Your friends")
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size.y = 300
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	column.add_child(scroll)
+	friend_rows = VBoxContainer.new()
+	friend_rows.add_theme_constant_override("separation", 8)
+	friend_rows.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(friend_rows)
+
+func set_friend_notice(text: String, success := false) -> void:
+	friend_notice.text = text
+	if success:
+		code_input.clear()
+		friend_name_input.clear()
+
+func update_friends(own_id: String, store, invited: Dictionary, hosting: String, active: bool, peer_names: Dictionary) -> void:
+	if own_code.text != own_id: own_code.text = own_id
+	host_friends_button.disabled = active
+	host_invite_button.disabled = active
+	friend_mode_label.text = {"friends": "Hosting a Friends instance", "invite": "Hosting an Invite instance"}.get(hosting, "")
+	var signature := JSON.stringify([store.entries, invited, hosting, active, peer_names, store.incoming, store.outgoing])
+	if signature == friends_signature: return
+	friends_signature = signature
+	for container in [friend_rows, peer_rows]:
+		for child in container.get_children():
+			container.remove_child(child)
+			child.queue_free()
+	if not active or peer_names.is_empty():
+		label(peer_rows, "Nobody else is here." if active else "Join a room to add people you meet.")
+	for peer in peer_names:
+		var row := horizontal(peer_rows)
+		var title := label(row, "%s  (%s)" % [peer_names[peer], peer.left(8)])
+		title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		if store.has_friend(peer): label(row, "Friend")
+		elif store.incoming.has(peer): button(row, "Accept friend request", func(): peer_friend_accepted.emit(peer))
+		elif store.outgoing.has(peer): label(row, "Request sent")
+		else: button(row, "Add friend", func(): peer_friend_requested.emit(peer))
+	if store.entries.is_empty():
+		label(friend_rows, "No friends yet. Paste a friend code above, or add people in a room.")
+	for entry in store.entries:
+		var id: String = entry.id
+		var row := horizontal(friend_rows)
+		var title := label(row, "%s  (%s)" % [entry.name, id.left(8)])
+		title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		if hosting == "invite":
+			var invite := CheckButton.new()
+			invite.text = "Invite"
+			invite.set_pressed_no_signal(invited.has(id))
+			invite.toggled.connect(func(on): friend_invite_toggled.emit(id, on))
+			row.add_child(invite)
+		button(row, "Join", func(): join_friend_requested.emit(id)).disabled = active
+		button(row, "Remove", func(): friend_removed.emit(id))
 
 func set_avatar_settings(id: String, height: float) -> void:
 	for i in range(avatar_picker.item_count):
