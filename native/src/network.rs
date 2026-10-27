@@ -8,7 +8,7 @@ use iroh::{
 use iroh_base::TransportAddr;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, RwLock,
@@ -18,8 +18,10 @@ use std::{
 use tokio::sync::mpsc;
 
 const ALPN: &[u8] = b"prim/friends/1";
+/// Identity-gated join: the host hands the instance secret to admitted IDs only.
+pub const JOIN_ALPN: &[u8] = b"prim/join/1";
 const AUTH: &[u8] = b"prim-friends-auth-v2";
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 const MAX_MESSAGE: usize = 16 * 1024;
 const MAX_PEERS: usize = 5;
 const VOICE: u8 = 1;
@@ -86,6 +88,82 @@ struct Record {
     address: Address,
     expires: u64,
 }
+/// Who may enter a hosted instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Policy {
+    Friends,
+    Invite,
+}
+impl Policy {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "friends" => Some(Self::Friends),
+            "invite" => Some(Self::Invite),
+            _ => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Friends => "friends",
+            Self::Invite => "invite",
+        }
+    }
+}
+/// How a session finds its room.
+#[derive(Clone, Debug)]
+pub enum Mode {
+    /// Existing behaviour: the build's lobby secret, DHT discovery or a test host.
+    Shared { direct_host: Option<Address> },
+    /// Fresh instance secret, no DHT record, admission by endpoint ID.
+    Host {
+        policy: Policy,
+        admitted: Vec<String>,
+    },
+    /// Dial a host's `prim/join/1` to obtain its instance secret.
+    Join { host: Address },
+}
+pub struct Options {
+    /// Room secret for `Mode::Shared`; ignored by the other modes.
+    pub secret: [u8; 32],
+    /// Persistent endpoint secret key; random when absent.
+    pub key: Option<[u8; 32]>,
+    pub name: String,
+    pub mode: Mode,
+    pub local_only: bool,
+}
+/// `prim/join/1` reply from an admitting host.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JoinReply {
+    version: u8,
+    secret: String,
+    host: Address,
+    mode: String,
+    name: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JoinRequest {
+    version: u8,
+}
+pub fn generate_key() -> [u8; 32] {
+    iroh_base::SecretKey::generate().to_bytes()
+}
+pub fn key_id(key: &[u8; 32]) -> String {
+    iroh_base::SecretKey::from_bytes(key).public().to_string()
+}
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn from_hex(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
 #[derive(Debug)]
 pub enum Event {
     Status(String),
@@ -109,6 +187,11 @@ pub struct Shared {
     pub host: RwLock<String>,
     pub local: RwLock<String>,
     stopped: AtomicBool,
+    /// Policy of the instance this session hosts; `None` when not hosting one.
+    policy: Option<Policy>,
+    admitted: RwLock<HashSet<String>>,
+    /// The room secret in use (instance secret once hosting or joined).
+    pub(crate) room_secret: RwLock<Option<[u8; 32]>>,
     events: std::sync::mpsc::SyncSender<Event>,
     name: String,
 }
@@ -119,6 +202,13 @@ impl Shared {
         if self.events.try_send(event).is_err() {
             self.stop();
         }
+    }
+    /// Replace the live admission set; takes effect for the next join.
+    pub fn set_admission(&self, ids: Vec<String>) {
+        *self.admitted.write().unwrap() = ids.into_iter().collect();
+    }
+    fn admits(&self, id: &str) -> bool {
+        self.admitted.read().unwrap().contains(id)
     }
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
@@ -180,12 +270,33 @@ pub struct Handle {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 impl Handle {
+    #[cfg(test)]
     pub fn start(
         secret: [u8; 32],
         name: String,
         direct_host: Option<Address>,
         local_only: bool,
     ) -> Result<Self> {
+        Self::start_with(Options {
+            secret,
+            key: None,
+            name,
+            mode: Mode::Shared { direct_host },
+            local_only,
+        })
+    }
+    pub fn start_with(options: Options) -> Result<Self> {
+        let Options {
+            secret,
+            key,
+            name,
+            mode,
+            local_only,
+        } = options;
+        let (policy, admitted) = match &mode {
+            Mode::Host { policy, admitted } => (Some(*policy), admitted.iter().cloned().collect()),
+            _ => (None, HashSet::new()),
+        };
         let (tx, events) = std::sync::mpsc::sync_channel(256);
         let shared = Arc::new(Shared {
             peers: RwLock::new(HashMap::new()),
@@ -195,6 +306,9 @@ impl Handle {
             host: RwLock::new(String::new()),
             local: RwLock::new(String::new()),
             stopped: AtomicBool::new(false),
+            policy,
+            admitted: RwLock::new(admitted),
+            room_secret: RwLock::new(None),
             events: tx,
             name: name.chars().take(32).collect(),
         });
@@ -209,7 +323,7 @@ impl Handle {
                 match runtime {
                     Ok(runtime) => {
                         if let Err(err) =
-                            runtime.block_on(run(state.clone(), secret, direct_host, local_only))
+                            runtime.block_on(run(state.clone(), secret, key, mode, local_only))
                         {
                             state.event(Event::Error(format!("Network: {err:#}")));
                         }
@@ -288,6 +402,12 @@ async fn establish(
     state: Arc<Shared>,
     secret: [u8; 32],
 ) -> Result<()> {
+    // Defense in depth: a hosted instance's secret only reaches admitted IDs, but
+    // refuse unadmitted dialers even if it leaks.
+    if !outgoing && state.policy.is_some() && !state.admits(&connection.remote_id().to_string()) {
+        connection.close(3u8.into(), b"not admitted");
+        bail!("room connection from unadmitted endpoint refused");
+    }
     let own = proof(&connection, &secret, AUTH, outgoing)?;
     let expected = proof(&connection, &secret, AUTH, !outgoing)?;
     let hello = Hello {
@@ -476,41 +596,174 @@ fn publish_members(endpoint: &Endpoint, state: &Arc<Shared>) {
         });
     }
 }
+fn close_text(connection: &Connection) -> Option<String> {
+    match connection.close_reason() {
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) => {
+            Some(String::from_utf8_lossy(&close.reason).into_owned())
+        }
+        _ => None,
+    }
+}
+/// Dial a host's `prim/join/1` and receive its instance secret.
+async fn request_join(endpoint: &Endpoint, host: &Address) -> Result<JoinReply> {
+    let connection = endpoint.connect(host.parse()?, JOIN_ALPN).await?;
+    let result: Result<JoinReply> = async {
+        let (mut send, mut recv) = connection.open_bi().await?;
+        write_frame(&mut send, &JoinRequest { version: VERSION }).await?;
+        read_frame(&mut recv).await
+    }
+    .await;
+    match result {
+        Ok(reply) => {
+            connection.close(0u8.into(), b"joined");
+            if reply.version != VERSION {
+                bail!("Incompatible Prim version; update all clients");
+            }
+            if reply.host.id != connection.remote_id().to_string() {
+                bail!("join reply from unexpected endpoint");
+            }
+            Ok(reply)
+        }
+        Err(err) => {
+            // The host explains refusals in the close reason.
+            let reason = match close_text(&connection) {
+                Some(reason) => Some(reason),
+                None => tokio::time::timeout(Duration::from_secs(1), connection.closed())
+                    .await
+                    .ok()
+                    .and(close_text(&connection)),
+            };
+            match reason {
+                Some(reason) => bail!("{reason}"),
+                None => Err(err),
+            }
+        }
+    }
+}
+/// Host side of `prim/join/1`: admit by authenticated remote ID only.
+async fn accept_join(connection: Connection, endpoint: Endpoint, state: Arc<Shared>) -> Result<()> {
+    let Some(policy) = state.policy else {
+        connection.close(5u8.into(), b"not hosting");
+        return Ok(());
+    };
+    let remote = connection.remote_id().to_string();
+    if !state.admits(&remote) {
+        connection.close(3u8.into(), b"not admitted");
+        return Ok(());
+    }
+    let secret = (*state.room_secret.read().unwrap()).context("no instance secret")?;
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    let request: JoinRequest = read_frame(&mut recv).await?;
+    if request.version != VERSION {
+        connection.close(1u8.into(), b"update prim: incompatible version");
+        return Ok(());
+    }
+    write_frame(
+        &mut send,
+        &JoinReply {
+            version: VERSION,
+            secret: to_hex(&secret),
+            host: Address::from_endpoint(&endpoint),
+            mode: policy.label().into(),
+            name: state.name.clone(),
+        },
+    )
+    .await?;
+    let _ = send.finish();
+    let _ = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
+    Ok(())
+}
 async fn run(
     state: Arc<Shared>,
-    secret: [u8; 32],
-    direct_host: Option<Address>,
+    shared_secret: [u8; 32],
+    key: Option<[u8; 32]>,
+    mode: Mode,
     local_only: bool,
 ) -> Result<()> {
     state.event(Event::Status("Starting network…".into()));
-    let endpoint = if local_only {
-        Endpoint::builder(presets::Minimal)
-            .alpns(vec![ALPN.to_vec(), crate::media::ALPN.to_vec()])
-            .bind()
-            .await?
-    } else {
-        Endpoint::builder(presets::N0)
-            .alpns(vec![ALPN.to_vec(), crate::media::ALPN.to_vec()])
-            .bind()
-            .await?
+    let alpns = vec![
+        ALPN.to_vec(),
+        JOIN_ALPN.to_vec(),
+        crate::media::ALPN.to_vec(),
+    ];
+    let mut secret = shared_secret;
+    // Hosting needs the instance secret before the accept loop starts.
+    if matches!(mode, Mode::Host { .. }) {
+        secret = generate_key();
+    }
+    *state.room_secret.write().unwrap() = Some(secret);
+    let endpoint = {
+        let secret_key = key.map(|k| iroh_base::SecretKey::from_bytes(&k));
+        macro_rules! bind {
+            ($preset:expr) => {{
+                let mut builder = Endpoint::builder($preset).alpns(alpns);
+                if let Some(secret_key) = secret_key {
+                    builder = builder.secret_key(secret_key);
+                }
+                builder.bind().await?
+            }};
+        }
+        if local_only {
+            bind!(presets::Minimal)
+        } else {
+            // N0 publishes this endpoint to n0's address lookup and resolves other
+            // IDs through it, so dialing a bare EndpointId works across the internet.
+            bind!(presets::N0)
+        }
     };
     *state.local.write().unwrap() = endpoint.id().to_string();
-    let media_task = tokio::spawn(
-        state
-            .media
-            .clone()
-            .run(endpoint.clone(), state.clone(), secret),
-    );
     if !local_only {
         let _ = tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await;
     }
     state.event(Event::Ready(serde_json::to_string(
         &Address::from_endpoint(&endpoint),
     )?));
+    // A joiner learns its room secret from the host before the room can start.
+    let mut direct_host = None;
+    match &mode {
+        Mode::Join { host } => {
+            state.event(Event::Status("Joining…".into()));
+            let reply =
+                match tokio::time::timeout(Duration::from_secs(15), request_join(&endpoint, host))
+                    .await
+                {
+                    Ok(Ok(reply)) => reply,
+                    Ok(Err(err)) => {
+                        state.event(Event::Error(format!("Join: {err:#}")));
+                        endpoint.close().await;
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        state.event(Event::Error("Join: host did not answer".into()));
+                        endpoint.close().await;
+                        return Ok(());
+                    }
+                };
+            let Some(joined) = from_hex(&reply.secret) else {
+                state.event(Event::Error("Join: malformed reply".into()));
+                endpoint.close().await;
+                return Ok(());
+            };
+            secret = joined;
+            *state.room_secret.write().unwrap() = Some(secret);
+            direct_host = Some(reply.host);
+        }
+        Mode::Shared { direct_host: d } => direct_host = d.clone(),
+        Mode::Host { .. } => (),
+    }
+    let media_task = tokio::spawn(
+        state
+            .media
+            .clone()
+            .run(endpoint.clone(), state.clone(), secret),
+    );
     if let Some(host) = direct_host {
         connect(endpoint.clone(), host, state.clone(), secret);
-    } else if local_only {
+    } else if matches!(mode, Mode::Host { .. }) || local_only {
         state.set_host(endpoint.id().to_string());
+        if matches!(mode, Mode::Host { .. }) {
+            state.event(Event::Status("Hosting".into()));
+        }
     } else {
         let e = endpoint.clone();
         let s = state.clone();
@@ -530,6 +783,8 @@ async fn run(
                         let Ok(Ok(conn)) = tokio::time::timeout(Duration::from_secs(8), incoming).await else { return; };
                         if conn.alpn() == crate::media::ALPN {
                             let _ = crate::media::accept(conn, s, secret).await;
+                        } else if conn.alpn() == JOIN_ALPN {
+                            let _ = accept_join(conn, e, s).await;
                         } else {
                             let _ = tokio::time::timeout(Duration::from_secs(8), establish(e,conn,false,s,secret)).await;
                         }
@@ -700,6 +955,164 @@ mod tests {
         for client in clients.iter().skip(1) {
             wait(client, |e| matches!(e, Event::Host(id) if id.is_empty()));
         }
+    }
+    fn hosted(key: [u8; 32], policy: Policy, admitted: &[[u8; 32]]) -> (Handle, Address) {
+        let host = Handle::start_with(Options {
+            secret: [0; 32],
+            key: Some(key),
+            name: "Host".into(),
+            mode: Mode::Host {
+                policy,
+                admitted: admitted.iter().map(key_id).collect(),
+            },
+            local_only: true,
+        })
+        .unwrap();
+        let Event::Ready(info) = wait(&host, |e| matches!(e, Event::Ready(_))) else {
+            unreachable!()
+        };
+        wait(&host, |e| matches!(e, Event::Host(_)));
+        (host, serde_json::from_str(&info).unwrap())
+    }
+    fn joiner(key: [u8; 32], name: &str, host: &Address) -> Handle {
+        Handle::start_with(Options {
+            secret: [0; 32],
+            key: Some(key),
+            name: name.into(),
+            mode: Mode::Join { host: host.clone() },
+            local_only: true,
+        })
+        .unwrap()
+    }
+    fn peer_ids(handle: &Handle) -> Vec<String> {
+        let mut ids: Vec<_> = handle
+            .shared
+            .peers
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+    fn wait_peers(handle: &Handle, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while handle.shared.peers.read().unwrap().len() != count {
+            assert!(Instant::now() < deadline, "peers never reached {count}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[test]
+    fn same_key_gives_same_endpoint_id_across_starts() {
+        let key = generate_key();
+        let ready_id = |key: Option<[u8; 32]>| {
+            let handle = Handle::start_with(Options {
+                secret: [3; 32],
+                key,
+                name: "A".into(),
+                mode: Mode::Shared { direct_host: None },
+                local_only: true,
+            })
+            .unwrap();
+            let Event::Ready(info) = wait(&handle, |e| matches!(e, Event::Ready(_))) else {
+                unreachable!()
+            };
+            serde_json::from_str::<Address>(&info).unwrap().id
+        };
+        let first = ready_id(Some(key));
+        assert_eq!(first, key_id(&key));
+        assert_eq!(first, ready_id(Some(key)));
+        assert_ne!(first, ready_id(None));
+        assert_ne!(first, ready_id(Some(generate_key())));
+    }
+    #[test]
+    fn friends_host_admits_listed_keys_and_refuses_others() {
+        let (kh, k1, k2, k3) = (
+            generate_key(),
+            generate_key(),
+            generate_key(),
+            generate_key(),
+        );
+        let (host, addr) = hosted(kh, Policy::Friends, &[k1, k2]);
+        assert_eq!(addr.id, key_id(&kh));
+        let (j1, j2) = (joiner(k1, "One", &addr), joiner(k2, "Two", &addr));
+        // Full mesh: the host sees both, each joiner sees the host and the other.
+        for handle in [&j1, &j2] {
+            wait(handle, |e| matches!(e, Event::Host(id) if *id == addr.id));
+            wait_peers(handle, 2);
+        }
+        wait_peers(&host, 2);
+        assert_eq!(peer_ids(&host), {
+            let mut v = vec![key_id(&k1), key_id(&k2)];
+            v.sort();
+            v
+        });
+        // An unlisted key is refused at the join ALPN and never appears anywhere.
+        let intruder = joiner(k3, "Intruder", &addr);
+        wait(
+            &intruder,
+            |e| matches!(e, Event::Error(m) if m.contains("not admitted")),
+        );
+        // Even holding the leaked instance secret, the room ALPN refuses it too.
+        let secret = host.shared.room_secret.read().unwrap().unwrap();
+        let leaked = Handle::start_with(Options {
+            secret,
+            key: Some(k3),
+            name: "Leaked".into(),
+            mode: Mode::Shared {
+                direct_host: Some(addr.clone()),
+            },
+            local_only: true,
+        })
+        .unwrap();
+        wait(&leaked, |e| matches!(e, Event::Error(_)));
+        std::thread::sleep(Duration::from_millis(300));
+        for handle in [&intruder, &leaked] {
+            assert!(handle.shared.peers.read().unwrap().is_empty());
+        }
+        for handle in [&host, &j1, &j2] {
+            assert!(!peer_ids(handle).contains(&key_id(&k3)));
+            assert_eq!(handle.shared.peers.read().unwrap().len(), 2);
+        }
+    }
+    #[test]
+    fn invite_host_refuses_until_admission_is_updated() {
+        let (kh, kg) = (generate_key(), generate_key());
+        let (host, addr) = hosted(kh, Policy::Invite, &[]);
+        let refused = joiner(kg, "Guest", &addr);
+        wait(
+            &refused,
+            |e| matches!(e, Event::Error(m) if m.contains("not admitted")),
+        );
+        assert!(host.shared.peers.read().unwrap().is_empty());
+        host.shared.set_admission(vec![key_id(&kg)]);
+        let guest = joiner(kg, "Guest", &addr);
+        wait(&guest, |e| matches!(e, Event::Host(id) if *id == addr.id));
+        wait_peers(&guest, 1);
+        wait_peers(&host, 1);
+        assert_eq!(peer_ids(&host), vec![key_id(&kg)]);
+        // Un-inviting stops new joins; it does not rewrite the running room.
+        host.shared.set_admission(vec![]);
+        let again = joiner(generate_key(), "Other", &addr);
+        wait(
+            &again,
+            |e| matches!(e, Event::Error(m) if m.contains("not admitted")),
+        );
+    }
+    #[test]
+    fn shared_lobby_host_refuses_join_requests() {
+        let host = Handle::start([21; 32], "Host".into(), None, true).unwrap();
+        let Event::Ready(info) = wait(&host, |e| matches!(e, Event::Ready(_))) else {
+            unreachable!()
+        };
+        let addr: Address = serde_json::from_str(&info).unwrap();
+        let guest = joiner(generate_key(), "Guest", &addr);
+        wait(
+            &guest,
+            |e| matches!(e, Event::Error(m) if m.contains("not hosting")),
+        );
+        assert!(host.shared.peers.read().unwrap().is_empty());
     }
     #[test]
     fn wrong_room_secret_never_admits_peer() {

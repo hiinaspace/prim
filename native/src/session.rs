@@ -1,4 +1,4 @@
-use crate::network::{Address, Event, Handle};
+use crate::network::{Address, Event, Handle, Mode, Options, Policy};
 use godot::prelude::*;
 use godot_network_audio::{AudioStreamNetwork, NetworkAudioSender};
 use std::collections::HashMap;
@@ -12,6 +12,34 @@ pub struct PrimSession {
     info: GString,
     local_id: GString,
     host_id: GString,
+    identity: Option<[u8; 32]>,
+}
+/// Persistent identity helpers: the endpoint ID is the person's Prim ID.
+#[derive(GodotClass)]
+#[class(base=RefCounted, init)]
+pub struct PrimIdentity {
+    base: Base<RefCounted>,
+}
+#[godot_api]
+impl PrimIdentity {
+    /// 32 random bytes usable as an identity key.
+    #[func]
+    fn generate_key() -> PackedByteArray {
+        PackedByteArray::from(crate::network::generate_key().as_slice())
+    }
+    /// The friend code (endpoint ID) for a key, or "" if the key is not 32 bytes.
+    #[func]
+    fn key_id(key: PackedByteArray) -> GString {
+        match <[u8; 32]>::try_from(key.as_slice()) {
+            Ok(key) => crate::network::key_id(&key).as_str().into(),
+            Err(_) => GString::new(),
+        }
+    }
+    /// True if the text parses as an endpoint ID.
+    #[func]
+    fn is_valid_id(id: GString) -> bool {
+        id.to_string().parse::<iroh::EndpointId>().is_ok()
+    }
 }
 #[godot_api]
 impl INode for PrimSession {
@@ -23,6 +51,7 @@ impl INode for PrimSession {
             info: GString::new(),
             local_id: GString::new(),
             host_id: GString::new(),
+            identity: None,
         }
     }
     fn process(&mut self, _: f64) {
@@ -151,7 +180,18 @@ impl PrimSession {
                 Err(_) => return false,
             }
         };
-        match Handle::start(secret, name.to_string(), test_host, local_only) {
+        self.start(Options {
+            secret,
+            key: self.identity,
+            name: name.to_string(),
+            mode: Mode::Shared {
+                direct_host: test_host,
+            },
+            local_only,
+        })
+    }
+    fn start(&mut self, options: Options) -> bool {
+        match Handle::start_with(options) {
             Ok(handle) => {
                 self.handle = Some(handle);
                 true
@@ -161,6 +201,76 @@ impl PrimSession {
                     .emit_signal("network_error", &[err.to_string().to_variant()]);
                 false
             }
+        }
+    }
+    /// Use this 32-byte key as the endpoint identity for sessions started later.
+    #[func]
+    fn set_identity(&mut self, key: PackedByteArray) -> bool {
+        match <[u8; 32]>::try_from(key.as_slice()) {
+            Ok(key) => {
+                self.identity = Some(key);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    /// Host a fresh private instance. `mode` is "friends" or "invite"; `ids` is the
+    /// initial admission set (endpoint IDs).
+    #[func]
+    fn host_instance(&mut self, mode: GString, ids: PackedStringArray, name: GString) -> bool {
+        if self.handle.is_some() {
+            return false;
+        }
+        let Some(policy) = Policy::parse(&mode.to_string()) else {
+            return false;
+        };
+        let admitted = ids.as_slice().iter().map(|id| id.to_string()).collect();
+        self.start(Options {
+            secret: [0; 32],
+            key: self.identity,
+            name: name.to_string(),
+            mode: Mode::Host { policy, admitted },
+            local_only: std::env::var("PRIM_NETWORK_LOCAL_ONLY").as_deref() == Ok("1"),
+        })
+    }
+    /// Join a friend's instance. `target` is a bare endpoint ID (resolved through
+    /// iroh address lookup) or an Address JSON object (tests, direct addresses).
+    #[func]
+    fn join_friend(&mut self, target: GString, name: GString) -> bool {
+        if self.handle.is_some() {
+            return false;
+        }
+        let text = target.to_string();
+        let text = text.trim();
+        let host = if text.starts_with('{') {
+            match serde_json::from_str::<Address>(text) {
+                Ok(address) => address,
+                Err(_) => return false,
+            }
+        } else if text.parse::<iroh::EndpointId>().is_ok() {
+            Address {
+                id: text.into(),
+                relay: None,
+                direct: Vec::new(),
+            }
+        } else {
+            return false;
+        };
+        self.start(Options {
+            secret: [0; 32],
+            key: self.identity,
+            name: name.to_string(),
+            mode: Mode::Join { host },
+            local_only: std::env::var("PRIM_NETWORK_LOCAL_ONLY").as_deref() == Ok("1"),
+        })
+    }
+    /// Replace the live admission set of a hosted instance.
+    #[func]
+    fn set_admission(&self, ids: PackedStringArray) {
+        if let Some(handle) = &self.handle {
+            handle
+                .shared
+                .set_admission(ids.as_slice().iter().map(|id| id.to_string()).collect());
         }
     }
     #[func]
