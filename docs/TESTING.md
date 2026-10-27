@@ -72,6 +72,47 @@ movie. URL viewers need independent access to the site. For a local video, any p
 Movie → Browse… → Share with room; viewers receive its bytes automatically.
 Choose Play only here for independent local playback.
 
+## Friends and private instances (manual two-person test)
+
+Two people, each with a build of this branch. Hello version 6 means everyone
+must run matching builds.
+
+1. Both start Prim, open **Menu → Friends**, and note the friend code at the top
+   (Copy puts it on the clipboard). The code is stored in `user://identity.key`;
+   do not delete it between steps.
+2. Add each other once. Either exchange codes over chat and use Paste + a name +
+   **Add** (one-sided: it means "I admit this key", so both people must add), or
+   meet in the shared lobby, press **Add friend** next to the person under "In
+   this room" and have them press **Accept friend request**.
+3. Both quit Prim completely and start it again. Friends tab still lists the
+   other person under the name you gave.
+4. Person A: Room tab → **Host Friends instance**. The status line shows
+   "Hosting". Person B: Friends tab → **Join** next to A's name. Expected: B
+   connects, each sees the other's avatar and nameplate; unmute and check voice;
+   share a video URL and check playback follows A.
+5. Refusal check: a third person C (not in A's list; C can generate a code and
+   have it added only on C's side) presses Join using A's code. Expected: C is
+   not connected and the status line shows "Join: not admitted"; neither A nor B
+   shows C.
+6. Invite mode: A leaves and presses **Host Invite instance**. B's Join now
+   fails with "not admitted". A ticks **Invite** next to B in the Friends tab;
+   B's next Join works without A restarting the room. Un-ticking only affects
+   later joins.
+
+Over the internet the joiner dials a bare endpoint ID and relies on iroh's
+default n0 address lookup and relay; if Join stalls on "Joining…" for more than
+~15 seconds the status becomes "Join: host did not answer" (host offline, behind
+a blocking network, or lookup not yet published; retry after both have been
+online for a minute).
+
+Automated evidence (headless, no network beyond loopback):
+
+```sh
+nix develop --command cargo test --lib network::
+XDG_DATA_HOME=$(mktemp -d) .local/godot/bin/godot --headless --path project --xr-mode off --script res://tests/friends.gd
+XDG_DATA_HOME=$(mktemp -d) PRIM_NETWORK_LOCAL_ONLY=1 .local/godot/bin/godot --headless --path project --xr-mode off --script res://tests/identity.gd
+```
+
 ## Automated evidence for the initial build
 
 - Native six-peer full mesh, membership/departure/host loss, wrong-secret rejection.

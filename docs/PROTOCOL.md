@@ -39,12 +39,54 @@ pause/seek requests to that clock; its own player remains independent. Returning
 to room playback reloads/seeks to that clock. A new room source ends the local
 override. Local subtitle/audio settings still apply to the local player.
 
-The authenticated connection hello is version 5; older builds must be updated.
+The authenticated connection hello is version 6; older builds must be updated.
 Reliable `avatar_state` carries `avatar` (a catalog ID), `revision` (catalog
 revision 1), `eye_height` (0.5–2.5 meters), and a uint32 configuration `epoch`.
 Unknown IDs or catalog revisions use cubes. A body swap preserves the peer's
 head/voice anchor, receive stream, name and talking indicator. No paths or avatar
 bytes are sent.
+
+## Identity and private instances (ALPN `prim/join/1`)
+
+Each install keeps one Ed25519 key (`user://identity.key`, 32 raw bytes) as its
+iroh endpoint secret key, so the endpoint ID is the stable person ID and the
+friend code. iroh's TLS authenticates it on every connection; the admission
+checks below use `connection.remote_id()`, never an ID carried in a payload.
+Display names remain self-claimed. Friends are kept as local petnames in
+`user://friends.json` (`[{id, name, added}]`); nothing about the friend list is
+published.
+
+A session starts in one of three modes. **Shared lobby** is the existing
+behavior: the build's lobby secret, DHT discovery, no admission list. **Host**
+(`friends` or `invite`) generates a fresh random 32-byte instance secret, sets
+the host as room host immediately and publishes no DHT record. The endpoint also
+accepts `prim/join/1`. **Join** dials the host's endpoint ID (iroh address lookup
+resolves a bare ID in the default configuration; tests pass a full address).
+
+`prim/join/1` is one bi-directional stream. The joiner sends a length-prefixed
+JSON `{version}`; the host replies `{version, secret (64 hex), host (Address),
+mode, name}` and the joiner closes. The host checks admission before reading
+anything: if the dialer's remote ID is not in its live admission set it closes
+the connection with application code 3 and reason `not admitted`; a session that
+is not hosting an instance closes with code 5 and `not hosting`. The joiner
+surfaces the close reason as an error. After a reply the joiner runs the normal
+`prim/friends/1` room protocol (hello, role-bound proofs, mesh, media, file
+sharing) with the instance secret and the host as the direct host. The admission
+set is replaced live (`set_admission`) and applies to later joins; it does not
+remove members already in the room.
+
+Defense in depth: while hosting with a policy, the host also closes
+`prim/friends/1` connections from remote IDs outside the admission set (code 3,
+`not admitted`) before the hello exchange, so a leaked instance secret does not
+admit a stranger to the host. Members admit each other on the host's word (they
+hold the secret); a member removed from the list mid-session can still rejoin
+that instance until the host starts a new one. Friends mode admits the host's
+friends list; Invite mode admits the friends the host ticked.
+
+Friend requests travel as reliable control messages
+`{"type":"friend_request","name":...}`. The receiver keys the pending request by
+the authenticated sender ID. A request from someone I already asked, or my
+Accept (which sends the same message back), adds both sides.
 
 Pose v2 is a 636-byte, little-endian, self-contained snapshot at 20 Hz:
 
