@@ -12,7 +12,15 @@
       ln -s ${pkgs.llvmPackages.llvm}/bin/llvm-nm "$out/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-nm"
       ln -s ${pkgs.llvmPackages.llvm}/bin/llvm-objcopy "$out/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy"
     '';
+    # Windows cross shell: nixpkgs' rustc built with the windows-gnu std (std must match the compiler build exactly)
+    # and the pinned mingw-w64 gcc as linker.
+    mingw = pkgs.pkgsCross.mingwW64;
   in {
+    devShells.x86_64-linux.windows = pkgs.mkShell {
+      packages = with pkgs; [ cargo mingw.buildPackages.rustc pkg-config cmake ninja zstd
+        (python3.withPackages (ps: [ ps.jinja2 ps.mako ])) mingw.stdenv.cc binutils ];
+      WINPTHREADS_LIB = "${mingw.windows.pthreads}/lib";
+    };
     devShells.x86_64-linux.default = pkgs.mkShell {
       packages = with pkgs; [ cargo rustWithTools rustfmt clippy pkg-config cmake ninja
         (python3.withPackages (ps: [ ps.jinja2 ps.mako ])) scons clang lld patchelf binutils ffmpeg libpulseaudio meson zstd nasm vulkan-headers ];

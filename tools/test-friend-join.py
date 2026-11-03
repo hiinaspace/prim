@@ -23,6 +23,9 @@ for name in ('PRIM_AUTOJOIN', 'PRIM_MEDIA', 'PRIM_TEST_HOST'): base.pop(name, No
 command = [godot, '--headless', '--path', str(ROOT / 'project'), '--xr-mode', 'off',
            '--script', 'res://tests/friend_join.gd', '--', '--desktop']
 roles = ['host', 'guest', 'intruder']
+# Optional: PRIM_TEST_WINDOWS_EXE runs one role (PRIM_TEST_WINDOWS_ROLE, default guest) as the Windows package under Wine.
+windows_exe = os.environ.get('PRIM_TEST_WINDOWS_EXE')
+windows_role = os.environ.get('PRIM_TEST_WINDOWS_ROLE', 'guest')
 processes = []
 logs = []
 try:
@@ -30,7 +33,16 @@ try:
         log = open(OUT / f'{role}.log', 'w')
         logs.append(log)
         env = base | {'PRIM_TEST_ROLE': role, 'XDG_DATA_HOME': str(OUT / f'profile-{role}')}
-        processes.append(subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT))
+        launch = command
+        if windows_exe and role == windows_role:
+            # Exported Windows test package (tools/export-test-pack.py) under Wine, isolated prefix.
+            launch = ['wine', windows_exe, '--headless', '--xr-mode', 'off', '--', '--desktop']
+            env['PRIM_TEST_DIR'] = 'Z:' + str(OUT).replace('/', '\\')
+            env.pop('LIBMPV_ZERO_MPV_LIBRARY', None)
+            env["WINEPREFIX"] = str(ROOT / ".local/wine-friend-join")
+            env['WINEDLLOVERRIDES'] = 'winemenubuilder.exe,mscoree,mshtml=;vulkan-1=b'
+            env['WINEDEBUG'] = '-all'
+        processes.append(subprocess.Popen(launch, env=env, stdout=log, stderr=subprocess.STDOUT))
     codes = [process.wait(timeout=150) for process in processes]
     reports = {role: json.loads((OUT / f'{role}.json').read_text()) for role in roles if (OUT / f'{role}.json').exists()}
     print(json.dumps(reports, indent=2))

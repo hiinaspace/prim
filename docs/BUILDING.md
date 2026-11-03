@@ -184,6 +184,19 @@ The layout expected by the packaging tool is explicit in its seed map. This is a
 working prototype recipe, not yet a single clean-room Windows CI derivation.
 The Windows launchers set the working directory and helper-tool PATH explicitly.
 
+### Quick Windows test zip (reuse a built engine)
+
+`scripts/build-windows.sh --base DIR` produces an unpublished test zip when a full
+Windows bundle already exists (`DIR` holds the patched `prim.exe`, mpv, Steam Audio
+and the other DLLs). It rebuilds only the Rust extension (`nix develop .#windows`:
+nixpkgs' mingw-w64 gcc and its matching windows-gnu Rust std, plus the pinned MSYS2
+opus) and the PCK, adds `scripts/windows-readme.txt`, and writes
+`.local/dist/prim-windows-test.zip`. Confirm `git diff <base-commit> HEAD --
+build-support dependencies` is empty first, since engine and extension sources
+come from the base. Under Wine, `PRIM_TEST_WINDOWS_EXE=<exported test package>
+tools/test-friend-join.py` runs the `guest` (or `PRIM_TEST_WINDOWS_ROLE=host`)
+as the Windows build.
+
 ## Checks
 
 ```sh
