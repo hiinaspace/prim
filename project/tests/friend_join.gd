@@ -52,7 +52,8 @@ func pump_voice() -> void:
 func join_host_by_friend_list() -> void:
 	var info: Variant = JSON.parse_string(file_text("host.endpoint"))
 	# Local-only runs cannot resolve a bare id; main.gd passes this full address instead.
-	OS.set_environment("PRIM_TEST_HOST", file_text("host.endpoint"))
+	# PRIM_TEST_BARE_ID=1 (tools/test-friend-join-relay.py): join by bare id via address lookup + relay.
+	if OS.get_environment("PRIM_TEST_BARE_ID") != "1": OS.set_environment("PRIM_TEST_HOST", file_text("host.endpoint"))
 	app.friends.add_by_code(info.id, "Host")
 	app.menu.select_tab("Friends")
 	await process_frame
@@ -85,7 +86,7 @@ func run() -> void:
 		check(await wait_for(func(): return not file_text("host.endpoint").is_empty()), "host endpoint published")
 		await join_host_by_friend_list()
 		var host_id: String = JSON.parse_string(file_text("host.endpoint")).id
-		check(await wait_for(func(): return app.avatars.has(host_id)), "joined the Friends instance")
+		check(await wait_for(func(): return app.avatars.has(host_id), 90.0), "joined the Friends instance")
 		check(app.session.get_host_id() == host_id and not app.session.is_host(), "host is the friend who hosts")
 		pump_voice()
 		check(await wait_for(func(): return app.avatars[host_id].last_sequence > 10), "host pose reaches guest")
