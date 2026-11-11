@@ -8,8 +8,8 @@ exclude = ["dependencies"]
 resolver = "2"
 
 [workspace.dependencies]
-iroh = "1.1.0"
-iroh-base = "1.1.0"
+iroh = "1.4.1"
+iroh-base = "1.4.1"
 
 [patch.crates-io]
-neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "69c6ccb08afe56d0d1b1cd9e5a7de011679fa152" }
+neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "e854b5a85cfabd8bb550e510c5380a50b159145b" }
