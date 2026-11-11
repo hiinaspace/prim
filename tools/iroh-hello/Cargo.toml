@@ -1,0 +1,12 @@
+[package]
+name = "iroh-hello"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "Smallest iroh round trip, used to prove cross builds (aarch64 Frame) reach a peer"
+
+[dependencies]
+anyhow = "1"
+iroh.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

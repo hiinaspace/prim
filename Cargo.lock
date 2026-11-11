@@ -1475,6 +1475,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-hello"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iroh",
+ "tokio",
+]
+
+[[package]]
 name = "iroh-metrics"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
