@@ -1,22 +1,22 @@
 # Windows 11 smoke-test VM
 
-`tools/winvm.py` runs a real Windows 11 in user-space QEMU/KVM on sayu, so a Windows
+`tools/winvm.py` runs a real Windows 11 in user-space QEMU/KVM on the Linux build host, so a Windows
 package can be checked on Windows and not only under Wine. Every smoke run starts
 from a clean snapshot. It is a desktop smoke test: there is no GPU passthrough, VR
 or real microphone.
 
 ## Requirements
 
-- `/dev/kvm` readable and writable by you. On sayu it is `crw-rw-rw-`, so no root,
-  libvirt or NixOS change is needed.
+- `/dev/kvm` readable and writable by you. On the NixOS build host it is
+  `crw-rw-rw-`, so no root, libvirt or NixOS change is needed.
 - Nix. The tool pulls `qemu_kvm`, `swtpm`, `OVMFFull` (Secure Boot firmware with
   Microsoft keys) and `xorriso` from nixpkgs and caches their store paths.
 - About 40 GB free. Everything bulky lives in `$PRIM_WINVM_DIR` (default
   `~/.cache/prim-winvm`), which carries a `CACHEDIR.TAG` so Borg skips it.
-- A Windows 11 x64 ISO. Microsoft blocks scripted downloads from sayu's IP, so get
+- A Windows 11 x64 ISO. Microsoft blocks scripted downloads from the build host's IP, so get
   one from <https://www.microsoft.com/en-us/software-download/windows11> in a
   browser. Pick "multi-edition ISO", then English (United States). The page gives a
-  24-hour link that `curl` can fetch on sayu. Check the SHA-256 against the table on
+  24-hour link that `curl` can fetch on the build host. Check the SHA-256 against the table on
   that page. The current base was built from `Win11_26300_en-us_x64.iso`, sha256
   `bd4307df…ea650`.
 
@@ -89,8 +89,8 @@ tools/winvm.py screenshot shot.png    # QMP screendump of the console
 tools/winvm.py stop | reset | status
 ```
 
-To watch live, use VNC on `127.0.0.1:5951` from sayu (`ssh -L 5951:127.0.0.1:5951
-sayu` from natto), or pass `--display` for a GTK window on sayu's desktop.
+To watch live, use VNC on `127.0.0.1:5951` on the build host (forward it with
+`ssh -L 5951:127.0.0.1:5951 <host>`), or pass `--display` for a GTK window there.
 
 ## Rendering and Vulkan in the VM
 
@@ -121,7 +121,7 @@ passthrough of a spare GPU.
 This run used the identity round 1 Windows test zip (`prim-windows-test.zip`,
 `scripts/build-windows.sh` on `claude/windows-test-build`). The base was Windows 11
 Home build 26300, unactivated. The run took 196 s and every harness step completed.
-The evidence is in `.local/winvm-smoke/20261111-145152/` on sayu, which isn't committed.
+The evidence is in `.local/winvm-smoke/20261111-145152/` on the build host, which isn't committed.
 
 - **Headless:** boots and stays up for 45 s. godot-rust, Steam Audio (Embree)
   and libmpv load, and `%APPDATA%\prim\identity.key` is written.

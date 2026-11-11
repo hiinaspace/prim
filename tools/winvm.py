@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Reusable Windows 11 VM for smoke-testing Prim Windows builds (user-space QEMU/KVM).
 
-See docs/WINDOWS_VM.md. Typical use, on sayu:
+See docs/WINDOWS_VM.md. Typical use, on the Linux build host:
     tools/winvm.py install --iso ~/.cache/prim-winvm/iso/Win11_*.iso   # once, ~30-60 min
     tools/winvm.py smoke .local/dist/prim-windows-test.zip              # fresh VM each run
     tools/winvm.py start | ssh -- <cmd> | put | get | screenshot | stop | reset | status
 
-No root, libvirt or system config: needs /dev/kvm (world-rw on sayu) and Nix for
+No root, libvirt or system config: needs /dev/kvm (rw for your user) and Nix for
 qemu, swtpm, OVMF and xorriso. Disks live in $PRIM_WINVM_DIR (default
 ~/.cache/prim-winvm, marked with CACHEDIR.TAG so Borg skips it).
 """
