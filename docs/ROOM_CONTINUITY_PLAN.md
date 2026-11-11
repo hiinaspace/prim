@@ -1,5 +1,24 @@
 # Room continuity, restoration, and eventual moderation
 
+> **Superseded (2026-11).** This plan is kept for the product decisions it
+> records, which still stand: a room belongs to its participants and survives
+> losing its coordinator, partitions converge, and participants cache room
+> state. Its mechanisms (lobby-secret identity, coordinator election and
+> cache restoration inside the Godot process) are replaced by the 2026-11 room
+> architecture.
+>
+> The 2026-11 room architecture splits Prim into one room daemon
+> (`prim-room`) per participant and separate client processes: voice, tracking,
+> the Godot room, mpv for cowatching, and later games. The daemon owns
+> membership, grants and authority, replicated room state, messages and media
+> streams over a single iroh endpoint (ALPN `prim/1`). Clients reach it through a
+> local socket. Room identity is the hash of a founding record, members are
+> admitted by signed grants rather than a shared secret, and every voice stream
+> carries an incarnation so a restarted sender is never confused with its
+> predecessor. The room core is sans-IO and is tested in a deterministic N-node
+> simulator before it runs over real iroh. The first build target is a
+> voice-only slice (`prim-room` plus `prim-voice`).
+
 Planning proposal, 2026-09-16. No runtime changes are implemented by this note.
 Based on the current working tree, including the uncommitted participant-file
 sharing work. This extends the party lifetime described in

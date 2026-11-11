@@ -1,5 +1,22 @@
 # Prototype boundaries
 
+> **Superseded as a design target (2026-11).** This file still describes the
+> wire of the current prototype, which is what today's builds speak; keep it
+> accurate until that code is retired. New protocol work follows the 2026-11
+> room architecture instead, and the formats below are not carried forward.
+>
+> The 2026-11 room architecture splits Prim into one room daemon
+> (`prim-room`) per participant and separate client processes: voice, tracking,
+> the Godot room, mpv for cowatching, and later games. The daemon owns
+> membership, grants and authority, replicated room state, messages and media
+> streams over a single iroh endpoint (ALPN `prim/1`). Clients reach it through a
+> local socket. Room identity is the hash of a founding record, members are
+> admitted by signed grants rather than a shared secret, and every voice stream
+> carries an incarnation so a restarted sender is never confused with its
+> predecessor. The room core is sans-IO and is tested in a deterministic N-node
+> simulator before it runs over real iroh. The first build target is a
+> voice-only slice (`prim-room` plus `prim-voice`).
+
 One native Iroh endpoint carries room traffic: bounded reliable control
 messages, lossy sequenced pose datagrams, and encoded voice datagrams. Voice
 capture/encoding and receive ingress run independently of Godot's main thread.
