@@ -27,6 +27,8 @@ if [[ ! -f dependencies/godot-libmpv-zero/godot-cpp/CMakeLists.txt ]]; then
     git -C dependencies/godot-libmpv-zero submodule update --init -- godot-cpp
 fi
 mkdir -p .local project/bin/linux project/addons/godot-steam-audio
+# .local holds regenerable engines, builds and test output; keep it out of backups.
+[[ -f .local/CACHEDIR.TAG ]] || printf 'Signature: 8a477f597d28d172789f06886806bc55\n# Regenerable Prim build and test output (./build.sh).\n' > .local/CACHEDIR.TAG
 # Always resolve the engine derivation so an old staged engine cannot omit XR fixes.
 ./tools/build-godot.sh
 ./tools/build-openvr-helper.sh
