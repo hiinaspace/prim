@@ -197,6 +197,25 @@ come from the base. Under Wine, `PRIM_TEST_WINDOWS_EXE=<exported test package>
 tools/test-friend-join.py` runs the `guest` (or `PRIM_TEST_WINDOWS_ROLE=host`)
 as the Windows build.
 
+## aarch64 cross-build (Steam Frame)
+
+`nix develop .#aarch64` targets `aarch64-unknown-linux-gnu` by default
+(`CARGO_BUILD_TARGET`). Its rustc carries the aarch64 std; the first entry
+builds that compiler from source, which takes a while. Binaries use the system
+loader `/lib/ld-linux-aarch64.so.1` and no Nix rpath, and the Rust code needs
+glibc 2.34 at most (SteamOS on the Frame ships 2.39), so they run there as built.
+The bundled Opus is built and linked statically.
+
+```sh
+nix develop .#aarch64 --command cargo build -p iroh-hello
+scp target/aarch64-unknown-linux-gnu/debug/iroh-hello steamos@<frame>:/tmp/
+target/debug/iroh-hello listen                       # on the PC, prints its id
+ssh steamos@<frame> /tmp/iroh-hello connect <id>     # replies with arch and path
+```
+
+This shell covers plain Rust crates (voice-core, iroh-hello, future daemon
+crates). The Godot extension and engine are not built for aarch64 yet.
+
 ## Checks
 
 ```sh

@@ -15,11 +15,29 @@
     # Windows cross shell: nixpkgs' rustc built with the windows-gnu std (std must match the compiler build exactly)
     # and the pinned mingw-w64 gcc as linker.
     mingw = pkgs.pkgsCross.mingwW64;
+    # aarch64 cross shell (Steam Frame, SteamOS glibc 2.39): nixpkgs' rustc built with the aarch64 std,
+    # the pinned aarch64 gcc as linker. Binaries get the system loader and no Nix rpath so they run on the Frame.
+    arm = pkgs.pkgsCross.aarch64-multiplatform;
   in {
     devShells.x86_64-linux.windows = pkgs.mkShell {
       packages = with pkgs; [ cargo mingw.buildPackages.rustc pkg-config cmake ninja zstd
         (python3.withPackages (ps: [ ps.jinja2 ps.mako ])) mingw.stdenv.cc binutils ];
       WINPTHREADS_LIB = "${mingw.windows.pthreads}/lib";
+    };
+    devShells.x86_64-linux.aarch64 = pkgs.mkShell {
+      packages = with pkgs; [ cargo arm.buildPackages.rustc arm.stdenv.cc pkg-config cmake ninja patchelf binutils ];
+      CARGO_BUILD_TARGET = "aarch64-unknown-linux-gnu";
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "aarch64-unknown-linux-gnu-cc";
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1";
+      CC_aarch64_unknown_linux_gnu = "aarch64-unknown-linux-gnu-cc";
+      CXX_aarch64_unknown_linux_gnu = "aarch64-unknown-linux-gnu-c++";
+      AR_aarch64_unknown_linux_gnu = "aarch64-unknown-linux-gnu-ar";
+      # audiopus_sys builds its bundled opus with CMake 4, which needs the old-policy floor; link it static
+      # so Frame binaries need no libopus. No Nix store rpath in target binaries.
+      CMAKE_POLICY_VERSION_MINIMUM = "3.5";
+      LIBOPUS_STATIC = "1";
+      NIX_DONT_SET_RPATH_aarch64_unknown_linux_gnu = "1";
+      NIX_NO_SELF_RPATH = "1";
     };
     devShells.x86_64-linux.default = pkgs.mkShell {
       packages = with pkgs; [ cargo rustWithTools rustfmt clippy pkg-config cmake ninja
