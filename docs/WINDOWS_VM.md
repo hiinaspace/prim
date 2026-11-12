@@ -145,3 +145,13 @@ The evidence is in `.local/winvm-smoke/20261111-145152/` on the build host, whic
 Not covered: a real GPU, VR, a microphone, the Windows Firewall prompt (no
 listening role ran in the desktop session long enough to trigger it), the
 internet relay, Windows 10.
+
+## Software rendering and a virtual microphone (tried 2026-11-11, not yet in `smoke`)
+
+- **Rendering:** copy Mesa lavapipe (`vulkan_lvp.dll` + `lvp_icd.x86_64.json`, from mmozeiko/build-mesa `mesa-lavapipe-x64`) to the guest, and in the desktop session run
+  `set VK_DRIVER_FILES=C:\lvp\lvp_icd.x86_64.json` then `prim.exe --rendering-driver vulkan -- --desktop`.
+  Godot reports llvmpipe and the desktop UI renders. Mesa llvmpipe `opengl32.dll` did not work with gl_compatibility.
+- **Microphone:** set `PRIM_WINVM_AUDIODEV` to a QEMU audiodev spec, e.g. `pa,in.name=primmic.monitor,out.name=primout`, with host null sinks
+  `primmic` and `primout` (`pactl load-module module-null-sink sink_name=primmic`). Play a WAV in with `paplay -d primmic x.wav`.
+  A guest WinMM recording (scheduled task in the desktop session) captured the tone at the expected peak. The WASAPI peak meter
+  reads 0 unless a stream is open, so record instead of metering.

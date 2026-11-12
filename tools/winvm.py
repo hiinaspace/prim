@@ -131,7 +131,7 @@ def launch(d, cdroms=(), display=False):
             '-drive', f'id=disk,if=none,format=qcow2,file={d}/disk.qcow2,discard=unmap',
             '-device', 'ide-hd,drive=disk,bus=ahci.0,bootindex=0',
             '-netdev', f'user,id=n0,hostfwd=tcp:127.0.0.1:{SSH_PORT}-:22', '-device', 'e1000e,netdev=n0',
-            '-audiodev', 'none,id=snd0', '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
+            '-audiodev', os.environ.get('PRIM_WINVM_AUDIODEV', 'none') + ',id=snd0', '-device', 'ich9-intel-hda', '-device', 'hda-duplex,audiodev=snd0',
             '-device', 'qemu-xhci', '-device', 'usb-tablet', '-vga', 'std',
             '-vnc', f'127.0.0.1:{VNC_DISPLAY}', '-display', 'gtk' if display else 'none',
             '-qmp', f'unix:{d}/qmp.sock,server=on,wait=off',
