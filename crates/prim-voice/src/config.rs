@@ -31,6 +31,7 @@ pub const VALUED_FLAGS: &[&str] = &[
     "incarnation",
     "arrival",
     "min-delay-ms",
+    "test-drop-every",
 ];
 
 pub const HELP: &str = "\
@@ -49,6 +50,7 @@ options:
   --stats-tone          per output second, the energy at each tone:auto frequency seen (in --stats)
   --min-delay-ms N      NetEq minimum delay (default 20, voice-core's)
   --no-dtx              send silence instead of using Opus DTX
+  --test-drop-every N   TEST ONLY (harness oracle fault): drop every Nth outgoing media packet
   --duration SECS       exit after this long (default: run until SIGINT/SIGTERM)
   SIGUSR1               reopen the audio devices on the current default
 
@@ -103,6 +105,9 @@ pub struct Config {
     pub min_delay_ms: Option<u32>,
     /// Tests: fix the incarnation instead of drawing one.
     pub incarnation: Option<u32>,
+    /// Test-only fault for the R0 oracle harness: drop every Nth outgoing media packet
+    /// (non-empty payload) before it reaches the daemon. Never set in product use.
+    pub test_drop_every: Option<u64>,
 }
 
 impl Default for Config {
@@ -119,6 +124,7 @@ impl Default for Config {
             arrival: ArrivalPolicy::Stamp,
             min_delay_ms: None,
             incarnation: None,
+            test_drop_every: None,
         }
     }
 }
@@ -205,6 +211,15 @@ impl Config {
                 bail!("--incarnation must be nonzero");
             }
             c.incarnation = Some(n);
+        }
+        if let Some(v) = f.value("test-drop-every") {
+            let n: u64 = v
+                .parse()
+                .with_context(|| format!("--test-drop-every {v:?}"))?;
+            if n == 0 {
+                bail!("--test-drop-every must be nonzero");
+            }
+            c.test_drop_every = Some(n);
         }
         if let Some(v) = f.value("min-delay-ms") {
             c.min_delay_ms = Some(v.parse().with_context(|| format!("--min-delay-ms {v:?}"))?);

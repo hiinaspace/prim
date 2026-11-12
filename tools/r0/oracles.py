@@ -20,6 +20,8 @@ PFX = "prim-r0-"
 RATE = 48000
 SEATS = [-150, -100, -50, 0, 50, 100, 150]
 SKEWS = [0, 500, -500, 0, 250, -250, 0]
+CLIP_ORDER = [0, 1, 2, 3, 0, 1, 2]  # per-talker clip index (default i % 4)
+DROP_EVERY = 0  # --drop-every: test-only packet-loss fault on the talkers (proves oracle 1b can fail)
 GODOT_DEF = os.path.expanduser("~/code/prim-hrtf/.cache/bench/r2a-4")
 mono = time.monotonic
 T0 = mono()
@@ -591,7 +593,7 @@ class Cluster:
             if which and t.name not in which:
                 continue
             cap, skew = specs[i]
-            t.start_voice(cap, "null", skew=skew)
+            t.start_voice(cap, "null", skew=skew, extra=(("--test-drop-every", str(DROP_EVERY)) if DROP_EVERY else ()))
 
     def pollers(self, period=1.0):
         def run():
@@ -858,7 +860,7 @@ def mk_cluster(run, args, audio, n=7, name="c", device=True, l_offset=0):
 def speech_specs(clips, tone_idx=()):
     specs = []
     for i in range(7):
-        cap = "tone:auto" if i in tone_idx else "wav:" + clips[i % 4]
+        cap = "tone:auto" if i in tone_idx else "wav:" + clips[CLIP_ORDER[i]]
         specs.append((cap, SKEWS[i]))
     return specs
 
@@ -902,16 +904,31 @@ def run_load(args, res, audio, scen, bulk, dur, tone_idx=(6,)):
         p = peers.get(t.key, {})
         r = p.get("receiver", {})
         total = max(1, p.get("blocks_pulled", 0) * 480)
-        conc = r.get("concealed_samples", 0) - r.get("silent_concealed_samples", 0)
+        # NetEq's own concealed_samples over the samples NetEq actually produced. Intentional
+        # DTX silence never reaches NetEq (VoiceReceiver::pull_frame returns zeros without
+        # get_audio), so neteq_output_samples is the active-speech window; blocks_pulled also
+        # counts silent blocks and would dilute the figure (kept as concealed_all_pct).
+        # (silent_concealed_samples is not usable: the fork calls concealment_event(n, true)
+        # for every Expand, so it always equals concealed_samples.)
+        cs = r.get("concealed_samples", 0)
+        act = r.get("neteq_output_samples", 0)
+        secs = max(1e-9, p.get("blocks_pulled", 0) / 100.0)
         res.data.setdefault(scen, {})[t.name] = {"accepted": p.get("packets_accepted"), "blocks": p.get("blocks_pulled"),
-                                                 "concealed_nonsilent_pct": 100.0 * conc / total,
-                                                 "concealed_all_pct": 100.0 * r.get("concealed_samples", 0) / total,
+                                                 "concealed_active_pct": 100.0 * cs / max(1, act),
+                                                 "neteq_output_samples": act,
+                                                 "concealed_all_pct": 100.0 * cs / total,
                                                  "late_discarded": r.get("late_packets_discarded"),
-                                                 "decoded_per_sec": r.get("decoded_per_sec")}
-    worst = max((d["concealed_nonsilent_pct"] for d in res.data[scen].values()), default=0)
+                                                 "decoded_per_sec": r.get("decoded_per_sec"),
+                                                 "expand_per_sec": r.get("expand_per_sec"),
+                                                 "accelerate_per_sec": r.get("accelerate_per_sec"),
+                                                 "preemptive_expand_per_sec": r.get("preemptive_expand_per_sec"),
+                                                 "concealment_events": r.get("concealment_events"),
+                                                 "talkspurt_flushes": r.get("talkspurt_flushes"),
+                                                 "talkspurt_flushes_per_min": 60.0 * (r.get("talkspurt_flushes") or 0) / secs}
+    worst = max((d["concealed_active_pct"] for d in res.data[scen].values()), default=0)
     dec = all((d["accepted"] or 0) > 0 and (d["blocks"] or 0) > 0 for d in res.data[scen].values())
     res.oracle(scen, "1b", "every stream decoded at L; concealment < 2 %", dec and worst < 2.0,
-               "worst non-silent concealment %.2f %%; per-peer %s" % (worst, {k: (d["accepted"], round(d["concealed_nonsilent_pct"], 2)) for k, d in res.data[scen].items()}))
+               "worst concealment during active speech %.2f %% of NetEq output; per-peer (accepted, active %%, flushes/min) %s" % (worst, {k: (d["accepted"], round(d["concealed_active_pct"], 2), round(d["talkspurt_flushes_per_min"], 1)) for k, d in res.data[scen].items()}))
     res.oracle(scen, "1c", "no output underruns after the first second", v["underruns"] - u0 == 0,
                "underruns %d total, %d after first 2s (callback_gap p99 %s us)" % (v["underruns"], v["underruns"] - u0, {"n": v["histograms"]["callback_gap_us"]["count"], "p99_us_upper": bucket_pct(v["histograms"]["callback_gap_us"]["log2_buckets"], 99), "max_us": v["histograms"]["callback_gap_us"]["max"]}))
     # device oracle: non-silent, level vs stats via T7 tone
@@ -1179,7 +1196,7 @@ def scen_faults(args, res, audio):
                             "rec_chunk_gap_max_ms": round(rec_gap, 1), "rec_frames_over_wall_max_ms": round(rec_surplus, 1),
                             "L_underruns_delta": vs_after["underruns"] - vs_before["underruns"],
                             "baseline_p5_over_median": round(base_p5 / base_med, 2) if base_med else None,
-                            "T3_concealed_nonsilent_delta": d3("concealed_samples") - d3("silent_concealed_samples"),
+                            "T3_concealed_samples_delta": d3("concealed_samples"),
                             "T3_expand_events_delta": d3("concealment_events"),
                             "T3_packets_accepted_delta": d3("packets_accepted", scope=None) if False else (p3a.get("packets_accepted", 0) - p3b.get("packets_accepted", 0)),
                             "T3_buffer_ms_1hz": t3buf,
@@ -1359,9 +1376,9 @@ def scen_faults(args, res, audio):
             v = c2.L.vstats()
             peers = v["peers"]
             dec = all(p.get("packets_accepted", 0) > 0 and p.get("blocks_pulled", 0) > 0 for p in peers.values()) and len(peers) == 2
-            conc = max((p["receiver"]["concealed_samples"] - p["receiver"]["silent_concealed_samples"]) / max(1, p["blocks_pulled"] * 480) * 100 for p in peers.values() if p.get("receiver"))
+            conc = max(p["receiver"]["concealed_samples"] / max(1, p["receiver"].get("neteq_output_samples", 0)) * 100 for p in peers.values() if p.get("receiver"))
             res.oracle(scen, "4d%+d" % (off // 1000000), "daemon clock offset %+d s: clock_mismatch counts rise, audio still decodes" % (off // 1000000),
-                       v["clock_mismatch"] > 0 and dec, "clock_mismatch %d, accepted %s, worst non-silent concealment %.1f %%" % (v["clock_mismatch"], [p["packets_accepted"] for p in peers.values()], conc))
+                       v["clock_mismatch"] > 0 and dec, "clock_mismatch %d, accepted %s, worst active-speech concealment %.1f %%" % (v["clock_mismatch"], [p["packets_accepted"] for p in peers.values()], conc))
         finally:
             c2.stop()
 
@@ -1690,7 +1707,18 @@ def main():
     ap.add_argument("--scale", type=float, default=1.0, help="scale the long durations (debug)")
     ap.add_argument("--godot", default=GODOT_DEF)
     ap.add_argument("--clips", default=None)
+    ap.add_argument("--skews", default=None, help="comma list of 7 ppm values overriding SKEWS (attribution runs)")
+    ap.add_argument("--clip-order", default=None, help="comma list of 7 clip indexes (0-3) overriding i%%4 (attribution runs)")
+    ap.add_argument("--drop-every", type=int, default=0, help="TEST ONLY: talkers drop every Nth media packet (proves 1b can fail)")
     args = ap.parse_args()
+    global SKEWS, CLIP_ORDER, DROP_EVERY
+    if args.skews:
+        SKEWS = [int(x) for x in args.skews.split(",")]
+        assert len(SKEWS) == 7
+    if args.clip_order:
+        CLIP_ORDER = [int(x) for x in args.clip_order.split(",")]
+        assert len(CLIP_ORDER) == 7
+    DROP_EVERY = args.drop_every
     os.makedirs(args.out, exist_ok=True)
     tagp = os.path.join(args.out, "CACHEDIR.TAG")
     if not os.path.exists(tagp):

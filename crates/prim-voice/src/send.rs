@@ -84,6 +84,15 @@ pub fn drain_encoder<F: FnMut(VoicePacket) -> bool>(
 
 /// Send one packet; `false` when the socket is closed and the loop must end.
 fn send_packet(sh: &Shared, p: &VoicePacket, sent: &mut u64) -> bool {
+    // Test-only fault (`--test-drop-every N`): lose every Nth media packet so the
+    // listener sees a sequence gap. End markers (empty payload) are kept.
+    if let Some(n) = sh.cfg.test_drop_every {
+        static MEDIA_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if !p.payload.is_empty() && (MEDIA_SEEN.fetch_add(1, Ordering::Relaxed) + 1) % n == 0 {
+            sh.stats.bump("test_dropped");
+            return true;
+        }
+    }
     let env = envelope(p, sh.incarnation, *sent);
     let bytes = env.payload.len() as u64;
     let now = mono_us();
