@@ -17,3 +17,6 @@ neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "e854b5a
 # Crypto in debug builds is ~300x slower; the room-core simulator tests need dependencies optimised.
 [profile.dev.package."*"]
 opt-level = 3
+# Dependencies ship without debug info: shrinks target/ by gigabytes; their backtraces are rarely
+# needed. Our own crates keep full debug info.
+debug = false
