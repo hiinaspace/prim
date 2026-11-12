@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
 use crate::driver::{DgramQueue, DriverHandle};
+use crate::limits::{SenderLimits, StallGate};
 use crate::media_age::{MediaAge, Verdict};
 
 /// Lease time-to-live: any message renews it.
@@ -52,6 +53,7 @@ const INGRESS_CAP: usize = 1024;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_GRACE: Duration = Duration::from_millis(200);
 const RESERVOIR: usize = 32768;
+const HEARTBEAT: Duration = Duration::from_millis(10);
 
 // ---- clock ------------------------------------------------------------------------
 
@@ -391,6 +393,16 @@ pub struct DropsJson {
     /// media clock says it should (listener-side pause; see `media_age`).
     #[serde(default)]
     pub age_media: u64,
+    /// Not a drop: a packet that would have been `age_media` but arrived with no stall of
+    /// this daemon to explain it (a path-delay step or jitter; kept for NetEq).
+    #[serde(default)]
+    pub age_media_tolerated: u64,
+    /// Dropped over a sender's token bucket (voice/viseme datagrams per second).
+    #[serde(default)]
+    pub rate: u64,
+    /// Dropped: a new stream (incarnation) from a sender over its new-stream limit.
+    #[serde(default)]
+    pub stream_rate: u64,
     /// Dropped at the daemon's per-sender incarnation fence: a retired stream's packet.
     #[serde(default)]
     pub stale_incarnation: u64,
@@ -427,6 +439,10 @@ pub struct RtJson {
     pub datagrams_enqueued: u64,
     /// `VoiceIn` written to the voice holder.
     pub received: u64,
+    /// Stalls of this daemon's own realtime thread detected (each opens a window in which
+    /// the media-time bound may drop).
+    #[serde(default)]
+    pub stalls: u64,
     pub drops: DropsJson,
     /// `read_mono_us - VoiceOut.sent_mono_us`: the outbound IPC hop.
     pub out_hop: HistJson,
@@ -448,6 +464,10 @@ struct Counters {
     per_sender: AtomicU64,
     age: AtomicU64,
     age_media: AtomicU64,
+    age_media_tolerated: AtomicU64,
+    rate: AtomicU64,
+    stream_rate: AtomicU64,
+    stalls: AtomicU64,
     stale_incarnation: AtomicU64,
     out_age: AtomicU64,
     wrong_incarnation: AtomicU64,
@@ -486,6 +506,8 @@ struct Shared {
     view_tx: mpsc::UnboundedSender<()>,
     view_rx: Mutex<Option<mpsc::UnboundedReceiver<()>>>,
     counters: Counters,
+    /// Test hook: no per-sender token buckets (floods from tests exceed real rates).
+    no_rate_limits: std::sync::atomic::AtomicBool,
     holders: Mutex<Vec<HolderJson>>,
     out_hop: Mutex<Hist>,
     in_queue: Mutex<Hist>,
@@ -517,6 +539,7 @@ impl RtShared {
             view_tx,
             view_rx: Mutex::new(Some(view_rx)),
             counters: Counters::default(),
+            no_rate_limits: Default::default(),
             holders: Mutex::new(Vec::new()),
             out_hop: Mutex::new(Hist::new()),
             in_queue: Mutex::new(Hist::new()),
@@ -572,6 +595,12 @@ impl RtShared {
         );
     }
 
+    /// Test hook: turn off the per-sender datagram and new-stream buckets.
+    #[doc(hidden)]
+    pub fn disable_rate_limits(&self) {
+        self.0.no_rate_limits.store(true, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> RtJson {
         let s = &self.0;
         let c = &s.counters;
@@ -582,6 +611,7 @@ impl RtShared {
             sent: g(&c.sent),
             datagrams_enqueued: g(&c.enqueued),
             received: g(&c.received),
+            stalls: g(&c.stalls),
             drops: DropsJson {
                 no_lease: g(&c.no_lease),
                 not_member: g(&c.not_member),
@@ -590,6 +620,9 @@ impl RtShared {
                 per_sender: g(&c.per_sender),
                 age: g(&c.age),
                 age_media: g(&c.age_media),
+                age_media_tolerated: g(&c.age_media_tolerated),
+                rate: g(&c.rate),
+                stream_rate: g(&c.stream_rate),
                 stale_incarnation: g(&c.stale_incarnation),
                 out_age: g(&c.out_age),
                 wrong_incarnation: g(&c.wrong_incarnation),
@@ -718,6 +751,10 @@ struct Core {
     media_age: HashMap<Key, MediaAge>,
     /// Per-sender incarnation fence, ahead of `media_age`.
     fences: HashMap<Key, IncarnationFence>,
+    /// Detects stalls of this thread; gates media-time drops.
+    gate: StallGate,
+    /// Per-sender token buckets.
+    limits: HashMap<Key, SenderLimits>,
 }
 
 type CoreRef = Rc<RefCell<Core>>;
@@ -763,9 +800,15 @@ async fn lane_main(
         voice_req: None,
         media_age: HashMap::new(),
         fences: HashMap::new(),
+        gate: StallGate::default(),
+        limits: HashMap::new(),
     }));
     tokio::task::spawn_local(client_events(core.clone(), events));
     core.borrow_mut().refresh_peers();
+    // The stall detector's heartbeat: an event at least every 10 ms when idle, so a gap
+    // between looks at the clock is the thread having been stopped, not quiet.
+    let mut beat = tokio::time::interval(HEARTBEAT);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -774,6 +817,7 @@ async fn lane_main(
                 Some(ing) => core.borrow_mut().on_ingress(ing),
                 None => break,
             },
+            _ = beat.tick() => core.borrow_mut().on_beat(),
             v = view_rx.recv() => {
                 if v.is_none() { break; }
                 while view_rx.try_recv().is_ok() {}
@@ -1043,8 +1087,29 @@ impl Core {
         slot.as_ref().is_some_and(|h| Rc::ptr_eq(h, s))
     }
 
+    /// Look at the clock for the stall detector; whether we are in a post-stall window.
+    fn look(&mut self) -> bool {
+        let before = self.gate.stalls;
+        let w = self.gate.observe(mono_us());
+        if self.gate.stalls != before {
+            self.shared
+                .counters
+                .stalls
+                .fetch_add(self.gate.stalls - before, Ordering::Relaxed);
+        }
+        w
+    }
+
+    fn on_beat(&mut self) {
+        self.look();
+    }
+
     fn on_ingress(&mut self, ing: Ingress) {
-        let c = &self.shared.counters;
+        // Look at the clock before anything else: whichever event the thread handles
+        // first after a stall must already know about it.
+        let in_window = self.look();
+        let shared = self.shared.clone();
+        let c = &shared.counters;
         let peer = match self.shared.view.read().unwrap().get(&ing.conn) {
             Some(e) => e.peer,
             None => {
@@ -1063,32 +1128,54 @@ impl Core {
                 return;
             }
         };
+        // Per-sender rate: a buggy peer's flood stops here, before the fence, MediaAge
+        // or the queue. Not charged inside a post-stall window: the backlog read after
+        // a long stop is bursty by construction and the age bound is its limiter.
+        let limited = !shared.no_rate_limits.load(Ordering::Relaxed);
+        if limited && !in_window && !self.limits.entry(peer).or_default().voice.take(ing.at_us) {
+            bump(&c.rate);
+            return;
+        }
         let Some(v) = self.voice.clone() else {
             bump(&c.no_lease);
             return;
         };
         // Fence by incarnation first, so a late packet of a retired stream can't reset
-        // the media-time state of the current one.
-        match self.fences.entry(peer).or_default().judge(env.incarnation) {
+        // the media-time state of the current one. A new stream takes a token before the
+        // fence moves: over the limit the packet is dropped and nothing changes, so the
+        // client never sees (and NetEq never resets for) incarnation churn faster than
+        // that.
+        let fence = self.fences.entry(peer).or_default();
+        match fence.peek(env.incarnation) {
             Fence::Stale => {
                 bump(&c.stale_incarnation);
                 return;
             }
             Fence::NewStream { .. } => {
+                if limited && !self.limits.entry(peer).or_default().streams.take(ing.at_us) {
+                    bump(&c.stream_rate);
+                    return;
+                }
+                fence.judge(env.incarnation);
                 self.media_age.remove(&peer);
             }
             Fence::Current => {}
         }
         // Bound by media time: the read stamp alone can't see a backlog released all at
-        // once after this daemon was stopped.
+        // once after this daemon was stopped. Only while recovering from such a stop may
+        // it drop; otherwise a late packet is a path-delay step, which NetEq absorbs.
         let verdict = self
             .media_age
             .entry(peer)
             .or_insert_with(|| MediaAge::new(IN_MAX_AGE_US))
-            .check(ing.at_us, env.incarnation, env.timestamp);
-        if verdict == Verdict::TooLate {
-            bump(&c.age_media);
-            return;
+            .check(ing.at_us, env.incarnation, env.timestamp, in_window);
+        match verdict {
+            Verdict::TooLate => {
+                bump(&c.age_media);
+                return;
+            }
+            Verdict::Tolerated => bump(&c.age_media_tolerated),
+            Verdict::Keep => {}
         }
         let mut out = v.out.borrow_mut();
         if out.voice.iter().filter(|i| i.from == peer).count() >= IN_PER_SENDER_MAX {

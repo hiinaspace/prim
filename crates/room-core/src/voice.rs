@@ -218,19 +218,28 @@ impl IncarnationFence {
         self.current
     }
 
-    pub fn judge(&mut self, incarnation: u32) -> Fence {
+    /// What `judge` would answer, without changing anything.
+    pub fn peek(&self, incarnation: u32) -> Fence {
         if incarnation == 0 || self.retired.contains(&incarnation) {
             return Fence::Stale;
         }
         if incarnation == self.current {
             return Fence::Current;
         }
-        let previous = self.current;
-        if previous != 0 {
-            self.retire(previous);
+        Fence::NewStream {
+            previous: self.current,
         }
-        self.current = incarnation;
-        Fence::NewStream { previous }
+    }
+
+    pub fn judge(&mut self, incarnation: u32) -> Fence {
+        let f = self.peek(incarnation);
+        if let Fence::NewStream { previous } = f {
+            if previous != 0 {
+                self.retire(previous);
+            }
+            self.current = incarnation;
+        }
+        f
     }
 
     /// Retire the current stream without a successor (the sender said it stopped,
@@ -318,5 +327,19 @@ mod tests {
         };
         assert_eq!(VoiceState::decode(&s.encode()).unwrap(), s);
         assert!(VoiceState::decode(&[1, 4, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn fence_peek_changes_nothing() {
+        let mut f = IncarnationFence::default();
+        assert_eq!(f.peek(5), Fence::NewStream { previous: 0 });
+        assert_eq!(f.peek(5), Fence::NewStream { previous: 0 });
+        assert_eq!(f.judge(5), Fence::NewStream { previous: 0 });
+        assert_eq!(f.peek(5), Fence::Current);
+        assert_eq!(f.peek(6), Fence::NewStream { previous: 5 });
+        assert_eq!(f.peek(5), Fence::Current, "peek did not retire 5");
+        f.judge(6);
+        assert_eq!(f.peek(5), Fence::Stale);
+        assert_eq!(f.peek(0), Fence::Stale);
     }
 }

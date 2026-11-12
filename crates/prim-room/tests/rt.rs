@@ -437,7 +437,8 @@ async fn a_new_session_inherits_nothing_of_the_old_one() {
     )
     .await;
     let stats_b = b.daemon.rt.clone().unwrap();
-    // Fill the holder's socket buffer so messages stay in the daemon's queue.
+    stats_b.disable_rate_limits(); // this test floods faster than any real sender
+                                   // Fill the holder's socket buffer so messages stay in the daemon's queue.
     for i in 0..300u16 {
         ca.sock
             .send_msg(&voice_out(env(5, i, vec![0xAA; 900])))
@@ -595,6 +596,109 @@ async fn retired_incarnations_are_dropped_before_the_media_clock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_packet_with_no_stall_of_ours_is_kept_and_counted() {
+    let fleet = Fleet::mem();
+    let (a, _b) = pair(&fleet).await;
+    let shared = a.daemon.rt.clone().unwrap();
+    let _holder = acquire(rt_path(&a), Role::Voice, 5, LM).await;
+    shared.fake_member(2000, Key([7; 32]));
+    let offer = |seq: u16| {
+        let bytes = Datagram::Voice(env(11, seq, vec![7; 20])).encode();
+        assert!(shared.offer(2000, bytes).is_none());
+    };
+    for seq in 0..10u16 {
+        offer(seq);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The path delay steps up 400 ms (the daemon itself kept running).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for seq in 10..20u16 {
+        offer(seq);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let d = shared.snapshot();
+    assert_eq!(d.drops.age_media, 0, "{d:?}");
+    assert_eq!(d.drops.age_media_tolerated, 1, "{d:?}");
+    assert_eq!(d.stalls, 0, "{d:?}");
+    assert_eq!(d.drops.rate + d.drops.stream_rate, 0, "{d:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_sender_has_its_own_rate_bucket() {
+    let fleet = Fleet::mem();
+    let (a, _b) = pair(&fleet).await;
+    let shared = a.daemon.rt.clone().unwrap();
+    let _holder = acquire(rt_path(&a), Role::Voice, 5, LM).await;
+    shared.fake_member(2000, Key([7; 32]));
+    shared.fake_member(2001, Key([8; 32]));
+    // A buggy sender: 300 packets at once. The burst (50) gets through, the rest is `rate`.
+    for seq in 0..300u16 {
+        let bytes = Datagram::Voice(env(11, seq, vec![7; 20])).encode();
+        assert!(shared.offer(2000, bytes).is_none());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let d = shared.snapshot();
+    assert!(
+        (240..=250).contains(&d.drops.rate),
+        "rate drops {}: {d:?}",
+        d.drops.rate
+    );
+    // A well-behaved sender at 50 pps is untouched by it.
+    let before = shared.snapshot().drops.rate;
+    for seq in 0..20u16 {
+        let bytes = Datagram::Voice(env(12, seq, vec![7; 20])).encode();
+        assert!(shared.offer(2001, bytes).is_none());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(shared.snapshot().drops.rate, before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_streams_are_limited_per_sender_and_leave_the_fence_alone() {
+    let fleet = Fleet::mem();
+    let (a, _b) = pair(&fleet).await;
+    let shared = a.daemon.rt.clone().unwrap();
+    let _holder = acquire(rt_path(&a), Role::Voice, 5, LM).await;
+    shared.fake_member(2000, Key([7; 32]));
+    shared.fake_member(2001, Key([8; 32]));
+    let offer = |conn: u64, inc: u32, seq: u16| {
+        let bytes = Datagram::Voice(env(inc, seq, vec![7; 20])).encode();
+        assert!(shared.offer(conn, bytes).is_none());
+    };
+    // Ten incarnations in a row from one sender: three are streams, seven are over the limit.
+    for inc in 100..110u32 {
+        offer(2000, inc, 1);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Another sender is not affected.
+    offer(2001, 500, 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let d = shared.snapshot();
+    assert_eq!(d.drops.stream_rate, 7, "{d:?}");
+    assert_eq!(d.drops.rate, 0, "{d:?}");
+    assert_eq!(d.drops.age_media, 0, "{d:?}");
+    // The third stream is still the sender's current one: its next packet is not a
+    // new stream, and a refused incarnation was never retired, so it can try again later.
+    offer(2000, 102, 2);
+    offer(2000, 109, 2);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let d = shared.snapshot();
+    assert_eq!(d.drops.stream_rate, 8, "{d:?}");
+    assert_eq!(d.drops.stale_incarnation, 0, "{d:?}");
+    // One second later a token is back.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    offer(2000, 109, 3);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let d = shared.snapshot();
+    assert_eq!(d.drops.stream_rate, 8, "{d:?}");
+    offer(2000, 102, 4); // 109 is current now, 102 was retired by it
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(shared.snapshot().drops.stale_incarnation, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listener_poses_are_forwarded_at_once_and_replaced_not_queued() {
     let fleet = Fleet::mem();
     let (a, _b) = pair(&fleet).await;
@@ -683,6 +787,7 @@ async fn rt_delay_stays_small_while_the_core_is_flooded() {
     let (a, b) = pair(&fleet).await;
     let ca = acquire(rt_path(&a), Role::Voice, 5, LM).await;
     let cb = acquire(rt_path(&b), Role::Voice, 7, LM).await;
+    b.daemon.rt.as_ref().unwrap().disable_rate_limits(); // a flood test, not a real sender
     let bkey = b.key();
     wait_msg(&ca.sock, 10_000, |m| {
         matches!(m, RtMsg::Peer { key, incarnation: 7, flags } if *key == bkey && flags & peer_flags::CONNECTED != 0)

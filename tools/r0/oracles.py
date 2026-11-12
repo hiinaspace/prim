@@ -476,6 +476,31 @@ class Node:
         return self.local.status(timeout)
 
 
+# Daemon inbound-lane counters reported per scenario (age_media_tolerated is not a drop).
+LANE_COUNTERS = ("age_media", "age_media_tolerated", "rate", "stream_rate")
+CLUSTER_TALLIES = []
+
+
+def lane_oracle(res, scen, tallies):
+    """Per-scenario tally of the lane counters. `rate` and `stream_rate` must stay 0 everywhere
+    (the fault scenarios restart processes, at most about once per second, so they are
+    not throttled); `age_media` is expected only after a daemon stall of ours."""
+    tot = {k: 0 for k in LANE_COUNTERS + ("stalls",)}
+    per = {}
+    for t in tallies:
+        for node, c in t.items():
+            for k, v in c.items():
+                tot[k] += v
+                per.setdefault(node, {}).setdefault(k, 0)
+                per[node][k] += v
+    res.data.setdefault(scen, {})["lane_counters"] = {"total": tot, "per_node": per}
+    ok = tot["rate"] == 0 and tot["stream_rate"] == 0 and bool(tallies)
+    if scen in ("baseline", "bulk", "listener"):
+        ok = ok and tot["age_media"] == 0
+    res.oracle(scen, "lane", "inbound lane: rate = stream_rate = 0" + ("; age_media = 0 (no stall of ours)" if scen in ("baseline", "bulk", "listener") else ""), ok,
+               "age_media %d, age_media_tolerated %d, rate %d, stream_rate %d, daemon stalls detected %d" % (tot["age_media"], tot["age_media_tolerated"], tot["rate"], tot["stream_rate"], tot["stalls"]))
+
+
 class Cluster:
     def __init__(self, run, prim, audio=None, name="c"):
         self.run, self.prim, self.audio = run, prim, audio
@@ -602,8 +627,31 @@ class Cluster:
             time.sleep(0.2)
         return False
 
+    def tally(self):
+        """Final inbound-lane counters of every daemon (last good status), for the limits oracle."""
+        out = {}
+        last = self.timeline[-1][1] if self.timeline else {}
+        for n in [self.L] + self.T:
+            st = None
+            try:
+                if n.local and n.local.alive and n.daemon and n.daemon.alive():
+                    st = n.local.status(2)
+            except Exception:
+                pass
+            st = st or last.get(n.name)
+            if st:
+                rt = st["rt"]
+                d = rt["drops"]
+                out[n.name] = {k: d.get(k, 0) for k in LANE_COUNTERS}
+                out[n.name]["stalls"] = rt.get("stalls", 0)
+        return out
+
     def stop(self):
         self.poll_stop.set()
+        try:
+            CLUSTER_TALLIES.append(self.tally())
+        except Exception as e:
+            log("tally failed:", repr(e))
         for h in self.helpers:
             h.term(2)
         for n in self.T + [self.L]:
@@ -1662,6 +1710,7 @@ def main():
     try:
         for s in todo:
             log("=== scenario", s)
+            n_tallies = len(CLUSTER_TALLIES)
             try:
                 if s == "baseline":
                     base = scen_baseline(args, res, audio)
@@ -1679,6 +1728,8 @@ def main():
                 import traceback
                 traceback.print_exc()
                 res.oracle(s, "error", "scenario aborted", False, repr(e))
+            if s != "scenes" and len(CLUSTER_TALLIES) > n_tallies:  # listener reuses earlier clusters
+                lane_oracle(res, s, CLUSTER_TALLIES[n_tallies:])
             res.save(env)
     finally:
         cleanup_all()

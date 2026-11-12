@@ -61,13 +61,13 @@ A lease is a role held by one realtime-socket session. Roles: `voice` and
 | queue | bound by size | bound by age | on overflow |
 |---|---|---|---|
 | voice client → daemon (`VoiceOut` in the realtime socket buffer) | `SO_SNDBUF` 64 KiB | `OUT_MAX_AGE_MS` 40 ms between the client's send stamp and the daemon's read (same host, same clock) | drop; counted `out_age`; the out_hop histogram records it first |
-| datagrams arriving at the daemon | the ingress channel (1024) | **media-time lateness** over `IN_MAX_AGE_US` (100 ms), per sender, at enqueue | drop; counted `age_media` |
+| datagrams arriving at the daemon | the ingress channel (1024); per-sender token bucket 100 pps / burst 50 and new streams 1 per s / burst 3 ("Rate limits") | **media-time lateness** over `IN_MAX_AGE_US` (100 ms), per sender, at enqueue, **only within a post-stall window** (below) | drop; counted `age_media` (outside the window: kept, counted `age_media_tolerated`); over a bucket: `rate` / `stream_rate` |
 | daemon → voice client (`VoiceIn`) | 256 messages, ≤ 32 per sender | 100 ms since `received_at` | drop oldest; counted per reason |
 | voice client → network (per peer datagram queue) | the driver's datagram queue (128) | `max_age_ms` 40 | drop; counted |
 | socket buffers | `SO_SNDBUF` 64 KiB each way | — | `EAGAIN` keeps the message in the user-space queue, where the age bound applies |
 | `prim-voice` receive | NetEq's own buffer | `VoiceIn` older than 100 ms at read is dropped; in a matched session (below) this holds for every stamp, so a stall replay is dropped | counted |
-| capture ring (device callback → encoder) | 2 s of samples | **none.** After an encoder or process stall, stale mic audio is encoded with a fresh `sent_mono_us`, so `out_age` can't see it; the far daemon's media-time bound drops it | overwrite oldest in the ring |
-| iroh inbox pipe (transport → daemon, before the arrival stamp) | 64 KiB | **none**, and it sits before the stamp, so the stamp can't see its backlog; only the media-time bound does | `EAGAIN`/drop at the transport |
+| capture ring (device callback → encoder) | 2 s of samples | **none.** After an encoder or process stall, stale mic audio is encoded with a fresh `sent_mono_us`, so `out_age` can't see it; the far daemon doesn't drop it unless it is itself recovering from a stall (it is a lateness step, `age_media_tolerated`) | overwrite oldest in the ring |
+| iroh inbox pipe (transport → daemon, before the arrival stamp) | 64 KiB | **none**, and it sits before the stamp, so the stamp can't see its backlog; only the media-time bound does, and only if the whole daemon was stopped (see "Not covered") | `EAGAIN`/drop at the transport |
 | `prim-voice` receive in *mismatch mode* | NetEq's own buffer | **none:** until a packet has been judged matched, the age bound doesn't apply (read time stands in) | counted `clock_mismatch` |
 | listener pose | latest value only | — | overwritten |
 
@@ -78,21 +78,66 @@ datagrams; after it resumes they are all read, and stamped, within a few ms, so 
 timestamp doesn't have that problem: per sender (reset when its incarnation changes)
 the daemon keeps `offset = arrival - media_time` and `base`, the running minimum
 (`base = min(offset, base + 1000 ppm of the wall time since the last packet)`, which
-absorbs ±500 ppm drift). A packet with `offset - base > IN_MAX_AGE_US` is late and is
-dropped. If a sender has had nothing but late packets for 200 ms, `base` jumps to the
-current offset, so a lasting rise in path delay (a relay fallback, a sender hiccup)
-costs about 200-250 ms of audio, not minutes. A real pause backlog is read within
-milliseconds, so lateness sustained over 200 ms of arrival time is a new path delay,
-not a backlog.
+absorbs ±500 ppm drift). `offset - base` is how much later than usual a packet came.
+
+**The lateness rule, gated.** `base` is tracked on every packet, but a packet with
+`offset - base > IN_MAX_AGE_US` is **dropped only while the daemon is recovering from
+a stall of its own**. Anywhere else the same lateness is a path-delay step (an iroh
+relay fallback) or jitter above 100 ms, which NetEq absorbs better than a drop would:
+the packet is kept, `base` follows it, and `age_media_tolerated` counts it so the steps
+stay visible.
+
+- *Stall detector.* The realtime lane looks at the clock at every event, and a 10 ms
+  timer guarantees an event when it is idle. A gap over 50 ms between two looks means
+  the thread was stopped (SIGSTOP, a blocked executor), counted `stalls` in `prim ctl
+  status`. `on_ingress` looks first, so after SIGCONT whichever event runs first
+  (backlog packet or timer) already knows. The lane is one thread, so there is no
+  atomic: a separate heartbeat thread would miss a stall of the lane alone.
+- *Window.* From the end of the stall for `100 ms + min(stall, 1 s)`. The backlog is
+  read within milliseconds, but a transport that releases it in steps can take about as
+  long as the stall; "the backlog has drained" can't be observed per sender, so the
+  window is time-based and proportional. A second stall inside the window extends it.
+- *Escape.* Inside the window, if a sender has had nothing but late packets for 200 ms
+  of arrival time, `base` jumps to the current offset (a real pause backlog is read
+  within milliseconds, so sustained lateness is a new path delay). A new incarnation
+  resets the state.
+- *Not covered.* A stall of only the transport's receive task or the iroh inbox pipe
+  (not the lane) is not detected, and its backlog is then kept for NetEq to handle; a
+  whole-process stop covers both. A sender that pauses doesn't release a backlog (its
+  `out_age` bound drops it at the source).
+
 Timestamps advance in real time through DTX and talkspurt gaps (the encoder counts
 every captured 20 ms frame, sent or not, and polls until no full frame is pending, so
 it can't fall behind the capture ring; a device change skips the gap in whole
 frames), so silence is not mistaken for lateness. A capture xrun or process stall that
-loses samples is not covered: the media clock then lags real time for good, and the
-200 ms escape is what absorbs it. The 32-bit timestamp is unwrapped
-by signed distance from the previous one.
+loses samples is not covered: the media clock then lags real time for good. That is
+only a permanent `age_media_tolerated` step now, no longer a drop. The 32-bit timestamp
+is unwrapped by signed distance from the previous one.
 
-All drop counters (`age`, `age_media`, `out_age`, …) are in `prim ctl status` (daemon) and the `prim-voice` stats JSON.
+## Rate limits
+
+Meant against buggy peers (a stuck loop, a flapping restart), not hostile ones. In the
+daemon's inbound lane, per sender, after the datagram decodes and before the fence,
+MediaAge or queues:
+
+| bucket | sustained | burst | why | counted |
+|---|---|---|---|---|
+| voice datagrams | 100 pps | 50 | voice is 50 pps, so 2× with a second of burst; jitter and QUIC release bursts fit | `rate` |
+| new streams (incarnation changes) | 1 per s | 3 | a restart per second is already a flapping client; each one resets the listener's NetEq under the per-peer mutex the mixer also takes | `stream_rate` |
+
+Only kinds 2 and 3 pass through this lane (poses and everything else go through the
+core), and kind 3 is decoded and dropped in R0, so it has no bucket. A new stream takes
+its token *before* the fence moves; refused, the packet changes nothing (not the
+fence, not MediaAge), so a stream refused now can start a second later and the client
+never sees faster incarnation churn than this. That bound is why `prim-voice`'s
+`recv.rs` needs no limit of its own: its NetEq resets happen only on `Fence::NewStream`
+of a `VoiceIn`, and `VoiceIn` is produced only by the daemon's lane; nothing local
+creates one. Inside a post-stall window the datagram bucket isn't charged: a long stop
+releases a burst by construction and the age bound is its limiter (the per-sender and
+total queue caps still apply). A voice client restarts at most about once per second in
+the fault matrix, which the stream bucket's burst of 3 allows.
+
+All drop counters (`age`, `age_media`, `age_media_tolerated`, `rate`, `stream_rate`, `out_age`, …) and the daemon's `stalls` are in `prim ctl status` and the `prim-voice` stats JSON; the harness tallies the four lane counters per scenario (`lane` oracle).
 
 ## Clocks
 

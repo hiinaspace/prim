@@ -5,7 +5,11 @@
 //! after it resumes: every one looks fresh. The sender's 48 kHz sample timestamp does
 //! not lie about that. For each sender we track `offset = arrival - media_time`; its
 //! running minimum `base` is the best-case path delay, so `offset - base` is how much
-//! later than usual a packet arrived. A packet more than the bound late is dropped.
+//! later than usual a packet arrived. A packet more than the bound late is dropped,
+//! but only while the caller says dropping is allowed (`may_drop`): the backlog this
+//! guards against exists only after the daemon's own stall (`limits::StallGate`).
+//! Outside that window a late packet is kept (`Tolerated`: a path-delay step or jitter
+//! NetEq can absorb) and `base` follows it.
 //!
 //! Pure state, no sockets: unit-testable.
 
@@ -21,8 +25,10 @@ const ESCAPE_US: u64 = 200_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Keep,
-    /// Over the lateness bound.
+    /// Over the lateness bound, and dropping was allowed.
     TooLate,
+    /// Over the lateness bound, but dropping was not allowed: kept.
+    Tolerated,
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +60,13 @@ impl MediaAge {
 
     /// Judge one packet of this sender: `at_us` is the local arrival stamp, `timestamp`
     /// the envelope's 48 kHz sample index (wrapping u32).
-    pub fn check(&mut self, at_us: u64, incarnation: u32, timestamp: u32) -> Verdict {
+    pub fn check(
+        &mut self,
+        at_us: u64,
+        incarnation: u32,
+        timestamp: u32,
+        may_drop: bool,
+    ) -> Verdict {
         if !self.started || incarnation != self.incarnation {
             self.incarnation = incarnation;
             self.started = false;
@@ -84,6 +96,12 @@ impl MediaAge {
             self.drop_run_since = None;
             return Verdict::Keep;
         }
+        if !may_drop {
+            // No stall of ours explains it: a new path delay. Follow it.
+            self.base = offset;
+            self.drop_run_since = None;
+            return Verdict::Tolerated;
+        }
         let since = *self.drop_run_since.get_or_insert(at_us);
         if at_us.saturating_sub(since) > ESCAPE_US {
             self.base = offset;
@@ -97,6 +115,13 @@ impl MediaAge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl MediaAge {
+        /// `check` with dropping allowed: the post-stall rule.
+        fn strict(&mut self, at_us: u64, incarnation: u32, timestamp: u32) -> Verdict {
+            self.check(at_us, incarnation, timestamp, true)
+        }
+    }
 
     const MAX: u64 = 100_000;
     const FRAME: u64 = 20_000;
@@ -116,7 +141,7 @@ mod tests {
                 let at = 5_000_000
                     + (media_us as i64 * (1_000_000 - ppm) / 1_000_000) as u64
                     + (i % 7) * 400; // a little jitter
-                if m.check(at, 1, ts_of(media_us)) == Verdict::TooLate {
+                if m.strict(at, 1, ts_of(media_us)) == Verdict::TooLate {
                     drops += 1;
                 }
             }
@@ -130,7 +155,7 @@ mod tests {
         let mut t = 1_000_000u64;
         let mut i = 0u64;
         for _ in 0..50 {
-            assert_eq!(m.check(t, 1, ts_of(i * FRAME)), Verdict::Keep);
+            assert_eq!(m.strict(t, 1, ts_of(i * FRAME)), Verdict::Keep);
             i += 1;
             t += FRAME;
         }
@@ -139,7 +164,7 @@ mod tests {
         let mut kept = Vec::new();
         for k in 0..25u64 {
             let at = resume + k * 100; // read in a burst
-            if m.check(at, 1, ts_of((i + k) * FRAME)) == Verdict::Keep {
+            if m.strict(at, 1, ts_of((i + k) * FRAME)) == Verdict::Keep {
                 kept.push(k);
             }
         }
@@ -156,7 +181,7 @@ mod tests {
         for k in 0..50u64 {
             at += FRAME;
             assert_eq!(
-                m.check(at, 1, ts_of((i + k) * FRAME)),
+                m.strict(at, 1, ts_of((i + k) * FRAME)),
                 Verdict::Keep,
                 "k {k}"
             );
@@ -169,7 +194,7 @@ mod tests {
         let mut t = 1_000_000u64;
         let mut i = 0u64;
         for _ in 0..50 {
-            m.check(t, 1, ts_of(i * FRAME));
+            m.strict(t, 1, ts_of(i * FRAME));
             i += 1;
             t += FRAME;
         }
@@ -177,7 +202,7 @@ mod tests {
         let start = t;
         let mut first_kept = None;
         for _ in 0..200 {
-            if m.check(t, 1, ts_of(i * FRAME)) == Verdict::Keep && first_kept.is_none() {
+            if m.strict(t, 1, ts_of(i * FRAME)) == Verdict::Keep && first_kept.is_none() {
                 first_kept = Some(t - start);
             }
             i += 1;
@@ -186,7 +211,7 @@ mod tests {
         let f = first_kept.expect("recovers");
         assert!((200_000..=250_000).contains(&f), "recovered after {f} us");
         // and stays recovered
-        assert_eq!(m.check(t, 1, ts_of(i * FRAME)), Verdict::Keep);
+        assert_eq!(m.strict(t, 1, ts_of(i * FRAME)), Verdict::Keep);
     }
 
     #[test]
@@ -196,7 +221,7 @@ mod tests {
         let start = u32::MAX - 48 * 20 * 10; // ten frames before the wrap
         for k in 0..100u32 {
             let ts = start.wrapping_add(k * 960);
-            assert_eq!(m.check(t, 1, ts), Verdict::Keep, "k {k}");
+            assert_eq!(m.strict(t, 1, ts), Verdict::Keep, "k {k}");
             t += FRAME;
         }
     }
@@ -206,14 +231,17 @@ mod tests {
         let mut m = MediaAge::new(MAX);
         let mut t = 1_000_000u64;
         for k in 0..50u64 {
-            m.check(t, 1, ts_of(k * FRAME));
+            m.strict(t, 1, ts_of(k * FRAME));
             t += FRAME;
         }
         // A restart: unrelated timestamp origin, long gap. Must not be judged against
         // the old stream.
         t += 3_000_000;
         for k in 0..50u64 {
-            assert_eq!(m.check(t, 2, ts_of(900_000_000 + k * FRAME)), Verdict::Keep);
+            assert_eq!(
+                m.strict(t, 2, ts_of(900_000_000 + k * FRAME)),
+                Verdict::Keep
+            );
             t += FRAME;
         }
     }
@@ -224,10 +252,106 @@ mod tests {
         let mut m = MediaAge::new(MAX);
         let mut t = 1_000_000u64;
         for k in 0..50u64 {
-            m.check(t, 1, ts_of(k * FRAME));
+            m.strict(t, 1, ts_of(k * FRAME));
             t += FRAME;
         }
         let gap = 5_000_000;
-        assert_eq!(m.check(t + gap, 1, ts_of(50 * FRAME + gap)), Verdict::Keep);
+        assert_eq!(m.strict(t + gap, 1, ts_of(50 * FRAME + gap)), Verdict::Keep);
+    }
+
+    #[test]
+    fn delay_step_without_a_stall_loses_nothing() {
+        let mut m = MediaAge::new(MAX);
+        let mut t = 1_000_000u64;
+        let mut i = 0u64;
+        for _ in 0..50 {
+            assert_eq!(m.check(t, 1, ts_of(i * FRAME), false), Verdict::Keep);
+            i += 1;
+            t += FRAME;
+        }
+        // The path delay steps up 300 ms for good (a relay fallback): the packets keep
+        // coming every 20 ms but all arrive 300 ms later than before.
+        t += 300_000;
+        let mut tolerated = 0;
+        for _ in 0..500 {
+            let v = m.check(t, 1, ts_of(i * FRAME), false);
+            assert_ne!(v, Verdict::TooLate, "nothing is dropped outside a stall");
+            if v == Verdict::Tolerated {
+                tolerated += 1;
+            }
+            i += 1;
+            t += FRAME;
+        }
+        // Only the step itself is counted; base follows, so it is not late forever.
+        assert_eq!(tolerated, 1, "tolerated {tolerated}");
+        // A later stall is judged against the new path delay, not the old one.
+        // (the sender's media clock kept running through the 500 ms: 25 frames on).
+        let resume = t + 500_000;
+        assert_eq!(
+            m.check(resume, 1, ts_of((i + 25) * FRAME), true),
+            Verdict::Keep
+        );
+        assert_eq!(m.check(resume, 1, ts_of(i * FRAME), true), Verdict::TooLate);
+    }
+
+    #[test]
+    fn drift_over_a_minute_is_never_late_or_tolerated() {
+        for ppm in [-500i64, 500] {
+            let mut m = MediaAge::new(MAX);
+            for i in 0..3000u64 {
+                let media_us = i * FRAME;
+                let at = 5_000_000
+                    + (media_us as i64 * (1_000_000 - ppm) / 1_000_000) as u64
+                    + (i % 7) * 400;
+                assert_eq!(
+                    m.check(at, 1, ts_of(media_us), false),
+                    Verdict::Keep,
+                    "ppm {ppm} i {i}"
+                );
+            }
+        }
+    }
+
+    /// A 500 ms stall of the daemon with a backlog behind it, with the real gate in
+    /// front: the old packets are dropped, the new ones kept, and the same traffic
+    /// with no stall detected would have been kept whole.
+    #[test]
+    fn stall_with_backlog_drops_old_keeps_new() {
+        use crate::limits::StallGate;
+        let mut m = MediaAge::new(MAX);
+        let mut gate = StallGate::default();
+        let mut t = 1_000_000u64;
+        let mut i = 0u64;
+        for _ in 0..50 {
+            let w = gate.observe(t);
+            assert_eq!(m.check(t, 1, ts_of(i * FRAME), w), Verdict::Keep);
+            i += 1;
+            t += FRAME;
+        }
+        let resume = t + 500_000;
+        let mut kept = Vec::new();
+        for k in 0..25u64 {
+            let at = resume + k * 100;
+            // The lane's first look at the clock after the stall is this packet.
+            let w = gate.observe(at);
+            assert!(w, "stall seen at k {k}");
+            if m.check(at, 1, ts_of((i + k) * FRAME), w) == Verdict::Keep {
+                kept.push(k);
+            }
+        }
+        i += 25;
+        assert!(kept.iter().all(|&k| k >= 20), "old ones dropped: {kept:?}");
+        assert!(
+            kept.contains(&24) && kept.contains(&21),
+            "new kept: {kept:?}"
+        );
+        // Real time again, still inside the window: everything is kept.
+        let mut at = resume + 2_500;
+        for k in 0..50u64 {
+            at += FRAME;
+            let w = gate.observe(at);
+            assert_eq!(m.check(at, 1, ts_of((i + k) * FRAME), w), Verdict::Keep);
+        }
+        assert!(!gate.observe(at + 10_000), "window closed");
     }
 }

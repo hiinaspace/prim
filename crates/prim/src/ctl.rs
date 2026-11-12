@@ -430,8 +430,8 @@ fn print_status(s: &local::StatusJson) {
         );
         let d = &rt.drops;
         println!(
-            "rt drops no_lease={} not_member={} decode={} queue_full={} per_sender={} age={} age_media={} stale_incarnation={} out_age={} wrong_incarnation={} channel_full={} bad_role={} viseme={} pose_replaced={} pose_dropped={}",
-            d.no_lease, d.not_member, d.decode, d.queue_full, d.per_sender, d.age, d.age_media, d.stale_incarnation, d.out_age,
+            "rt stalls={}\nrt drops no_lease={} not_member={} decode={} queue_full={} per_sender={} age={} age_media={} age_media_tolerated={} rate={} stream_rate={} stale_incarnation={} out_age={} wrong_incarnation={} channel_full={} bad_role={} viseme={} pose_replaced={} pose_dropped={}",
+            rt.stalls, d.no_lease, d.not_member, d.decode, d.queue_full, d.per_sender, d.age, d.age_media, d.age_media_tolerated, d.rate, d.stream_rate, d.stale_incarnation, d.out_age,
             d.wrong_incarnation, d.channel_full, d.bad_role, d.viseme, d.pose_replaced, d.pose_dropped
         );
         for (name, h) in [
