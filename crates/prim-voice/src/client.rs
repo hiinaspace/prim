@@ -69,6 +69,8 @@ impl Client {
                 ack: AtomicU32::new(0),
                 capture_rate: AtomicU32::new(SAMPLE_RATE),
                 reopen: AtomicBool::new(false),
+                out_cb_us: AtomicU64::new(0),
+                in_cb_us: AtomicU64::new(0),
             },
             primed: AtomicBool::new(false),
             last_send_us: AtomicU64::new(mono_us()),
@@ -205,8 +207,16 @@ fn device_manager(sh: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<(), Str
         }
     };
     let _ = ready.send(Ok(()));
+    let mut watchdog = Watchdog::new(mono_us());
     while !sh.is_shutdown() {
         std::thread::sleep(Duration::from_millis(20));
+        if streams.is_some() && watchdog.stalled(&sh, mono_us()) {
+            // The device went away without telling us (a sink unloaded, a graph node
+            // gone): reopen exactly as SIGUSR1 does. The process env still holds the
+            // routing, so the new streams land where the old ones did.
+            sh.stats.bump("device_stall_reopen");
+            sh.gen.reopen.store(true, Ordering::SeqCst);
+        }
         if !sh.gen.reopen.swap(false, Ordering::SeqCst) {
             continue;
         }
@@ -227,6 +237,7 @@ fn device_manager(sh: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<(), Str
                 match crate::device::open(&sh) {
                     Ok(s) => {
                         streams = Some(s);
+                        watchdog.reset(&sh, mono_us());
                         break;
                     }
                     Err(_) => {
@@ -238,6 +249,59 @@ fn device_manager(sh: Arc<Shared>, ready: std::sync::mpsc::Sender<Result<(), Str
         }
     }
     drop(streams);
+}
+
+/// Device-callback watchdog. A stream that stops calling back for `STALL_US` while it is
+/// open is reopened. Callbacks that never started get `FIRST_US` (stream start can be
+/// slow). If this thread itself was stopped or starved (SIGSTOP, a stalled host), the
+/// callbacks can't be blamed: the baseline restarts.
+struct Watchdog {
+    opened_us: u64,
+    last_tick_us: u64,
+}
+
+impl Watchdog {
+    const STALL_US: u64 = 300_000;
+    const FIRST_US: u64 = 1_500_000;
+    const TICK_GAP_US: u64 = 150_000;
+
+    fn new(now: u64) -> Watchdog {
+        Watchdog {
+            opened_us: now,
+            last_tick_us: now,
+        }
+    }
+
+    /// New streams were just opened: forget the old callbacks.
+    fn reset(&mut self, sh: &Shared, now: u64) {
+        sh.gen.out_cb_us.store(0, Ordering::Relaxed);
+        sh.gen.in_cb_us.store(0, Ordering::Relaxed);
+        self.opened_us = now;
+        self.last_tick_us = now;
+    }
+
+    fn stalled(&mut self, sh: &Shared, now: u64) -> bool {
+        let starved = now.saturating_sub(self.last_tick_us) > Self::TICK_GAP_US;
+        self.last_tick_us = now;
+        if starved {
+            self.opened_us = now;
+            // The callbacks' own stamps are as old as our pause; start them over.
+            sh.gen.out_cb_us.store(0, Ordering::Relaxed);
+            sh.gen.in_cb_us.store(0, Ordering::Relaxed);
+            return false;
+        }
+        let stuck = |last: u64| {
+            if last == 0 {
+                now.saturating_sub(self.opened_us) > Self::FIRST_US
+            } else {
+                now.saturating_sub(last) > Self::STALL_US
+            }
+        };
+        (matches!(sh.cfg.output, OutputSpec::Device)
+            && stuck(sh.gen.out_cb_us.load(Ordering::Relaxed)))
+            || (matches!(sh.cfg.capture, CaptureSpec::Device)
+                && stuck(sh.gen.in_cb_us.load(Ordering::Relaxed)))
+    }
 }
 
 impl Drop for Client {

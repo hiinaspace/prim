@@ -733,14 +733,23 @@ def bulk_helpers(cl, run, stop_evt, counters):
     w = Local(L.sock)
 
     def flood_state():
+        # The daemon caps a live value at LIVE_VALUE_CAP (200 B) and a durable one at
+        # DURABLE_VALUE_CAP (4096 B). The first version wrote 512 B for both, so every
+        # live write (7 in 8) came back TooLarge and the flood was mostly errors.
         i = 0
-        val = b64(b"x" * 512)
+        live_val = b64(b"x" * 192)
+        durable_val = b64(b"y" * 2048)
         while not stop_evt.is_set():
             try:
-                r = w.call("write", scope="member", name="flood%d" % (i % 32), live=(i % 8 != 0),
-                           persistent=(i % 8 == 0), value=val, timeout=5)
-                k = "writes" if r.get("kind") == "ok" else "write_errors"
-                counters[k] = counters.get(k, 0) + 1
+                durable = (i % 8 == 0)
+                r = w.call("write", scope="member", name="flood%d" % (i % 32), live=not durable,
+                           persistent=durable, value=durable_val if durable else live_val, timeout=5)
+                if r.get("kind") == "ok":
+                    counters["writes"] = counters.get("writes", 0) + 1
+                else:
+                    counters["write_errors"] = counters.get("write_errors", 0) + 1
+                    code = "write_err_%s" % (r.get("code") or r.get("error") or r.get("message") or "?")
+                    counters[code] = counters.get(code, 0) + 1
             except Exception:
                 time.sleep(0.05)
             i += 1
@@ -851,19 +860,26 @@ def run_load(args, res, audio, scen, bulk, dur, tone_idx=(6,)):
     if 6 in tone_idx:
         inc = peers[cl.T[6].key]["incarnation"]
         hz = auto_hz(inc)
-        xl, xr = rec.slice_st(t_flow + 2.0, t_end)
-        am = []
+        # Both sides over the same last N seconds, 1 s windows, power-averaged. The
+        # recording is the whole mix and the stats' per-second Goertzel is too, so the
+        # other talkers' speech near the tone frequency leaks into both; 50 ms windows
+        # (20 Hz bins) made that +4.6 dB at 2160 Hz, and medians of two different
+        # window sets still differed by 1.6 dB. Averaging power over 30 windows each
+        # side shrinks the leakage noise well under the 1.5 dB limit.
+        nwin = int(min(30, max(5, dur - 4)))
+        xl, xr = rec.slice_st(t_end - nwin - 0.5, t_end - 0.5)
+        pw = []
         for xx in (xl, xr):
-            ts = sorted(a for _, a in tone_series(xx, hz))
-            am.append(ts[len(ts) // 2] if ts else 0.0)
-        rec_amp = (am[0] + am[1]) / 2
+            sq = [a * a for _, a in tone_series(xx, hz, win=RATE, hop=RATE // 2)]
+            pw.append(sum(sq) / len(sq) if sq else 0.0)
+        rec_amp = math.sqrt((pw[0] + pw[1]) / 2)
         sj = s_end.get("tone_seconds", [])
         sa = []
-        for e in sj[-int(max(5, dur / 2)):]:
+        for e in sj[-nwin - 1:-1]:
             for tn in e["tones"]:
                 if tn["incarnation"] == inc:
-                    sa.append((tn["l"] + tn["r"]) / 2)
-        stat_amp = sorted(sa)[len(sa) // 2] if sa else 0.0
+                    sa.append(((tn["l"] ** 2 + tn["r"] ** 2) / 2))
+        stat_amp = math.sqrt(sum(sa) / len(sa)) if sa else 0.0
         diff = 20 * math.log10(max(rec_amp, 1e-9) / max(stat_amp, 1e-9))
         ok = ok and abs(diff) < 1.5 and stat_amp > 0
         detail += "; T7 tone %.0f Hz: recorded %.4f vs stats %.4f (%.2f dB)" % (hz, rec_amp, stat_amp, diff)
@@ -926,8 +942,12 @@ def scen_bulk(args, res, audio, base=None):
         res.data["bulk"]["baseline_rows"] = base[0]
     la = hist_row(v["histograms"]["listener_age_us"])
     res.data["bulk"]["listener_age"] = la
-    ok = c.get("msg_delivered", 0) > 5 and c.get("writes", 0) > 100 and "stress_error" not in c
-    res.oracle("bulk", "2c", "load was actually applied", ok, c)
+    ok = (c.get("msg_delivered", 0) > 5 and c.get("writes", 0) > 100 and "stress_error" not in c
+          and c.get("write_errors", 0) < 0.05 * max(1, c.get("writes", 0)))
+    c["note"] = ("reliable messages are capped at 64 KiB (room_core MESSAGE_CAP); kept at 64 KiB, a 256 KiB request is "
+                 "refused TooLarge. State writes: live values <= 200 B, durable <= 4096 B (staterec caps); "
+                 "the flood writes 192 B live and 2048 B durable; write_errors must be < 5 % of writes.")
+    res.oracle("bulk", "2c", "load was actually applied (state-write errors < 5 %)", ok, c)
     return rows, la
 
 
@@ -1015,9 +1035,9 @@ def scen_faults(args, res, audio):
         inc3 = lambda: (L.vstats() or {}).get("peers", {}).get(T3.key, {}).get("incarnation")
         hz3 = auto_hz(inc3())
 
-        def amp_series(rec, hz, t0, t1):
+        def amp_series(rec, hz, t0, t1, win=2400, hop=480):
             x, i0, c = rec.slice_t(t0, t1)
-            return [(c + (i0 + i + 1200) / RATE, a) for i, a in tone_series(x, hz)]
+            return [(c + (i0 + i + win // 2) / RATE, a) for i, a in tone_series(x, hz, win=win, hop=hop)]
 
         def base_amp(rec, hz, t0, t1):
             s = sorted(a for _, a in amp_series(rec, hz, t0, t1))
@@ -1051,7 +1071,8 @@ def scen_faults(args, res, audio):
                 rec_t = next((t for t, a in series if t >= tc and a >= 0.5 * amp0), None)
                 resume_ms = (rec_t - tc) * 1000 if rec_t else None
                 flow_ms = (tflow - tc) * 1000 if tflow else None
-                age_d = rt_after["drops"]["age"] - rt_before["drops"]["age"]
+                rd = lambda k: rt_after["drops"].get(k, 0) - rt_before["drops"].get(k, 0)
+                age_d = rd("age") + rd("age_media")
                 vage_d = vs_after["drops"]["age"] - vs_before["drops"]["age"]
                 maxbuf = max(max((p.get("receiver", {}).get("buffer_ms", 0) for p in s["peers"].values()), default=0)
                              for tt, s in L.statlog if tt >= tc)
@@ -1060,25 +1081,60 @@ def scen_faults(args, res, audio):
                            resume_ms is not None and resume_ms <= 300,
                            "tone back to 50%% in %s ms; VoiceIn flow resumed in %s ms" % (None if resume_ms is None else round(resume_ms), None if flow_ms is None else round(flow_ms)))
                 res.oracle(scen, tag + "-stale", "stale inbound dropped by age (counter rises)", age_d + vage_d > 0,
-                           "daemon drops.age +%d, voice drops.age +%d" % (age_d, vage_d))
+                           "daemon drops.age +%d (age_media +%d), voice drops.age +%d" % (age_d, rd("age_media"), vage_d))
                 res.oracle(scen, tag + "-burst", "no burst of old audio (NetEq buffer within bound, nothing older than 100 ms)",
                            maxbuf <= pre_buf + 100 and ipcmax <= 100000,
                            "max NetEq buffer after resume %s ms (before: %s); max VoiceIn age at read %.1f ms" % (maxbuf, pre_buf, ipcmax / 1000))
             else:
                 others = [t for t in cl.T if t.name not in ("T5",)]
-                dips = []
-                tt_amp = [a for t, a in series if ts <= t <= tc + 0.3]
-                dip = min(tt_amp) / amp0 if tt_amp and amp0 else None
+                # The recording is the whole mix: the other six talkers are speech, and in a
+                # 50 ms window (20 Hz bins) their energy near T3's frequency beats with the
+                # tone (the same stream swings 0.7x..1.85x with no gap at all). 200 ms windows
+                # cut that leakage ~4x. The dip is judged against the 5th percentile of the
+                # same windows in the quiet seconds before, so the metric's own noise is
+                # in the baseline; a real stall (underrun) is also checked directly.
+                W, H = 9600, 1200
+                wser = amp_series(recA, hz3, ts - 1, mono(), win=W, hop=H)
+                base_w = sorted(a for t, a in amp_series(recA, hz3, ts - 6, ts - 0.7, win=W, hop=H))
+                base_p5 = base_w[len(base_w) // 20] if base_w else 0.0
+                base_med = base_w[len(base_w) // 2] if base_w else 0.0
+                tt_ser = [(t, a) for t, a in wser if ts <= t <= tc + 0.3]
+                tt_amp = [a for t, a in tt_ser]
+                dip = min(tt_amp) / base_p5 if tt_amp and base_p5 else None
+                amp0 = base_med or amp0
+                # What was happening at the dip: recorder health (pw-record chunk gaps and
+                # frames-vs-wall), L's output underruns, T3's concealment, T3's NetEq buffer.
+                dip_t = min(tt_ser, key=lambda e: e[1])[0] if tt_ser else None
+                with recA.lock:
+                    chunks = [(t, fr) for t, fr in recA.times if ts - 0.5 <= t <= tc + 0.5]
+                rec_gap = max((b[0] - a[0] for a, b in zip(chunks, chunks[1:])), default=0) * 1000
+                rec_surplus = max((((b[1] - a[1]) / RATE) - (b[0] - a[0]) for a, b in zip(chunks, chunks[1:])), default=0) * 1000
+                p3b = vs_before["peers"].get(T3.key, {})
+                p3a = vs_after["peers"].get(T3.key, {})
+                def d3(k, scope="receiver"):
+                    return (p3a.get(scope, {}).get(k, 0) or 0) - (p3b.get(scope, {}).get(k, 0) or 0)
+                t3buf = [s["peers"].get(T3.key, {}).get("receiver", {}).get("buffer_ms") for tt, s in L.statlog if ts - 1 <= tt <= tc + 2]
+                dip_diag = {"dip_at_ms_after_cont": None if dip_t is None else round((dip_t - tc) * 1000),
+                            "rec_chunk_gap_max_ms": round(rec_gap, 1), "rec_frames_over_wall_max_ms": round(rec_surplus, 1),
+                            "L_underruns_delta": vs_after["underruns"] - vs_before["underruns"],
+                            "baseline_p5_over_median": round(base_p5 / base_med, 2) if base_med else None,
+                            "T3_concealed_nonsilent_delta": d3("concealed_samples") - d3("silent_concealed_samples"),
+                            "T3_expand_events_delta": d3("concealment_events"),
+                            "T3_packets_accepted_delta": d3("packets_accepted", scope=None) if False else (p3a.get("packets_accepted", 0) - p3b.get("packets_accepted", 0)),
+                            "T3_buffer_ms_1hz": t3buf,
+                            "series_ms_after_cont_amp_over_normal": [(round((t - tc) * 1000), round(a / amp0, 2)) for t, a in tt_ser if amp0]}
+                res.data.setdefault(scen, {})["T5_others_dip_diag"] = dip_diag
                 flow_ms = (tflow - tc) * 1000 if tflow else None
-                age_d = rt_after["drops"]["age"] - rt_before["drops"]["age"]
+                rd = lambda k: rt_after["drops"].get(k, 0) - rt_before["drops"].get(k, 0)
+                age_d = rd("age") + rd("out_age")
                 v5 = cl.T[4].vstats()
                 drop5 = sum((v5 or {}).get("drops", {}).get(k, 0) for k in ("age", "send_socket_full"))
                 res.oracle(scen, tag + "-resume", "T5 daemon paused 500 ms: T5 flow resumes within 300 ms",
                            flow_ms is not None and flow_ms <= 300, "datagram flow resumed in %s ms" % (None if flow_ms is None else round(flow_ms)))
-                res.oracle(scen, tag + "-others", "other talkers unaffected by a talker-daemon pause (T3 tone min %.0f%% of normal)" % (100 * (dip or 0)),
-                           dip is not None and dip > 0.7, "T3 tone min/normal = %s" % (None if dip is None else round(dip, 3)))
+                res.oracle(scen, tag + "-others", "other talkers unaffected by a talker-daemon pause (T3 tone min %.0f%% of baseline p5, no underruns)" % (100 * (dip or 0)),
+                           dip is not None and dip > 0.7 and dip_diag["L_underruns_delta"] == 0, "T3 tone (200 ms windows) min / baseline-p5 = %s; %s" % (None if dip is None else round(dip, 3), {k: v for k, v in dip_diag.items() if k != "series_ms_after_cont_amp_over_normal"}))
                 res.oracle(scen, tag + "-stale", "T5's stale frames dropped by age/size (counter rises)", age_d + drop5 > 0,
-                           "T5 daemon drops.age +%d, T5 voice age/send_full drops %d" % (age_d, drop5))
+                           "T5 daemon drops.age+out_age +%d (out_age +%d), T5 voice age/send_full drops %d" % (age_d, rd("out_age"), drop5))
                 maxbuf = max(max((p.get("receiver", {}).get("buffer_ms", 0) for p in [s["peers"].get(cl.T[4].key, {})]), default=0) for tt, s in L.statlog if tt >= tc)
                 res.oracle(scen, tag + "-burst", "no burst of old T5 audio at L", maxbuf <= pre_buf + 100, "max T5 NetEq buffer after resume %s ms (before max %s)" % (maxbuf, pre_buf))
             time.sleep(3)
@@ -1181,20 +1237,22 @@ def scen_faults(args, res, audio):
         g0, i0_ = gen_info()
         tu = mono()
         audio.rm_sink(cur)
+        stall0 = (L.vstats() or {}).get("device_stall_reopen", 0)
         auto = wait_gen(g0, 3)
-        how = "automatic reopen"
+        how = "automatic reopen %.0f ms after the unload (watchdog)" % ((auto - tu) * 1000) if auto else ""
         if not auto:
             how = "no automatic reopen after sink removal; SIGUSR1 sent"
             L.voice.sig(signal.SIGUSR1)
             wait_gen(g0, 4)
+        stall1 = (L.vstats() or {}).get("device_stall_reopen", 0)
         time.sleep(3)
         g1, i1 = gen_info()
         rec_other = recA if other == sinkA else recB
         tn = tone_at(rec_other, mono() - 2, mono())
         links = {k: sorted(v) for k, v in audio.stream_targets().items()}
         res.oracle(scen, "4c-3", "null sink L is on unloaded: reopen lands on the other null sink, gen bumps, incarnation unchanged, audio resumes",
-                   g1 > g0 and i1 == i0_ and tn > 0.02 and not audio.check_links() and links.get("alsa_playback.prim") == [other],
-                   "%s; gen %s -> %s; tone on %s %.3f; links %s" % (how, g0, g1, other, tn, links))
+                   bool(auto) and stall1 > stall0 and g1 > g0 and i1 == i0_ and tn > 0.02 and not audio.check_links() and links.get("alsa_playback.prim") == [other],
+                   "%s; device_stall_reopen %s -> %s; gen %s -> %s; tone on %s %.3f; links %s" % (how, stall0, stall1, g0, g1, other, tn, links))
         res.data.setdefault(scen, {})["device_reopen_note"] = how
     finally:
         cl.stop()

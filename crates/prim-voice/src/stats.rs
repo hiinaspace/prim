@@ -98,6 +98,8 @@ pub fn snapshot(sh: &Shared) -> Value {
             "keepalives": c("keepalives"),
             "device_changes": c("device_changes"),
         },
+        "device_stall_reopen": c("device_stall_reopen"),
+        "device_open_failures": c("device_open_failures"),
         "voice_in": c("voice_in"),
     });
     if sh.cfg.stats_tone {

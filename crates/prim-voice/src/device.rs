@@ -2,9 +2,9 @@
 //! callbacks only copy between the preallocated rings and touch atomics: no allocation,
 //! no contended lock, no logging, no IPC.
 
-use std::sync::Arc;
 #[cfg(feature = "device")]
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -75,6 +75,7 @@ fn open_output(sh: &Arc<Shared>) -> Result<cpal::Stream> {
             cfg,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let now = crate::clock::mono_us();
+                cb.gen.out_cb_us.store(now, Ordering::Relaxed);
                 if last_us != 0 {
                     cb.stats.callback_gap_us.record(now - last_us);
                 }
@@ -137,9 +138,13 @@ where
 {
     use cpal::traits::DeviceTrait;
     let ring = sh.cap_ring.clone();
+    let cb = sh.clone();
     dev.build_input_stream(
         cfg,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
+            cb.gen
+                .in_cb_us
+                .store(crate::clock::mono_us(), Ordering::Relaxed);
             // Downmix to mono through a stack buffer, in chunks.
             let mut mono = [0f32; 1024];
             for chunk in data.chunks(channels * mono.len()) {

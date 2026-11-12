@@ -34,6 +34,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
 use crate::driver::{DgramQueue, DriverHandle};
+use crate::media_age::{MediaAge, Verdict};
 
 /// Lease time-to-live: any message renews it.
 pub const LEASE_TTL_MS: u32 = 2000;
@@ -383,6 +384,13 @@ pub struct DropsJson {
     pub queue_full: u64,
     pub per_sender: u64,
     pub age: u64,
+    /// Dropped at enqueue for arriving over `IN_MAX_AGE_US` later than the sender's
+    /// media clock says it should (listener-side pause; see `media_age`).
+    #[serde(default)]
+    pub age_media: u64,
+    /// Dropped from the voice client: sent over `OUT_MAX_AGE_MS` before the daemon read it.
+    #[serde(default)]
+    pub out_age: u64,
     pub wrong_incarnation: u64,
     pub channel_full: u64,
     /// A message from a session that doesn't hold the role it needs.
@@ -433,6 +441,8 @@ struct Counters {
     queue_full: AtomicU64,
     per_sender: AtomicU64,
     age: AtomicU64,
+    age_media: AtomicU64,
+    out_age: AtomicU64,
     wrong_incarnation: AtomicU64,
     channel_full: AtomicU64,
     bad_role: AtomicU64,
@@ -572,6 +582,8 @@ impl RtShared {
                 queue_full: g(&c.queue_full),
                 per_sender: g(&c.per_sender),
                 age: g(&c.age),
+                age_media: g(&c.age_media),
+                out_age: g(&c.out_age),
                 wrong_incarnation: g(&c.wrong_incarnation),
                 channel_full: g(&c.channel_full),
                 bad_role: g(&c.bad_role),
@@ -688,6 +700,7 @@ struct Core {
     me: u64,
     next_req: u64,
     last_written: Option<VoiceState>,
+    media_age: HashMap<Key, MediaAge>,
 }
 
 type CoreRef = Rc<RefCell<Core>>;
@@ -729,6 +742,7 @@ async fn lane_main(
         me,
         next_req: 2,
         last_written: None,
+        media_age: HashMap::new(),
     }));
     tokio::task::spawn_local(client_events(core.clone(), events));
     core.borrow_mut().refresh_peers();
@@ -1010,6 +1024,17 @@ impl Core {
             bump(&c.no_lease);
             return;
         };
+        // Bound by media time: the read stamp alone can't see a backlog released all at
+        // once after this daemon was stopped.
+        let verdict = self
+            .media_age
+            .entry(peer)
+            .or_insert_with(|| MediaAge::new(IN_MAX_AGE_US))
+            .check(ing.at_us, env.incarnation, env.timestamp);
+        if verdict == Verdict::TooLate {
+            bump(&c.age_media);
+            return;
+        }
         let mut out = v.out.borrow_mut();
         if out.voice.iter().filter(|i| i.from == peer).count() >= IN_PER_SENDER_MAX {
             if let Some(pos) = out.voice.iter().position(|i| i.from == peer) {
@@ -1041,11 +1066,14 @@ impl Core {
             bump(&c.wrong_incarnation);
             return;
         }
-        self.shared
-            .out_hop
-            .lock()
-            .unwrap()
-            .record(mono_us().saturating_sub(sent_mono_us));
+        let hop_us = mono_us().saturating_sub(sent_mono_us);
+        self.shared.out_hop.lock().unwrap().record(hop_us);
+        // The client's socket buffer holds messages while this daemon is stopped; they
+        // all arrive at once on resume. Same host, same clock: the age is exact.
+        if hop_us > OUT_MAX_AGE_MS as u64 * 1000 {
+            bump(&c.out_age);
+            return;
+        }
         bump(&c.sent);
         let bytes = Datagram::Voice(env).encode();
         let inc = s.incarnation.get();

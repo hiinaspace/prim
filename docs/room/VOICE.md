@@ -60,13 +60,30 @@ A lease is a role held by one realtime-socket session. Roles: `voice` and
 
 | queue | bound by size | bound by age | on overflow |
 |---|---|---|---|
+| voice client → daemon (`VoiceOut` in the realtime socket buffer) | `SO_SNDBUF` 64 KiB | `OUT_MAX_AGE_MS` 40 ms between the client's send stamp and the daemon's read (same host, same clock) | drop; counted `out_age`; the out_hop histogram records it first |
+| datagrams arriving at the daemon | the ingress channel (1024) | **media-time lateness** over `IN_MAX_AGE_US` (100 ms), per sender, at enqueue | drop; counted `age_media` |
 | daemon → voice client (`VoiceIn`) | 256 messages, ≤ 32 per sender | 100 ms since `received_at` | drop oldest; counted per reason |
 | voice client → network (per peer datagram queue) | the driver's datagram queue (128) | `max_age_ms` 40 | drop; counted |
 | socket buffers | `SO_SNDBUF` 64 KiB each way | — | `EAGAIN` keeps the message in the user-space queue, where the age bound applies |
 | `prim-voice` receive | NetEq's own buffer | `VoiceIn` older than 100 ms at read is dropped | counted |
 | listener pose | latest value only | — | overwritten |
 
-All drop counters are in `prim ctl status` (daemon) and the `prim-voice` stats JSON.
+**Why the read stamp alone can't bound age.** `received_at` is taken when the daemon
+reads a datagram. While the daemon is stopped the kernel or the transport keeps the
+datagrams; after it resumes they are all read, and stamped, within a few ms, so a
+500 ms backlog looks fresh and NetEq would buffer it. The sender's 48 kHz sample
+timestamp doesn't have that problem: per sender (reset when its incarnation changes)
+the daemon keeps `offset = arrival - media_time` and `base`, the running minimum
+(`base = min(offset, base + 1000 ppm of the wall time since the last packet)`, which
+absorbs ±500 ppm drift). A packet with `offset - base > IN_MAX_AGE_US` is late and is
+dropped. If a sender has had nothing but late packets for 1 s, `base` jumps to the
+current offset, so a lasting rise in path delay costs about 1 s of audio, not minutes.
+Timestamps advance in real time through DTX and talkspurt gaps (the encoder counts
+every captured 20 ms frame, sent or not, and a device change skips the gap in whole
+frames), so silence is not mistaken for lateness. The 32-bit timestamp is unwrapped
+by signed distance from the previous one.
+
+All drop counters (`age`, `age_media`, `out_age`, …) are in `prim ctl status` (daemon) and the `prim-voice` stats JSON.
 
 ## Clocks
 
@@ -109,7 +126,7 @@ Threads; the device callbacks only copy between preallocated ring buffers:
   (`voice_core::VoiceEncoder`) and sends `VoiceOut`.
 - **Seats are fixed** in R0: seat angles around a table of radius 1.5 m, assigned by
   sorted member key, or given explicitly with `--seat KEY=AZIMUTH`.
-- **Device change:** the stream is reopened on the current default device; the
+- **Device change:** a stream error, SIGUSR1, or the watchdog reopens the stream. The watchdog (device manager thread) reopens when an open output or capture callback hasn't run for 300 ms (1.5 s if it never ran), counted `device_stall_reopen`; it restarts its baseline if its own thread was stopped. The reopen is in-process, so the routing env stays. The stream is reopened on the current default device; the
   device generation increments, the capture ring is flushed (stale mic samples are
   discarded), the encoder advances its timestamp over the gap, and the incarnation
   stays.

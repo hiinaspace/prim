@@ -150,6 +150,10 @@ pub struct GenSync {
     pub capture_rate: AtomicU32,
     /// Set by SIGUSR1 or a stream error; the device manager reopens.
     pub reopen: AtomicBool,
+    /// `mono_us` of the latest output / input device callback (0: none yet on this
+    /// stream). The device manager's watchdog reads these.
+    pub out_cb_us: AtomicU64,
+    pub in_cb_us: AtomicU64,
 }
 
 pub struct Shared {
