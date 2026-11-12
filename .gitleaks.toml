@@ -1,0 +1,8 @@
+# Golden wire vectors are derived from fixed, publicly known test secrets
+# ([1; 32], [2; 32], ...). They are not credentials.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "room-core golden wire vectors"
+paths = ['''crates/room-core/tests/vectors/golden\.json''']

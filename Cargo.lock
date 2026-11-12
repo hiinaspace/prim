@@ -2769,6 +2769,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "room-core"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "data-encoding",
+ "ed25519-dalek",
+ "serde_json",
+]
+
+[[package]]
 name = "ropus"
 version = "0.12.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

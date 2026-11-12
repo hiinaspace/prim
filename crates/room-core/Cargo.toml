@@ -1,0 +1,15 @@
+[package]
+name = "room-core"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "Sans-IO core of the prim room: signed grants, single-writer state, coordinator, peer frames"
+
+[dependencies]
+blake3 = "1"
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"] }
+data-encoding = "2"
+
+[dev-dependencies]
+serde_json = "1"
