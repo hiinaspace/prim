@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Unlicense"
 publish = false
-description = "Multi-call binary: prim room (the daemon) and prim ctl (its local client)"
+description = "Multi-call binary: prim room (the daemon), prim ctl (its local client) and prim voice (the voice client)"
 
 [[bin]]
 name = "prim"
@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 prim-room = { path = "../prim-room" }
+prim-voice = { path = "../prim-voice" }
 room-core = { path = "../room-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

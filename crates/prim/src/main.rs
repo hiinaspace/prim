@@ -1,9 +1,10 @@
 //! `prim`: a multi-call binary. `prim room ...` runs the room daemon, `prim ctl ...`
-//! talks to its local socket. Invoked as `prim-room` or `prim-ctl` it dispatches on
-//! its own name.
+//! talks to its local socket, `prim voice ...` is the voice client. Invoked as
+//! `prim-room`, `prim-ctl` or `prim-voice` it dispatches on its own name.
 
 mod ctl;
 mod room;
+mod voice;
 
 use std::process::ExitCode;
 
@@ -11,7 +12,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: prim room found|join <token>|resume <room-hex> [options]\n       \
          prim ctl [--socket PATH] <status|invite|grant|revoke|retire|close|reopen|leave|write|sub|send|listen> ...\n\
-         run `prim room --help` or `prim ctl --help` for the options"
+         prim voice [track] [options]\n\
+         run `prim room --help`, `prim ctl --help` or `prim voice --help` for the options"
     );
     ExitCode::from(2)
 }
@@ -25,6 +27,7 @@ fn main() -> ExitCode {
     let which = match prog.as_str() {
         "prim-room" => Some("room".to_string()),
         "prim-ctl" => Some("ctl".to_string()),
+        "prim-voice" => Some("voice".to_string()),
         _ => None,
     };
     let (which, rest): (String, Vec<String>) = match which {
@@ -49,6 +52,7 @@ fn main() -> ExitCode {
     let result = match which.as_str() {
         "room" => rt.block_on(room::run(rest)),
         "ctl" => rt.block_on(ctl::run(rest)),
+        "voice" => voice::run(rest),
         _ => return usage(),
     };
     match result {

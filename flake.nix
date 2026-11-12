@@ -25,7 +25,10 @@
       WINPTHREADS_LIB = "${mingw.windows.pthreads}/lib";
     };
     devShells.x86_64-linux.aarch64 = pkgs.mkShell {
-      packages = with pkgs; [ cargo arm.buildPackages.rustc arm.stdenv.cc pkg-config cmake ninja patchelf binutils ];
+      packages = with pkgs; [ cargo arm.buildPackages.rustc arm.stdenv.cc pkg-config cmake ninja patchelf binutils arm.alsa-lib ];
+      # cpal (prim-voice's `device` feature) links libasound: let pkg-config find the aarch64 one.
+      PKG_CONFIG_ALLOW_CROSS = "1";
+      PKG_CONFIG_PATH_aarch64_unknown_linux_gnu = "${arm.alsa-lib.dev}/lib/pkgconfig";
       CARGO_BUILD_TARGET = "aarch64-unknown-linux-gnu";
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "aarch64-unknown-linux-gnu-cc";
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-C link-arg=-Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1";

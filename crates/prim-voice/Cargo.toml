@@ -1,0 +1,23 @@
+[package]
+name = "prim-voice"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense AND Apache-2.0"
+publish = false
+description = "The prim voice client: realtime socket to prim-room, Opus send path, NetEq receive path, HRTF mixer"
+
+[features]
+default = ["device"]
+# Real audio devices (cpal: ALSA/PipeWire). Without it only wav/tone/null sources and sinks exist.
+device = ["dep:cpal"]
+
+[dependencies]
+anyhow = "1"
+cpal = { version = "0.18", optional = true }
+getrandom = "0.4"
+hound = "3.5"
+libc = "0.2"
+prim-hrtf = { git = "https://github.com/hiinaspace/prim-hrtf", rev = "e38fa7d" }
+room-core = { path = "../room-core" }
+serde_json = "1"
+voice-core = { path = "../../dependencies/godot-network-audio/voice-core" }

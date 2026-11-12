@@ -3,7 +3,7 @@
 # here as they are written. Submodules under dependencies/ keep their own
 # workspaces and are only used through path dependencies.
 [workspace]
-members = ["native", "tools/iroh-hello", "crates/room-core", "crates/prim-room", "crates/prim"]
+members = ["native", "tools/iroh-hello", "crates/room-core", "crates/prim-room", "crates/prim-voice", "crates/prim"]
 exclude = ["dependencies"]
 resolver = "2"
 
