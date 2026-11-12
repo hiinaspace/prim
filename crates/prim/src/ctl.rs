@@ -205,6 +205,32 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
+        "dgram" => {
+            // prim ctl dgram <to> <channel> <size> [--count N] [--max-age ms]
+            let to = arg(1, "target")?;
+            let channel: u16 = arg(2, "channel")?.parse().context("channel")?;
+            let size: usize = arg(3, "size")?.parse().context("size")?;
+            let n = count(&args)?.unwrap_or(1);
+            let max_age_ms: u32 = args
+                .value("max-age")
+                .map(str::parse)
+                .transpose()?
+                .unwrap_or(2_000);
+            for i in 0..n {
+                let mut body = format!("dgram-{i}-").into_bytes();
+                body.resize(size.max(body.len()), b'.');
+                c.send(&Request::SendDatagram {
+                    to: to.clone(),
+                    channel,
+                    payload: b64(&body),
+                    max_age_ms,
+                })
+                .await?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            println!("sent {n} datagrams of {size} B");
+            Ok(ExitCode::SUCCESS)
+        }
         "listen" => {
             let channel: u16 = arg(1, "channel")?.parse().context("channel")?;
             let r = c
@@ -216,6 +242,21 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
             let want = count(&args)?;
             let mut seen = 0usize;
             stream(&mut c, &args, |ev| {
+                if let Event::Datagram {
+                    from,
+                    channel: ch,
+                    payload,
+                    age_ms,
+                } = ev
+                {
+                    if *ch == channel {
+                        println!(
+                            "datagram from={from} channel={ch} bytes={} age_ms={age_ms}",
+                            unb64(payload).map(|p| p.len()).unwrap_or(0)
+                        );
+                        seen += 1;
+                    }
+                }
                 if let Event::Message {
                     from,
                     channel: ch,

@@ -130,6 +130,16 @@ path_a=$(ctl_a status | sed -n "s/^route peer=$key_b path=\([a-z]*\) .*/\1/p")
 mds_b=$(ctl_b status | sed -n "s/^route peer=$key_a .*max_datagram_size=\([0-9a-z]*\) .*/\1/p")
 echo "selected path: A=$path_a B=$path_b; max_datagram_size at B: $mds_b"
 [[ "$mds_b" =~ ^[0-9]+$ ]] || fail "no max_datagram_size reported"
+# Full-size app datagrams B -> A at max_datagram_size minus the 9-byte header (CONTRACTS.md 5).
+# Datagrams are lossy, so require most of them, not all.
+dsize=$((mds_b - 9))
+ctl_a listen 9 --count 15 --timeout 20 >"$work/dgram-a.out" &
+lp=$!
+sleep 1
+ctl_b dgram "$key_a" 9 "$dsize" --count 20 >/dev/null
+wait "$lp" || fail "A received fewer than 15 of 20 datagrams of $dsize B"
+got=$(grep -c "^datagram .*bytes=$dsize " "$work/dgram-a.out" || true)
+echo "ok   datagrams B -> A: $got/20 of payload $dsize B (wire $mds_b B) on path=$path_b"
 if [ "$mode" = direct ]; then
   [ "$path_a" = direct ] && [ "$path_b" = direct ] || fail "expected direct paths"
 else
