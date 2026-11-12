@@ -50,7 +50,8 @@ Every authority fact is a signed record. They share one envelope:
 | 3 | 1 | kind |
 | 4 | 32 | room_id (all zero for genesis only) |
 | 36 | 32 | issuer key |
-| 68 | … | body, per kind |
+| 68 | 32 | issuer_cites: a revocation of the issuer it signs under (all zero = none; must be zero for genesis) |
+| 100 | … | body, per kind |
 | end−64 | 64 | signature |
 
 - `signature = Ed25519(issuer, "prim/1 record\0" || bytes[0 .. end−64])`
@@ -79,9 +80,11 @@ Field rules (decoder-enforced):
 - `meta` is at most 256 bytes. It is a petname hint, never a store.
 - `generation` is nonzero for `invite` (the open generation the invite is bound
   to) and zero for every other grant.
-- `expiry_ms` 0 means no expiry.
+- `expiry_ms` 0 means no expiry. Keyholder and inviter grants must have `expiry_ms = 0`
+  (nothing enforces their expiry, so the decoder refuses to pretend).
 - `cites_revoke` all-zero means none.
 - `kept` holds at most 64 record IDs, strictly ascending.
+- `issuer_cites` of genesis is zero.
 - `generation` of open, close and claim is at least 1. A claim's `term` is at least 1
   (term 0 is the implicit claim made by the open).
 
@@ -92,6 +95,9 @@ the set**: no clocks and no arrival order, so every replica that holds the same
 records computes the same roster. Expiry and the invite's generation binding are
 admission checks (section 7), not set-validity rules.
 
+A grant set holds at most 4096 records besides genesis. A peer refuses records
+past the cap; a room of friends uses tens.
+
 Let `root` be the genesis issuer. Evaluate in this order:
 
 1. **Root and self revocations always take effect.** A revoke or retire takes
@@ -100,8 +106,10 @@ Let `root` be the genesis issuer. Evaluate in this order:
 2. **Keyholders** are the subjects of keyholder grants issued by root that no
    effective revocation masks. Root counts as a keyholder.
 3. **Keyholder revocations.** A revoke or retire issued by a keyholder takes
-   effect unless its subject is root or a keyholder. A keyholder can't
-   remove another keyholder; only root can.
+   effect unless its subject is root or a keyholder, or a stage-1 revocation
+   masks it. A keyholder can't remove another keyholder; only root can. A
+   revocation **kept** (below) by every stage-1 retire of its former-keyholder
+   issuer also takes effect, so retiring a keyholder doesn't lift the bans it kept.
 4. **Inviters** are the subjects of unmasked inviter grants issued by a keyholder.
    An inviter mints invites, never inviters.
 5. **Invites** are unmasked invite grants issued by a keyholder or an inviter.
@@ -110,48 +118,73 @@ Let `root` be the genesis issuer. Evaluate in this order:
    grant. If two distinct member grants share an invite key, both are
    invalid (equivocation: a leaked token can deny a join, never add a second
    member silently). Keyholders are members.
-7. **Lifecycle.** Open and close records count when their issuer is a keyholder.
-   Claim records count when the issuer is a member.
+7. **Lifecycle.** Open and close records count when their issuer is a keyholder
+   (or kept) and they extend the chain: see Room lifecycle. Claim records count when
+   the issuer is a member and they extend the term chain: see Coordinator.
 
-**Masking.** An effective revocation `X` with subject `K` masks record `G` when the
-revocation covers `G` (below) and `G.cites_revoke` does not **cover** `X`:
-- A **revoke** covers every grant whose subject is `K` and every record whose
-  issuer is `K`. That cascades: invites issued by `K` die, so the members those
-  invites admitted die too.
-- A **retire** covers keyholder and inviter grants whose subject is `K`, and
-  records issued by `K` that are not listed in `kept`. Members `K` admitted stay
-  if they are kept. `K`'s own member grant isn't touched.
-- A record named in an effective retire's `kept` still counts after its issuer `K`
-  loses authority, but only if `K` really held that authority: a root-issued
-  keyholder grant for `K` (or, for invites, a keyholder-issued inviter grant) that
-  no *revoke* masks. A member with no authority can't self-retire to launder
-  grants it signed, and a later revoke of `K` still cascades past the kept list.
+A record whose issuer is kept (below) satisfies "issuer is a keyholder" or "issuer
+is an inviter" in stages 4–7.
+
+**Masking.** An effective revocation `X` with subject `K` masks record `G` on two
+sides, each with its own waiver. `G` is masked if either side applies unwaived.
+- **Subject side.** A revoke reaches every grant whose subject is `K`; a retire
+  reaches keyholder and inviter grants whose subject is `K` (`K`'s own member grant
+  isn't touched). Waived when `G.cites_revoke` **covers** `X`: this is how a grant
+  re-admits. Member grants issued by an invite key never get this waiver, because
+  whoever holds the token chooses that cite; re-admitting a revoked person takes a
+  member grant from a keyholder.
+- **Issuer side (the cascade).** Both kinds reach every record whose issuer is `K`.
+  Invites issued by `K` die, so the members those invites admitted die too.
+  Waived when `G.issuer_cites` covers `X` (`K` signed `G` after it saw `X`), or, for
+  a retire, when `G` is in that retire's `kept`. The waiver never grants authority:
+  `G` still needs an issuer that holds it now (a keyholder, inviter, member…) by the
+  stages above, or is kept.
+- **Kept.** `G` issued by `K` is kept when at least one effective retire of `K`
+  exists, every effective retire of `K` lists `G` in `kept` (`issuer_cites` does
+  not substitute here: a record signed after a retire can't be in that retire's
+  list), and `K` really held the authority: a root-issued keyholder grant for `K`
+  (or, for invites, a keyholder-issued inviter grant) that no *revoke* masks. A
+  member with no authority can't self-retire to launder grants it signed; a
+  retiree can't sign more after its first retire and keep them with a second;
+  and a later revoke of `K` still cascades past the kept list.
+
+Nodes sign every record with `issuer_cites` set to the latest effective revocation
+of their own key that they know, so a re-admitted or retired-but-still-member key
+can still claim, invite or open.
 
 `covers(c, X)` holds when `c == X.id`, or when `c` names a revoke or retire `C` in the set
 with `covers(C.cites_revoke, X)`. A revocation's own `cites_revoke` names
-the latest revocation of the same subject that its issuer knew. So
+the latest effective revocation of the same subject that its issuer knew. So
 re-admission is a **new grant citing the revocation**, never an undo. A revocation
 the re-admitter hadn't seen still wins, because tombstones beat reintroduction. A
 missing link in the chain also means "masked", which fails safe and heals once
-the record arrives.
+the record arrives. A cite is one chain, so two concurrent revocations of the same
+key that neither cites can't both be covered: they are final in v1 (fail-safe).
+A node refuses locally to issue a grant that wouldn't take effect.
 
 Revocations issued by `K` are records issued by `K`, so revoking a hostile
 keyholder also voids the revocations it made.
 
 ### Room lifecycle
 
-- `open_generation` is the largest generation of any valid open.
-- The room is **closed** if a valid close exists with generation ≥
-  `open_generation`. Close beats open at equal generation, so replaying an old
-  open never reopens a room.
-- Reopening uses a generation greater than every close.
+Generations step by one. `open(1)` counts; `close(g)` counts only when an
+`open(g)` counts; `open(g+1)` counts only when a `close(g)` counts. Records past
+the chain don't count (they wait, harmlessly, in the set). So:
+- `open_generation` is the last generation in the chain with a valid open.
+- The room is **closed** if a valid close of `open_generation` exists. Close
+  beats open at equal generation, so replaying an old open never reopens a room.
+- Reopening issues `open(g+1)` after `close(g)`.
 - The room is **dead** if it has never been opened.
+- Nobody can jump a counter to its maximum: a `close(u32::MAX)` is inert.
 
 ### Coordinator
 
 - Each generation `g` has an implicit claim `(g, term 0)`, held by the issuer of
   the valid open for `g` with the lowest record ID.
 - Explicit claims carry `term ≥ 1` and `rank` (the claimant's presence `since_ms`).
+  Terms step by one: a claim at `(g, t)` counts only when a claim at `(g, t−1)`
+  counts (term 0 is the open). A node probes a claim before issuing it and never
+  claims a term twice; a term that would overflow isn't claimed.
 - The **best claim of a term** is the one with the lowest `(rank, holder key)`.
 - The **current coordinator** is the best claim of the highest term.
 - Apps key on `(generation, term, holder)`, never on "who is coordinator".
@@ -312,7 +345,14 @@ bootstrap peer. That peer admits `J` only if all of these hold:
 - the room is open at `invite.generation`;
 - `invite.expiry_ms` is later than the admitting peer's wall clock.
 
-Then it floods both records. Closing the room therefore kills every outstanding
+Then it floods both records.
+
+Expiry and generation binding are enforced only by the admitting peer. Records
+that arrive by gossip are judged by set validity, which has no clock and ignores
+the invite's generation. So these bind honest members only: a member holding an
+unused token can still redeem it after expiry or a reopen and flood the result.
+Under the v1 threat model (invited friends) that is accepted; closing the room,
+or revoking the invite key, is the hard stop. Closing the room therefore kills every outstanding
 token (a reopen has a new generation), and the token is spent once its member
 grant is known. A member that never uses a token can lose it to a thief.
 Equivocation then voids both admissions, so the theft is visible.

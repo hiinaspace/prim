@@ -1,8 +1,9 @@
 //! Adversarial authority tests, written from CONTRACTS.md section 2.
 
 use room_core::grants::{AdmitError, Epoch, GrantSet, Lifecycle};
+use room_core::grants::{InsertError, MAX_RECORDS};
 use room_core::ids::{Identity, Key, RecordId};
-use room_core::record::{build, Kind, Record};
+use room_core::record::{build, Kind, Record, Signer};
 
 fn ident(n: u8) -> Identity {
     Identity::from_secret([n; 32])
@@ -431,4 +432,193 @@ fn kept_records_die_when_the_retiree_is_later_revoked() {
         !w.gs.is_member(&x.key()),
         "revoke must cascade past an earlier retire's kept list"
     );
+}
+
+// ---- R1 audit regressions -------------------------------------------------
+
+fn retire_by(w: &mut World, by: &Identity, subj: Key, kept: Vec<RecordId>) -> Record {
+    let cites = w.gs.latest_revocation_of(&subj);
+    let n = w.nn();
+    let mut kept = kept;
+    kept.sort();
+    let r = build::retire(by, w.gs.room(), subj, n, 4000, cites, kept);
+    w.add(r)
+}
+
+#[test]
+fn retired_keyholder_cannot_admit_with_either_cite() {
+    let mut w = World::new();
+    let kh = ident(50);
+    w.keyholder(&kh);
+    let root = w.root.clone();
+    let ret = retire_by(&mut w, &root, kh.key(), vec![]);
+    // Old attack: the body cite names the retire.
+    let x = ident(51);
+    w.grant(&kh, Kind::Member, x.key(), ret.id);
+    assert!(
+        !w.gs.is_member(&x.key()),
+        "body cite waived the issuer cascade"
+    );
+    // The issuer cite waives the cascade but not the missing authority.
+    let y = ident(52);
+    let n = w.nn();
+    let r = build::grant(
+        Signer::new(&kh, ret.id),
+        w.gs.room(),
+        Kind::Member,
+        y.key(),
+        n,
+        2000,
+        0,
+        0,
+        RecordId::ZERO,
+    );
+    w.add(r);
+    assert!(
+        !w.gs.is_member(&y.key()),
+        "issuer cite restored lost authority"
+    );
+    assert!(!w.gs.is_keyholder(&kh.key()));
+}
+
+#[test]
+fn second_self_retire_cannot_keep_records_signed_after_the_first() {
+    let mut w = World::new();
+    let kh = ident(53);
+    w.keyholder(&kh);
+    let first = retire_by(&mut w, &kh.clone(), kh.key(), vec![]);
+    let y = ident(54);
+    let n = w.nn();
+    let late = build::grant(
+        Signer::new(&kh, first.id),
+        w.gs.room(),
+        Kind::Member,
+        y.key(),
+        n,
+        2000,
+        0,
+        0,
+        RecordId::ZERO,
+    );
+    let late = w.add(late);
+    retire_by(&mut w, &kh.clone(), kh.key(), vec![late.id]);
+    assert!(
+        !w.gs.is_member(&y.key()),
+        "a later retire laundered a post-retire grant"
+    );
+}
+
+#[test]
+fn retire_keeping_a_ban_keeps_the_ban() {
+    let mut w = World::new();
+    let kh = ident(55);
+    let m = ident(56);
+    w.keyholder(&kh);
+    w.grant(&kh, Kind::Member, m.key(), RecordId::ZERO);
+    let ban = w.revoke(&kh, m.key());
+    assert!(!w.gs.is_member(&m.key()));
+    let root = w.root.clone();
+    retire_by(&mut w, &root, kh.key(), vec![ban.id]);
+    assert!(!w.gs.is_keyholder(&kh.key()));
+    assert!(
+        !w.gs.is_member(&m.key()),
+        "retiring the banning keyholder lifted a kept ban"
+    );
+    assert!(w.gs.authority().effective_revocations.contains(&ban.id));
+}
+
+#[test]
+fn readmitted_member_claims_under_its_issuer_cite() {
+    let mut w = World::new();
+    let root = w.root.clone();
+    w.open(&root, 1);
+    let m = ident(57);
+    w.grant(&root, Kind::Member, m.key(), RecordId::ZERO);
+    let rv = w.revoke(&root, m.key());
+    w.grant(&root, Kind::Member, m.key(), rv.id);
+    assert!(w.gs.is_member(&m.key()));
+    let room = w.gs.room();
+    let stale = w.add(build::claim(&m, room, 1, 1, 0, 5000));
+    assert!(
+        !w.gs.is_valid(&stale.id),
+        "claim without the issuer cite is cascaded"
+    );
+    let good = w.add(build::claim(Signer::new(&m, rv.id), room, 1, 1, 0, 5000));
+    assert!(w.gs.is_valid(&good.id));
+    assert_eq!(w.gs.coordinator().unwrap().1.holder, m.key());
+}
+
+#[test]
+fn counters_step_by_one() {
+    let mut w = World::new();
+    let root = w.root.clone();
+    w.open(&root, 1);
+    let room = w.gs.room();
+    let m = ident(58);
+    w.grant(&root, Kind::Member, m.key(), RecordId::ZERO);
+    // A term jump to the maximum is ignored (and can't overflow anyone's +1).
+    let jump = w.add(build::claim(&m, room, 1, u32::MAX, 0, 5000));
+    assert!(!w.gs.is_valid(&jump.id));
+    assert_eq!(
+        w.gs.coordinator().unwrap().0,
+        Epoch {
+            generation: 1,
+            term: 0
+        }
+    );
+    // A close at the maximum generation doesn't brick the room.
+    let brick = w.add(build::close(&root, room, u32::MAX, 4000));
+    assert!(!w.gs.is_valid(&brick.id));
+    assert_eq!(w.gs.lifecycle(), Lifecycle::Open(1));
+    // Neither does an open that skips a generation.
+    w.open(&root, 3);
+    assert_eq!(w.gs.lifecycle(), Lifecycle::Open(1));
+    w.add(build::close(&root, room, 1, 4000));
+    w.open(&root, 2);
+    assert_eq!(w.gs.lifecycle(), Lifecycle::Open(2));
+}
+
+#[test]
+fn old_token_cannot_cite_its_way_past_a_revoke() {
+    let mut w = World::new();
+    let root = w.root.clone();
+    w.open(&root, 1);
+    let m = ident(59);
+    w.grant(&root, Kind::Member, m.key(), RecordId::ZERO);
+    let eph = ident(60);
+    w.invite(&root, &eph, 1, 0);
+    let rv = w.revoke(&root, m.key());
+    // m kept a copy of the token and signs a member grant to itself citing its revoke.
+    let n = w.nn();
+    let r = build::grant(
+        &eph,
+        w.gs.room(),
+        Kind::Member,
+        m.key(),
+        n,
+        5000,
+        0,
+        0,
+        rv.id,
+    );
+    w.add(r);
+    assert!(
+        !w.gs.is_member(&m.key()),
+        "invite-signed grant waived a revoke"
+    );
+}
+
+#[test]
+fn grant_set_is_capped() {
+    let mut w = World::new();
+    let root = w.root.clone();
+    let room = w.gs.room();
+    let recs = (0..=MAX_RECORDS as u32).map(|i| {
+        let mut nn = [0u8; 16];
+        nn[..4].copy_from_slice(&i.to_le_bytes());
+        build::open(&root, room, 1, nn, 2500)
+    });
+    let out = w.gs.insert_all(recs.collect::<Vec<_>>());
+    assert_eq!(out.last().unwrap(), &Err(InsertError::Full));
+    assert_eq!(w.gs.len(), MAX_RECORDS + 1);
 }

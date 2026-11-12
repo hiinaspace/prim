@@ -227,6 +227,17 @@ fn admit_reason(e: AdmitError) -> Reason {
 }
 
 impl Room {
+    /// Sign as this node, citing the latest revocation of our own key so records we
+    /// issue after a re-admission or our own retire aren't caught by the cascade.
+    fn signer(&self) -> crate::record::Signer<'_> {
+        let cites = self
+            .grants
+            .as_ref()
+            .map(|g| g.latest_revocation_of(&self.my_key))
+            .unwrap_or(RecordId::ZERO);
+        crate::record::Signer::new(&self.me, cites)
+    }
+
     // ------------------------------------------------------------------
     // Construction
     // ------------------------------------------------------------------
@@ -1611,7 +1622,7 @@ impl Room {
         if let Some((rank, k)) = best {
             if k == self.my_key {
                 let claim = build::claim(
-                    &self.me,
+                    self.signer(),
                     self.room,
                     g,
                     epoch.term + 1,
@@ -2114,7 +2125,7 @@ impl Room {
         let secret: [u8; 32] = self.entropy.bytes();
         let nonce = self.nonce16();
         let tok = InviteToken::mint(
-            &self.me,
+            self.signer(),
             self.room,
             generation,
             secret,
@@ -2142,7 +2153,7 @@ impl Room {
         let cites = g.latest_revocation_of(&subject);
         let nonce = self.nonce16();
         let rec = build::grant(
-            &self.me,
+            self.signer(),
             self.room,
             kind,
             subject,
@@ -2165,7 +2176,14 @@ impl Room {
         }
         let cites = g.latest_revocation_of(&subject);
         let rec = match retire {
-            None => build::revoke(&self.me, self.room, subject, nonce, self.now.unix_ms, cites),
+            None => build::revoke(
+                self.signer(),
+                self.room,
+                subject,
+                nonce,
+                self.now.unix_ms,
+                cites,
+            ),
             Some(keep_all) => {
                 let kept: Vec<RecordId> = if keep_all {
                     g.records()
@@ -2179,7 +2197,7 @@ impl Room {
                     return Err(ErrorCode::TooLarge);
                 }
                 build::retire(
-                    &self.me,
+                    self.signer(),
                     self.room,
                     subject,
                     nonce,
@@ -2205,7 +2223,7 @@ impl Room {
         if !matches!(g.lifecycle(), Lifecycle::Open(_)) {
             return Err(ErrorCode::Closed);
         }
-        let rec = build::close(&self.me, self.room, n, self.now.unix_ms);
+        let rec = build::close(self.signer(), self.room, n, self.now.unix_ms);
         self.commit_local_records(vec![rec]);
         Ok(())
     }
@@ -2217,7 +2235,7 @@ impl Room {
             return Err(ErrorCode::Unknown);
         }
         let nonce = self.nonce16();
-        let rec = build::open(&self.me, self.room, n + 1, nonce, self.now.unix_ms);
+        let rec = build::open(self.signer(), self.room, n + 1, nonce, self.now.unix_ms);
         self.commit_local_records(vec![rec]);
         Ok(())
     }

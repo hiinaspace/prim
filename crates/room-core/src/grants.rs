@@ -10,7 +10,13 @@ use crate::record::{Body, Kind, Record};
 pub enum InsertError {
     WrongRoom,
     SecondGenesis,
+    /// The set already holds [`MAX_RECORDS`] records.
+    Full,
 }
+
+/// Cap on records in one room's grant set (CONTRACTS.md section 2). A room for a
+/// handful of friends needs tens; the cap bounds a hostile member's flood.
+pub const MAX_RECORDS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmitError {
@@ -139,6 +145,9 @@ impl GrantSet {
         if self.records.contains_key(&rec.id) {
             return Ok(false);
         }
+        if self.records.len() >= MAX_RECORDS {
+            return Err(InsertError::Full);
+        }
         self.records.insert(rec.id, rec);
         self.recompute();
         Ok(true)
@@ -160,6 +169,10 @@ impl GrantSet {
                 });
             } else if rec.room != self.room {
                 out.push(Err(InsertError::WrongRoom));
+            } else if self.records.contains_key(&rec.id) {
+                out.push(Ok(false));
+            } else if self.records.len() >= MAX_RECORDS {
+                out.push(Err(InsertError::Full));
             } else if let std::collections::btree_map::Entry::Vacant(e) = self.records.entry(rec.id)
             {
                 e.insert(rec);
@@ -330,15 +343,20 @@ impl GrantSet {
     }
 
     /// The latest revocation of `subject` known here, for a new revocation's or a
-    /// re-admission grant's `cites_revoke`. Picks one covering all others when the
-    /// chain is linear; otherwise the lowest id (a re-admitter must cite each
-    /// concurrent branch by issuing after it sees them all).
+    /// re-admission grant's `cites_revoke`, or a record's `issuer_cites`. Picks one
+    /// covering all others when the chain is linear; otherwise the lowest id. A cite
+    /// is a single chain, so two concurrent revocations that neither cites can't both
+    /// be covered: the subject stays out until a keyholder revokes again citing one
+    /// branch (that new revocation masks too, so in practice concurrent revocations
+    /// are final, which fails safe).
     pub fn latest_revocation_of(&self, subject: &Key) -> RecordId {
         let revs: Vec<&Record> = self
             .records
             .values()
             .filter(|r| {
-                matches!(r.kind, Kind::Revoke | Kind::Retire) && r.subject() == Some(*subject)
+                matches!(r.kind, Kind::Revoke | Kind::Retire)
+                    && r.subject() == Some(*subject)
+                    && self.auth.effective_revocations.contains(&r.id)
             })
             .collect();
         for cand in &revs {
@@ -368,25 +386,81 @@ impl GrantSet {
     }
 
     /// Does effective revocation `x` mask record `g`?
-    fn masks(&self, x: &Record, g: &Record) -> bool {
+    ///
+    /// Two sides, each with its own waiver:
+    /// - subject side (`g` grants to the revoked key): waived when `g`'s body
+    ///   `cites_revoke` covers `x`, except for member grants signed by an invite key
+    ///   (the joiner holds that key, so the cite would be theirs to choose);
+    /// - issuer side (`g` was issued by the revoked key, the cascade): waived when
+    ///   `g.issuer_cites` covers `x`, or for a retire when `g` is in its `kept`.
+    ///   The issuer must still hold, on its own, the authority `g` needs; the waiver
+    ///   only stops the cascade from killing records a re-admitted key signs later.
+    fn masks(&self, x: &Record, g: &Record, invite_keys: &BTreeSet<Key>) -> bool {
         if x.id == g.id {
             return false;
         }
         let rv = x.revocation().unwrap();
         let k = rv.subject;
-        let in_scope = match x.kind {
-            Kind::Revoke => (g.kind.is_grant() && g.subject() == Some(k)) || g.issuer == k,
+        let subject_side = match x.kind {
+            Kind::Revoke => g.kind.is_grant() && g.subject() == Some(k),
             Kind::Retire => {
-                (matches!(g.kind, Kind::Keyholder | Kind::Inviter) && g.subject() == Some(k))
-                    || (g.issuer == k && rv.kept.binary_search(&g.id).is_err())
+                matches!(g.kind, Kind::Keyholder | Kind::Inviter) && g.subject() == Some(k)
             }
             _ => unreachable!(),
         };
-        in_scope && !self.covers(g.cites_revoke(), x.id)
+        let subject_waived = !(g.kind == Kind::Member && invite_keys.contains(&g.issuer))
+            && self.covers(g.cites_revoke(), x.id);
+        let issuer_side = g.issuer == k;
+        let issuer_waived = self.covers(g.issuer_cites, x.id)
+            || (x.kind == Kind::Retire && rv.kept.binary_search(&g.id).is_ok());
+        (subject_side && !subject_waived) || (issuer_side && !issuer_waived)
     }
 
-    fn masked_by<'a>(&self, set: impl IntoIterator<Item = &'a Record>, g: &Record) -> bool {
-        set.into_iter().any(|x| self.masks(x, g))
+    fn masked_by<'a>(
+        &self,
+        set: impl IntoIterator<Item = &'a Record>,
+        g: &Record,
+        invite_keys: &BTreeSet<Key>,
+    ) -> bool {
+        set.into_iter().any(|x| self.masks(x, g, invite_keys))
+    }
+
+    /// `g` survives its issuer's retirement: at least one retire of the issuer in
+    /// `revs` exists, every one of them lists `g` in `kept` (no `issuer_cites`
+    /// shortcut: a record signed after a retire can't be in that retire's list), and
+    /// the issuer really held the authority `g` needs: a root-issued keyholder grant
+    /// (or, for invites, a keyholder-issued inviter grant) that no revoke in `revs`
+    /// masks. Without the authority check any member could sign grants and
+    /// self-retire with them kept.
+    fn kept_by(
+        &self,
+        revs: &[&Record],
+        g: &Record,
+        keyholders: &BTreeSet<Key>,
+        invite_keys: &BTreeSet<Key>,
+    ) -> bool {
+        let k = g.issuer;
+        let mut retires = revs
+            .iter()
+            .filter(|x| x.kind == Kind::Retire && x.subject() == Some(k))
+            .peekable();
+        if retires.peek().is_none() {
+            return false;
+        }
+        if !retires.all(|x| x.revocation().unwrap().kept.binary_search(&g.id).is_ok()) {
+            return false;
+        }
+        let revoked = |r: &Record| {
+            revs.iter()
+                .any(|x| x.kind == Kind::Revoke && self.masks(x, r, invite_keys))
+        };
+        let held = |kind: Kind, issuer_ok: &dyn Fn(Key) -> bool| {
+            self.records.values().any(|r| {
+                r.kind == kind && r.subject() == Some(k) && issuer_ok(r.issuer) && !revoked(r)
+            })
+        };
+        held(Kind::Keyholder, &|i| i == self.root)
+            || (g.kind == Kind::Invite && held(Kind::Inviter, &|i| keyholders.contains(&i)))
     }
 
     fn recompute(&mut self) {
@@ -397,6 +471,12 @@ impl GrantSet {
             .copied()
             .filter(|r| matches!(r.kind, Kind::Revoke | Kind::Retire))
             .collect();
+        let invite_keys: BTreeSet<Key> = recs
+            .iter()
+            .filter(|r| r.kind == Kind::Invite)
+            .filter_map(|r| r.subject())
+            .collect();
+        let ik = &invite_keys;
 
         // 1. Root and self revocations; never against root.
         let stage1: Vec<&Record> = revs
@@ -414,57 +494,32 @@ impl GrantSet {
             .iter()
             .filter(|r| r.kind == Kind::Keyholder && r.issuer == root)
         {
-            if !self.masked_by(stage1.iter().copied(), g) {
+            if !self.masked_by(stage1.iter().copied(), g, ik) {
                 keyholders.insert(g.subject().unwrap());
             }
         }
 
-        // 3. Keyholder revocations: issuer a keyholder, subject neither root nor a keyholder.
+        // 3. Keyholder revocations: issuer a keyholder (or a retired keyholder that
+        // kept it), subject neither root nor a keyholder.
         let mut effective: Vec<&Record> = stage1.clone();
         for x in revs.iter().copied() {
             if stage1.iter().any(|s| s.id == x.id) {
                 continue;
             }
             let s = x.subject().unwrap();
-            if keyholders.contains(&x.issuer)
-                && x.issuer != root
+            let issuer_ok = (keyholders.contains(&x.issuer) && x.issuer != root)
+                || self.kept_by(&stage1, x, &keyholders, ik);
+            if issuer_ok
                 && !keyholders.contains(&s)
-                && !self.masked_by(stage1.iter().copied(), x)
+                && !self.masked_by(stage1.iter().copied(), x, ik)
             {
                 effective.push(x);
             }
         }
         // Stage-1 records masked by another stage-1 record don't need removal: a masked
         // self-revocation only ever concerns a subject that is revoked anyway.
-        let masked = |g: &Record| self.masked_by(effective.iter().copied(), g);
-        // A retire lists records its subject issued that stay valid even though the
-        // subject no longer holds the authority that issued them.
-        // Only authority the subject really held is preserved: a root-issued keyholder
-        // grant (or, for invites, a keyholder-issued inviter grant) that no *revoke*
-        // masks. Without this, any member could sign grants and self-retire with them
-        // in `kept`.
-        let revoked = |g: &Record| {
-            effective
-                .iter()
-                .any(|x| x.kind == Kind::Revoke && self.masks(x, g))
-        };
-        let held = |k: Key, kind: Kind, issuer_ok: &dyn Fn(Key) -> bool| {
-            recs.iter().any(|r| {
-                r.kind == kind && r.subject() == Some(k) && issuer_ok(r.issuer) && !revoked(r)
-            })
-        };
-        let kept_ok = |g: &Record| {
-            let k = g.issuer;
-            let listed = effective.iter().any(|x| {
-                x.kind == Kind::Retire
-                    && x.subject() == Some(k)
-                    && x.revocation().unwrap().kept.binary_search(&g.id).is_ok()
-            });
-            listed
-                && (held(k, Kind::Keyholder, &|i| i == root)
-                    || (g.kind == Kind::Invite
-                        && held(k, Kind::Inviter, &|i| keyholders.contains(&i))))
-        };
+        let masked = |g: &Record| self.masked_by(effective.iter().copied(), g, ik);
+        let kept_ok = |g: &Record| self.kept_by(&effective, g, &keyholders, ik);
 
         let mut valid: BTreeSet<RecordId> = BTreeSet::from([self.genesis.id]);
         valid.extend(effective.iter().map(|x| x.id));
@@ -519,68 +574,92 @@ impl GrantSet {
             }
         }
 
-        // 7. Lifecycle and claims.
-        let mut opens: BTreeMap<u32, ClaimInfo> = BTreeMap::new();
-        let mut max_close = 0u32;
+        // 7. Lifecycle and claims. Generations step by one: open(1); close(g) needs a
+        // valid open(g); open(g+1) needs a valid close(g). Terms step by one too:
+        // claim(g, t) needs a valid claim at (g, t-1), with the open as term 0. Records
+        // past the chain don't count, so nobody can jump a counter to its maximum.
+        let lc_ok = |r: &Record| (keyholders.contains(&r.issuer) || kept_ok(r)) && !masked(r);
+        let mut open_cands: BTreeMap<u32, Vec<&Record>> = BTreeMap::new();
+        let mut close_cands: BTreeMap<u32, Vec<&Record>> = BTreeMap::new();
         for r in recs.iter().copied() {
-            if !matches!(r.kind, Kind::Open | Kind::Close)
-                || !(keyholders.contains(&r.issuer) || kept_ok(r))
-                || masked(r)
-            {
-                continue;
-            }
-            valid.insert(r.id);
             match r.body {
-                Body::Open { generation, .. } => {
-                    let e = opens.entry(generation).or_insert(ClaimInfo {
-                        holder: r.issuer,
-                        rank: 0,
-                        id: r.id,
-                    });
-                    if r.id < e.id {
-                        *e = ClaimInfo {
-                            holder: r.issuer,
-                            rank: 0,
-                            id: r.id,
-                        };
-                    }
+                Body::Open { generation, .. } if lc_ok(r) => {
+                    open_cands.entry(generation).or_default().push(r)
                 }
-                Body::Close { generation, .. } => max_close = max_close.max(generation),
-                _ => unreachable!(),
+                Body::Close { generation, .. } if lc_ok(r) => {
+                    close_cands.entry(generation).or_default().push(r)
+                }
+                _ => {}
             }
         }
-        let max_open = opens.keys().next_back().copied().unwrap_or(0);
-        let lifecycle = if max_open == 0 && max_close == 0 {
-            Lifecycle::Dead
-        } else if max_close >= max_open {
-            Lifecycle::Closed(max_close)
-        } else {
-            Lifecycle::Open(max_open)
-        };
+        let mut opens: BTreeMap<u32, ClaimInfo> = BTreeMap::new();
+        let mut lifecycle = Lifecycle::Dead;
+        let mut g = 1u32;
+        while let Some(os) = open_cands.get(&g) {
+            let first = os.iter().min_by_key(|r| r.id).unwrap();
+            opens.insert(
+                g,
+                ClaimInfo {
+                    holder: first.issuer,
+                    rank: 0,
+                    id: first.id,
+                },
+            );
+            valid.extend(os.iter().map(|r| r.id));
+            lifecycle = Lifecycle::Open(g);
+            let Some(cs) = close_cands.get(&g) else { break };
+            valid.extend(cs.iter().map(|r| r.id));
+            lifecycle = Lifecycle::Closed(g);
+            match g.checked_add(1) {
+                Some(n) => g = n,
+                None => break,
+            }
+        }
 
-        let mut claims: BTreeMap<Epoch, ClaimInfo> = BTreeMap::new();
-        for r in recs.iter().filter(|r| r.kind == Kind::Claim) {
+        let mut claim_cands: BTreeMap<Epoch, Vec<&Record>> = BTreeMap::new();
+        for r in recs.iter().copied() {
             let Body::Claim {
-                generation,
-                term,
-                rank,
-                ..
+                generation, term, ..
             } = r.body
             else {
-                unreachable!()
-            };
-            if !members.contains_key(&r.issuer) || masked(r) || !opens.contains_key(&generation) {
                 continue;
-            }
-            valid.insert(r.id);
-            let info = ClaimInfo {
-                holder: r.issuer,
-                rank,
-                id: r.id,
             };
-            let e = claims.entry(Epoch { generation, term }).or_insert(info);
-            if (rank, r.issuer) < (e.rank, e.holder) {
-                *e = info;
+            if members.contains_key(&r.issuer) && !masked(r) && opens.contains_key(&generation) {
+                claim_cands
+                    .entry(Epoch { generation, term })
+                    .or_default()
+                    .push(r);
+            }
+        }
+        let mut claims: BTreeMap<Epoch, ClaimInfo> = BTreeMap::new();
+        for &generation in opens.keys() {
+            let mut term = 1u32;
+            while let Some(cs) = claim_cands.get(&Epoch { generation, term }) {
+                let best = cs
+                    .iter()
+                    .min_by_key(|r| {
+                        let Body::Claim { rank, .. } = r.body else {
+                            unreachable!()
+                        };
+                        (rank, r.issuer)
+                    })
+                    .unwrap();
+                let Body::Claim { rank, .. } = best.body else {
+                    unreachable!()
+                };
+                claims.insert(
+                    Epoch { generation, term },
+                    ClaimInfo {
+                        holder: best.issuer,
+                        rank,
+                        id: best.id,
+                    },
+                );
+                valid.extend(cs.iter().map(|r| r.id));
+                match term.checked_add(1) {
+                    Some(n) => term = n,
+                    None => break,
+                }
             }
         }
 

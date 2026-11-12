@@ -8,7 +8,7 @@ pub const RECORD_VERSION: u8 = 1;
 pub const META_CAP: usize = 256;
 pub const KEPT_CAP: usize = 64;
 pub const RECORD_SIG_CTX: &[u8] = b"prim/1 record\0";
-const HEADER: usize = 68;
+const HEADER: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
@@ -103,9 +103,34 @@ pub struct Record {
     pub kind: Kind,
     pub room: RoomId,
     pub issuer: Key,
+    /// The latest revocation of the issuer that the issuer operates under (zero = none).
+    /// Waives issuer-side masking by that revocation chain (CONTRACTS.md section 2).
+    pub issuer_cites: RecordId,
     pub body: Body,
     pub id: RecordId,
     pub bytes: Vec<u8>,
+}
+
+/// A signing identity plus the issuer-side cite it signs under.
+#[derive(Clone, Copy)]
+pub struct Signer<'a> {
+    pub id: &'a Identity,
+    pub cites: RecordId,
+}
+
+impl<'a> Signer<'a> {
+    pub fn new(id: &'a Identity, cites: RecordId) -> Self {
+        Self { id, cites }
+    }
+}
+
+impl<'a> From<&'a Identity> for Signer<'a> {
+    fn from(id: &'a Identity) -> Self {
+        Self {
+            id,
+            cites: RecordId::ZERO,
+        }
+    }
 }
 
 impl Record {
@@ -138,7 +163,8 @@ impl Record {
     }
 
     /// Build and sign a record. Panics on a body that would not decode (caller bug).
-    pub fn sign(signer: &Identity, kind: Kind, room: RoomId, body: Body) -> Record {
+    pub fn sign<'a>(signer: impl Into<Signer<'a>>, kind: Kind, room: RoomId, body: Body) -> Record {
+        let Signer { id: signer, cites } = signer.into();
         let mut w = Writer::new();
         w.raw(&RECORD_MAGIC).u8(RECORD_VERSION).u8(kind as u8);
         w.raw(&if kind == Kind::Genesis {
@@ -147,6 +173,11 @@ impl Record {
             room.0
         });
         w.raw(&signer.key().0);
+        w.raw(&if kind == Kind::Genesis {
+            [0; 32]
+        } else {
+            cites.0
+        });
         encode_body(&mut w, kind, &body);
         let mut msg = RECORD_SIG_CTX.to_vec();
         msg.extend_from_slice(&w.0);
@@ -173,6 +204,10 @@ impl Record {
         let kind = Kind::from_u8(r.u8()?)?;
         let room_field = RoomId(r.array()?);
         let issuer = Key(r.array()?);
+        let issuer_cites = RecordId(r.array()?);
+        if kind == Kind::Genesis && !issuer_cites.is_zero() {
+            return Err(DecodeError::Field("genesis issuer_cites must be zero"));
+        }
         let body = decode_body(&mut r, kind)?;
         r.end()?;
         let room = if kind == Kind::Genesis {
@@ -203,6 +238,7 @@ impl Record {
             kind,
             room,
             issuer,
+            issuer_cites,
             body,
             id: RecordId(h("prim/1 record-id", signed)),
             bytes: bytes.to_vec(),
@@ -304,6 +340,11 @@ fn decode_body(r: &mut Reader<'_>, kind: Kind) -> Result<Body, DecodeError> {
                 cites_revoke: RecordId(r.array()?),
                 meta: r.bytes16(META_CAP, "meta")?.to_vec(),
             };
+            if matches!(kind, Kind::Keyholder | Kind::Inviter) && g.expiry_ms != 0 {
+                return Err(DecodeError::Field(
+                    "keyholder and inviter grants never expire",
+                ));
+            }
             if (kind == Kind::Invite) != (g.generation != 0) {
                 return Err(DecodeError::Field(
                     "generation is nonzero exactly for invites",
@@ -394,8 +435,8 @@ pub mod build {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn grant(
-        issuer: &Identity,
+    pub fn grant<'a>(
+        issuer: impl Into<Signer<'a>>,
         room: RoomId,
         kind: Kind,
         subject: Key,
@@ -422,8 +463,8 @@ pub mod build {
         )
     }
 
-    pub fn revoke(
-        issuer: &Identity,
+    pub fn revoke<'a>(
+        issuer: impl Into<Signer<'a>>,
         room: RoomId,
         subject: Key,
         nonce: [u8; 16],
@@ -444,8 +485,8 @@ pub mod build {
         )
     }
 
-    pub fn retire(
-        issuer: &Identity,
+    pub fn retire<'a>(
+        issuer: impl Into<Signer<'a>>,
         room: RoomId,
         subject: Key,
         nonce: [u8; 16],
@@ -469,8 +510,8 @@ pub mod build {
         )
     }
 
-    pub fn open(
-        issuer: &Identity,
+    pub fn open<'a>(
+        issuer: impl Into<Signer<'a>>,
         room: RoomId,
         generation: u32,
         nonce: [u8; 16],
@@ -488,7 +529,12 @@ pub mod build {
         )
     }
 
-    pub fn close(issuer: &Identity, room: RoomId, generation: u32, issued_ms: u64) -> Record {
+    pub fn close<'a>(
+        issuer: impl Into<Signer<'a>>,
+        room: RoomId,
+        generation: u32,
+        issued_ms: u64,
+    ) -> Record {
         Record::sign(
             issuer,
             Kind::Close,
@@ -500,8 +546,8 @@ pub mod build {
         )
     }
 
-    pub fn claim(
-        issuer: &Identity,
+    pub fn claim<'a>(
+        issuer: impl Into<Signer<'a>>,
         room: RoomId,
         generation: u32,
         term: u32,

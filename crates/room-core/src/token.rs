@@ -110,8 +110,8 @@ impl InviteToken {
 
     /// Mint: the inviter signs an invite grant for a fresh ephemeral key.
     #[allow(clippy::too_many_arguments)]
-    pub fn mint(
-        inviter: &Identity,
+    pub fn mint<'a>(
+        inviter: impl Into<crate::record::Signer<'a>>,
         room: RoomId,
         generation: u32,
         ephemeral_secret: [u8; 32],
