@@ -1,0 +1,19 @@
+[package]
+name = "prim"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "Multi-call binary: prim room (the daemon) and prim ctl (its local client)"
+
+[[bin]]
+name = "prim"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+prim-room = { path = "../prim-room" }
+room-core = { path = "../room-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde_json = "1"
