@@ -1,10 +1,9 @@
-# Room wire contracts (draft, round R1, 2026-11-11)
+# Room wire contracts (rounds R1 and R0, 2026-11-11)
 
-This is the draft of the wire contracts for the `prim-room` daemon. The
-architecture is in [ROOM.md](ROOM.md). Contracts 1–3, 7 and 8 are drafts to
-freeze before friends get a build. Contracts 4 (hello) and 5 (datagram header)
-are **provisional until round R0** lands voice on them. Contract 6 (the voice
-envelope) belongs to R0; this file only reserves room for it.
+These are the wire contracts for the `prim-room` daemon. The architecture is in
+[ROOM.md](ROOM.md), and voice in [VOICE.md](VOICE.md). Contracts 1–3, 7 and 8 are
+drafts to freeze before friends get a build. Contracts 4 (hello), 5 (datagram
+header) and 6 (voice envelope) were frozen in round R0.
 
 Golden vectors for every encoding are in
 `crates/room-core/tests/vectors/golden.json`. `cargo test -p room-core
@@ -256,7 +255,7 @@ rejected.
 - **Forwarding.** Durable records are flooded: a node forwards a record that
   improved its own state to its other peers. Live records go direct only.
 
-## 4. Peer connection and hello (PROVISIONAL until R0)
+## 4. Peer connection and hello (frozen in R0)
 
 - **One connection per peer** for room traffic, under ALPN `prim/1`. When two
   connections exist for the same peer (a simultaneous dial), each side keeps the
@@ -285,12 +284,17 @@ rejected.
 
 - **Hello.**
   - `version` must be 1. A peer with any other version is rejected with `version`.
-  - Unknown `caps` bits are ignored. Bits: 0 state, 1 messages, 2 datagrams,
-    3 streams. Bit 8 is reserved for voice (R0).
+  - `caps` bits 0–31 are optional and unknown ones are ignored. Bits: 0 state,
+    1 messages, 2 datagrams, 3 streams, 8 voice (the peer accepts datagram kinds
+    2 and 3; whether anyone listens is its `member/<id>/voice` key, section 6).
+  - `caps` bits 32–63 are **required**: a receiver that sees a required bit it
+    doesn't implement rejects with `unsupported`. Version 1 defines none, so a
+    future wire extension that old peers must not misread sets one instead of
+    bumping `version`.
   - `member` must equal the transport's remote key.
   - `proof` carries the invite redemption (section 7).
 - **Reject and goodbye reasons:** 1 version, 2 wrong_room, 3 not_member, 4 closed,
-  5 revoked, 6 duplicate, 7 invite_invalid, 8 shutdown, 9 leave.
+  5 revoked, 6 duplicate, 7 invite_invalid, 8 shutdown, 9 leave, 10 unsupported.
 - **Message `target`:** 0 the receiver, 1 broadcast copy, 2 coordinator. A
   coordinator message is resolved when sent and fails locally with
   `no_coordinator` when there is none.
@@ -300,29 +304,79 @@ rejected.
   `no_channel`.
 - Membership never grants a channel.
 
-## 5. Datagram header (PROVISIONAL until R0)
+## 5. Datagram header (frozen in R0)
 
 `ver_kind u8` (high nibble version = 1, low nibble kind), then the kind body.
+Decoders are strict (section 0); an unknown kind or version is dropped and counted.
 
 | kind | name | body |
 |---|---|---|
 | 0 | live state | an unsigned live state record (section 3) |
 | 1 | app | `channel u16 seq u16 send_ms u32 payload` |
-| 2 | voice | reserved for contract 6 (R0) |
+| 2 | voice | the voice envelope (section 6) |
+| 3 | viseme | the viseme body (section 6) |
+| 4–15 | reserved | dropped |
 
 - `send_ms` is the sender's monotonic milliseconds, wrapping at u32.
 - Receivers compute age only as a delta against the smallest observed
   `(arrival − send_ms)` for that peer. That needs no shared clock.
 - The daemon enforces `max_age` in its own send queue, because iroh drops
-  datagrams on buffer overflow, not by age.
-- Never assume an MTU: read `max_datagram_size()`. The guaranteed minimum is
-  about 1.2 KB, and the header plus a quantized pose must fit in it.
+  datagrams on buffer overflow, not by age. Voice has no `send_ms`: its age bound is
+  local (the send queue), and its jitter is NetEq's job from the 48 kHz timestamp.
+- Never assume an MTU: read `max_datagram_size()`. The floor is about 1.2 KB. The
+  largest live record (a quantized pose with a 48-byte name and 200-byte value) is
+  305 B with the header, and the largest voice datagram is 1015 B (`golden.rs`
+  `datagrams_fit_the_floor`).
+- Datagrams are never forwarded. The sender of every kind is the connection's
+  authenticated remote key.
 
-## 6. Voice envelope (R0, reserved)
+## 6. Voice envelope (frozen in R0)
 
-R0 defines datagram kind 2 and the `member/<id>/voice` key. Its fields are
-version, sender binding, incarnation, seq, a 48 kHz timestamp, flags and length.
-Visemes carry the incarnation plus the sample position.
+**Datagram kind 2.** After `ver_kind = 0x12`:
+
+| offset | size | field |
+|---|---|---|
+| 1 | 1 | `voice_ver`: high nibble envelope version = 1, low nibble codec (1 = Opus, 48 kHz, mono; others rejected) |
+| 2 | 4 | `incarnation` u32: random, nonzero, fresh per stream start, never reused by a sender |
+| 6 | 2 | `seq` u16: +1 per packet, wraps |
+| 8 | 4 | `timestamp` u32: 48 kHz sample index of the packet's first sample, wraps |
+| 12 | 1 | `flags`: bit0 talkspurt start, bit1 talkspurt end, bit2 FEC included, bit3 stream start (set on the first five packets of an incarnation); bits 4–7 zero |
+| 13 | 2 | payload length `n`, 1..=1000 |
+| 15 | n | one Opus packet |
+
+- **Sender binding.** There is no sender field. The sender is the authenticated
+  remote key of the connection, which the hello bound to a member of this room at
+  this open generation. A receiver accepts voice only on an established connection
+  from a current member, and only while a local client holds its `voice` lease;
+  otherwise it drops and counts.
+- **Incarnation.** A restarted voice client starts a new incarnation; a device
+  change does not (it keeps the incarnation and the sample clock, advancing
+  `timestamp` over the gap). Receivers keep, per sender, the current incarnation and
+  the last 8 retired ones (`voice::IncarnationFence`):
+  - the current incarnation: accept;
+  - a retired one: drop (a late packet of a dead stream);
+  - anything else: a new stream. Retire the current one, reset jitter-buffer and
+    decoder state, accept.
+  Incarnations are random, so there is no "newer" comparison, and a restart is
+  never mistaken for reordering of the old stream. `seq` and `timestamp` are
+  compared only within one incarnation.
+- **Timestamps** start at any value (R0's sender starts at 0) and advance by the
+  samples each packet covers, including over silence and device gaps, so NetEq sees
+  one continuous clock per incarnation.
+
+**Datagram kind 3, visemes.** After `ver_kind = 0x13`: `viseme_ver u8 = 1,
+incarnation u32 (nonzero, the voice stream described), sample_pos u32 (48 kHz voice
+timestamp at the analysis window's centre), count u8 ≤ 32, weights u8 × count`.
+A receiver aligns visemes to audio by comparing `sample_pos` with the timestamp it
+is playing out for that incarnation (a local playout observation, VOICE.md), and
+drops visemes whose incarnation isn't the sender's current one. R0 defines the
+format; nothing sends it yet.
+
+**`member/<id>/voice`.** Durable, presence-bound, written only by the member's
+daemon from its local voice lease: `ver u8 = 1, flags u8 (bit0 listening, bit1 mic),
+incarnation u32` (the incarnation being sent, 0 if none). Listening means a voice
+client holds the lease and renders received voice; when the lease ends the daemon
+writes `flags = 0`, so friends can see who can hear them.
 
 ## 7. Invite token
 
@@ -371,14 +425,22 @@ recovered or rotated in v1. The UI must say so.
 | member incarnation | u32, persisted counter | one daemon start; the member-scope `term` |
 | daemon incarnation | u64, random per process | in hello and presence |
 | client session | u64, per local API connection | provisional local API |
-| voice stream incarnation | reserved for R0 | — |
+| voice stream incarnation | u32, random nonzero | one voice stream (a voice client start); in the voice envelope, visemes and `member/<id>/voice` |
+| local lease session | u64, per realtime-socket session | provisional local API (VOICE.md) |
 | coordinator epoch | `(generation u32, term u32)` | per claim |
 
 Time:
 - **On the wire:** `*_ms` fields are Unix milliseconds from the signer's wall clock.
   They are informational, except that expiry is compared against the
   *checking* node's wall clock at admission. Datagram `send_ms` is
-  sender-monotonic and is used only as a delta.
+  sender-monotonic and is used only as a delta. The voice `timestamp` is the
+  sender's 48 kHz sample clock, meaningful only within one incarnation.
+- **On one host:** the daemon and its local clients share one clock domain,
+  `mono_us` = CLOCK_MONOTONIC in microseconds. `received_at_mono_us` (stamped at the
+  daemon's datagram receive) and pose `source_mono_us` are in it, so a client
+  subtracts them from its own CLOCK_MONOTONIC directly. A client that sees a stamp
+  in the future or more than 1 s old treats the domains as mismatched, uses its own
+  read time instead and counts it.
 - **In the core:** time is an input, `Now { mono_us: u64, unix_ms: u64 }`.
   `room-core` never reads a clock. Presence expiry, coordinator liveness and grace
   periods use `mono_us` at the *receiver*.

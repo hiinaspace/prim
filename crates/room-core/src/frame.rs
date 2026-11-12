@@ -1,4 +1,4 @@
-//! Peer frames and datagram header (CONTRACTS.md sections 4–5; PROVISIONAL until R0).
+//! Peer frames and datagram header (CONTRACTS.md sections 4–5, frozen in R0).
 
 use crate::ids::{Key, RoomId};
 use crate::wire::{DecodeError, Reader, Writer};
@@ -15,9 +15,16 @@ pub mod caps {
     pub const MESSAGES: u64 = 1 << 1;
     pub const DATAGRAMS: u64 = 1 << 2;
     pub const STREAMS: u64 = 1 << 3;
-    /// Reserved for round R0.
+    /// Accepts voice (kind 2) and viseme (kind 3) datagrams. Whether anyone is
+    /// listening is the `member/<id>/voice` key, not this bit.
     pub const VOICE: u64 = 1 << 8;
+    /// Bits 32..=63 are *required*: a peer that sees a required bit it doesn't know
+    /// rejects the hello with `unsupported`. None are defined in version 1.
+    pub const REQUIRED_MASK: u64 = 0xffff_ffff_0000_0000;
+    /// Required bits this build understands.
+    pub const KNOWN_REQUIRED: u64 = 0;
     pub const R1: u64 = STATE | MESSAGES | DATAGRAMS;
+    pub const R0: u64 = R1 | VOICE;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,6 +39,8 @@ pub enum Reason {
     InviteInvalid = 7,
     Shutdown = 8,
     Leave = 9,
+    /// The hello set a required capability bit this node doesn't implement.
+    Unsupported = 10,
     /// Not on the wire list yet; decoded from any unknown code.
     Other = 0xffff,
 }
@@ -49,6 +58,7 @@ impl Reason {
             7 => InviteInvalid,
             8 => Shutdown,
             9 => Leave,
+            10 => Unsupported,
             _ => Other,
         }
     }
@@ -333,6 +343,26 @@ pub enum Datagram {
         send_ms: u32,
         payload: Vec<u8>,
     },
+    /// Kind 2 (CONTRACTS.md section 6).
+    Voice(crate::voice::VoiceEnvelope),
+    /// Kind 3.
+    Viseme(crate::voice::Viseme),
+}
+
+/// Kind nibble of the first datagram byte, without decoding the body (the daemon's
+/// voice fast path routes on it).
+pub fn datagram_kind(b: &[u8]) -> Option<u8> {
+    match b.first() {
+        Some(vk) if vk >> 4 == DATAGRAM_VERSION => Some(vk & 0xf),
+        _ => None,
+    }
+}
+
+pub mod dgram_kind {
+    pub const LIVE_STATE: u8 = 0;
+    pub const APP: u8 = 1;
+    pub const VOICE: u8 = 2;
+    pub const VISEME: u8 = 3;
 }
 
 impl Datagram {
@@ -353,6 +383,14 @@ impl Datagram {
                     .u16(*seq)
                     .u32(*send_ms)
                     .raw(payload);
+            }
+            Datagram::Voice(e) => {
+                w.u8((DATAGRAM_VERSION << 4) | 2);
+                e.encode_into(&mut w);
+            }
+            Datagram::Viseme(v) => {
+                w.u8((DATAGRAM_VERSION << 4) | 3);
+                v.encode_into(&mut w);
             }
         }
         w.finish()
@@ -376,6 +414,16 @@ impl Datagram {
                     send_ms,
                     payload: r.take(r.remaining())?.to_vec(),
                 })
+            }
+            2 => {
+                let e = crate::voice::VoiceEnvelope::decode_from(&mut r)?;
+                r.end()?;
+                Ok(Datagram::Voice(e))
+            }
+            3 => {
+                let v = crate::voice::Viseme::decode_from(&mut r)?;
+                r.end()?;
+                Ok(Datagram::Viseme(v))
             }
             k => Err(DecodeError::Kind(k)),
         }

@@ -8,6 +8,10 @@ use room_core::grants::GrantSet;
 use room_core::record::{build, Kind, Record};
 use room_core::staterec::{Class, Lifetime, Presence, Scope, StateRecord, Version};
 use room_core::token::InviteToken;
+use room_core::rt::{peer_flags, Pose, Role, RtMsg, RT_PROTO};
+use room_core::voice::{
+    voice_flags, voice_state, Viseme, VoiceEnvelope, VoiceState, CODEC_OPUS_48K_MONO,
+};
 use room_core::wire::hex;
 use room_core::{Identity, RecordId};
 
@@ -246,8 +250,128 @@ fn vectors() -> BTreeMap<String, String> {
         }
         .encode(),
     );
+    // R0: hello advertising voice, voice and viseme datagrams, the voice key value and
+    // the local realtime protocol.
+    let hello_voice = Frame::Hello(Hello {
+        version: 1,
+        caps: caps::R0,
+        room,
+        member: joiner.key(),
+        daemon_incarnation: 0x1122_3344_5566_7788,
+        open_generation: 1,
+        proof: vec![],
+    });
+    put("frame.hello.voice", &hello_voice.encode());
+    let env = voice_env();
+    put("datagram.voice", &Datagram::Voice(env.clone()).encode());
+    put(
+        "datagram.viseme",
+        &Datagram::Viseme(Viseme {
+            incarnation: 0x8badf00d,
+            sample_pos: 0x0001_2c00,
+            weights: vec![0, 64, 255, 12, 0],
+        })
+        .encode(),
+    );
+    put(
+        "voice.state",
+        &VoiceState {
+            flags: voice_state::LISTENING | voice_state::MIC,
+            incarnation: 0x8badf00d,
+        }
+        .encode(),
+    );
+    let pose = Pose {
+        pos: [0.25, 1.6, -0.5],
+        rot: [0.0, 0.382_683_43, 0.0, 0.923_879_5],
+    };
+    for (name, m) in [
+        (
+            "rt.hello",
+            RtMsg::Hello {
+                proto: RT_PROTO,
+                role: Role::Voice,
+                takeover: false,
+                incarnation: 0x8badf00d,
+                flags: voice_state::LISTENING | voice_state::MIC,
+            },
+        ),
+        (
+            "rt.voice_out",
+            RtMsg::VoiceOut {
+                sent_mono_us: 0x0000_0012_3456_789a,
+                env: env.clone(),
+            },
+        ),
+        (
+            "rt.pose_out",
+            RtMsg::PoseOut {
+                source_mono_us: 0x0000_0012_3456_0000,
+                seq: 90,
+                pose,
+            },
+        ),
+        (
+            "rt.welcome",
+            RtMsg::Welcome {
+                proto: RT_PROTO,
+                self_key: joiner.key(),
+                lease_ttl_ms: 2000,
+                session: 3,
+            },
+        ),
+        (
+            "rt.voice_in",
+            RtMsg::VoiceIn {
+                from: member.key(),
+                received_at_mono_us: 0x0000_0012_3456_9999,
+                env,
+            },
+        ),
+        (
+            "rt.listener",
+            RtMsg::Listener {
+                source_mono_us: 0x0000_0012_3456_0000,
+                forwarded_mono_us: 0x0000_0012_3456_0100,
+                seq: 90,
+                pose,
+            },
+        ),
+        (
+            "rt.peer",
+            RtMsg::Peer {
+                key: member.key(),
+                flags: peer_flags::CONNECTED | peer_flags::MIC,
+                incarnation: 0x8badf00d,
+            },
+        ),
+    ] {
+        put(name, &m.encode());
+    }
     v.insert("token".into(), token_text);
     v
+}
+
+fn voice_env() -> VoiceEnvelope {
+    VoiceEnvelope {
+        codec: CODEC_OPUS_48K_MONO,
+        incarnation: 0x8badf00d,
+        seq: 0xffff,
+        timestamp: 0xffff_fc40,
+        flags: voice_flags::STREAM_START | voice_flags::TALKSPURT_START,
+        payload: vec![0xfc, 0xff, 0xfe],
+    }
+}
+
+/// Contract 5: the largest live-state datagram (a pose) and the largest voice datagram
+/// both fit the ~1.2 KB floor.
+#[test]
+fn datagrams_fit_the_floor() {
+    let mut env = voice_env();
+    env.payload = vec![0; room_core::voice::MAX_VOICE_PAYLOAD];
+    assert!(Datagram::Voice(env).encode().len() <= 1200);
+    // Live record: 54 header + 48 name + 2 + 200 value, plus ver_kind.
+    assert!(1 + 54 + 48 + 2 + 200 <= 1200);
 }
 
 #[test]
@@ -305,10 +429,16 @@ fn golden_vectors_decode() {
         let b = unhex(v);
         assert_eq!(Frame::decode(&b).unwrap().encode(), b, "{k}");
     }
-    for k in ["datagram.live", "datagram.app"] {
+    for k in ["datagram.live", "datagram.app", "datagram.voice", "datagram.viseme"] {
         let b = unhex(&want[k]);
         assert_eq!(Datagram::decode(&b).unwrap().encode(), b, "{k}");
     }
+    for (k, v) in want.iter().filter(|(k, _)| k.starts_with("rt.")) {
+        let b = unhex(v);
+        assert_eq!(RtMsg::decode(&b).unwrap().encode(), b, "{k}");
+    }
+    let vs = unhex(&want["voice.state"]);
+    assert_eq!(VoiceState::decode(&vs).unwrap().encode(), vs);
     let t = InviteToken::decode(&want["token"]).unwrap();
     assert_eq!(t.encode(), want["token"]);
     // A durable state record signed for this room doesn't verify in another room.

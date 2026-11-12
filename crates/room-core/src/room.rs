@@ -1679,6 +1679,9 @@ impl Room {
                     );
                 }
             }
+            // Voice and visemes take the driver's realtime fast path and never reach the
+            // core; one that does (a driver without a voice lane) is dropped.
+            Ok(Datagram::Voice(_)) | Ok(Datagram::Viseme(_)) => self.stats.dropped_datagrams += 1,
             Err(_) => self.stats.bad_frames += 1,
         }
     }
