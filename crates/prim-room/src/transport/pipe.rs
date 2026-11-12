@@ -26,6 +26,8 @@ pub(crate) struct Pipe {
     dgram_cap_bytes: usize,
     /// Woken when something is pushed or the pipe closes.
     readable: Notify,
+    /// Woken when a datagram is pushed or the pipe closes (for `recv_datagram`).
+    readable_dgram: Notify,
     /// Woken when a frame is popped or the pipe closes.
     writable: Notify,
     pub dgram_dropped: AtomicU64,
@@ -43,6 +45,7 @@ impl Pipe {
             lane_cap,
             dgram_cap_bytes,
             readable: Notify::new(),
+            readable_dgram: Notify::new(),
             writable: Notify::new(),
             dgram_dropped: AtomicU64::new(0),
         }
@@ -97,6 +100,7 @@ impl Pipe {
             g.dgrams.push_back(bytes);
         }
         self.readable.notify_one();
+        self.readable_dgram.notify_one();
         if dropped {
             DatagramSend::QueuedDroppedOld
         } else {
@@ -155,10 +159,59 @@ impl Pipe {
         }
     }
 
+    /// Next frame by lane priority, ignoring datagrams. Use together with
+    /// `recv_datagram` (never with `recv`) so datagrams don't wait behind a consumer
+    /// that is blocked on frames. Cancel-safe.
+    pub async fn recv_frame(&self) -> Option<(Lane, Vec<u8>)> {
+        loop {
+            let notified = self.readable.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut g = self.inner.lock().unwrap();
+                for i in 0..3 {
+                    if let Some(b) = g.lanes[i].pop_front() {
+                        drop(g);
+                        self.writable.notify_waiters();
+                        self.readable.notify_one();
+                        return Some((lane_from_index(i), b));
+                    }
+                }
+                if g.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Next datagram, ignoring frames. Cancel-safe.
+    pub async fn recv_datagram(&self) -> Option<Vec<u8>> {
+        loop {
+            let notified = self.readable_dgram.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut g = self.inner.lock().unwrap();
+                if let Some(d) = g.dgrams.pop_front() {
+                    g.dgram_bytes -= d.len();
+                    drop(g);
+                    self.readable_dgram.notify_one();
+                    return Some(d);
+                }
+                if g.closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Stop accepting pushes. Items already queued stay deliverable.
     pub fn close(&self) {
         self.inner.lock().unwrap().closed = true;
         self.readable.notify_one();
+        self.readable_dgram.notify_one();
         self.writable.notify_waiters();
     }
 

@@ -131,6 +131,19 @@ pub enum Output {
         client: ClientId,
         event: LocalEvent,
     },
+    /// `conn` became an established connection to the member `peer`; `caps` are the
+    /// hello capability bits the peer advertised. The driver keeps this as the
+    /// membership view of its datagram fast path (voice never enters the core).
+    Established {
+        conn: ConnId,
+        peer: Key,
+        caps: u64,
+    },
+    /// `conn` is no longer an established member connection (closed, rejected,
+    /// replaced). Always follows an `Established` for the same `conn`.
+    Unestablished {
+        conn: ConnId,
+    },
     /// Persistent state changed; the driver should save [`crate::room::Room::persist`] soon.
     PersistDirty,
 }

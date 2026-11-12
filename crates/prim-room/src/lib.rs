@@ -5,5 +5,6 @@
 pub mod daemon;
 pub mod driver;
 pub mod local;
+pub mod rt;
 pub mod state;
 pub mod transport;

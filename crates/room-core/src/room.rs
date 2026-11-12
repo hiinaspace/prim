@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::api::*;
 use crate::frame::{
-    msg_flags, AckStatus, Datagram, Frame, Hello, Reason, Target, PROTOCOL_VERSION,
+    caps, msg_flags, AckStatus, Datagram, Frame, Hello, Reason, Target, PROTOCOL_VERSION,
 };
 use crate::grants::{AdmitError, Epoch, GrantSet, InsertError, Lifecycle};
 use crate::ids::{Entropy, Identity, Key, Now, RecordId, RoomId};
@@ -122,6 +122,8 @@ struct Conn {
     peer: Key,
     outbound: bool,
     state: CState,
+    /// Capability bits from the peer's hello (0 until it arrives).
+    caps: u64,
     deadline_us: u64,
     /// Grant records received during the peer's initial sync, held until its
     /// `RecordsEnd` so membership is judged on the whole set. `None` once the sync
@@ -741,6 +743,7 @@ impl Room {
             );
         }
         if c.state == CState::Established {
+            self.out.push_back(Output::Unestablished { conn });
             if let Some(t) = self.tracks.get_mut(&c.peer) {
                 if !self.by_peer.contains_key(&c.peer) {
                     t.disc_at_us = Some(self.now.mono_us);
@@ -830,6 +833,7 @@ impl Room {
                 peer,
                 outbound,
                 state: CState::Handshake,
+                caps: 0,
                 deadline_us: self.now.mono_us + self.cfg.timing.hello_timeout_ms * 1000,
                 sync: None,
                 early: Vec::new(),
@@ -854,6 +858,9 @@ impl Room {
         if hello.version != PROTOCOL_VERSION {
             return self.reject(conn, Reason::Version);
         }
+        if hello.caps & caps::REQUIRED_MASK & !caps::KNOWN_REQUIRED != 0 {
+            return self.reject(conn, Reason::Unsupported);
+        }
         if hello.room != self.room {
             return self.reject(conn, Reason::WrongRoom);
         }
@@ -875,10 +882,11 @@ impl Room {
         }
         if let Some(c) = self.conns.get_mut(&conn) {
             c.state = new_state;
+            c.caps = hello.caps;
             c.sync = Some(Vec::new());
         }
         if new_state == CState::Established {
-            self.on_established(peer);
+            self.on_established(conn, peer);
         }
         if !adopted.is_empty() {
             // Redemption: flood the two records to everyone else.
@@ -890,7 +898,14 @@ impl Room {
         }
     }
 
-    fn on_established(&mut self, peer: Key) {
+    fn on_established(&mut self, conn: ConnId, peer: Key) {
+        if let Some(c) = self.conns.get(&conn) {
+            self.out.push_back(Output::Established {
+                conn,
+                peer,
+                caps: c.caps,
+            });
+        }
         if let Some(t) = self.tracks.get_mut(&peer) {
             t.disc_at_us = None;
         }
@@ -1115,7 +1130,7 @@ impl Room {
             .is_some_and(|g| g.admit(&peer, self.now.unix_ms).is_ok());
         if ok {
             self.conns.get_mut(&conn).unwrap().state = CState::Established;
-            self.on_established(peer);
+            self.on_established(conn, peer);
             self.send_sync(conn);
             self.replay_early(conn);
         }
@@ -2533,7 +2548,6 @@ impl Room {
 mod tests {
     use super::*;
     use crate::api::Timing;
-    use crate::frame::caps;
     use crate::grants::MAX_RECORDS;
 
     const U0: u64 = 1_800_000_000_000;
@@ -2843,5 +2857,72 @@ mod tests {
             root.store.best(&Slot::of(&rec)).map(|r| r.bytes.clone()),
             Some(rec.bytes.clone())
         );
+    }
+
+    fn connect_with_caps(root: &mut Room, b: Key, conn: ConnId, hello_caps: u64) -> Vec<Output> {
+        root.handle(
+            at(1),
+            Input::Connected {
+                conn,
+                peer: b,
+                outbound: false,
+            },
+        );
+        let hello = Frame::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            caps: hello_caps,
+            room: root.room_id(),
+            member: b,
+            daemon_incarnation: 1,
+            open_generation: 1,
+            proof: Vec::new(),
+        });
+        root.handle(
+            at(2),
+            Input::Frame {
+                conn,
+                lane: Lane::Control,
+                bytes: hello.encode(),
+            },
+        );
+        std::iter::from_fn(|| root.poll_output()).collect()
+    }
+
+    #[test]
+    fn unknown_required_caps_are_rejected_as_unsupported() {
+        let mut root = Room::found(cfg(1), at(0), b"m");
+        let b = key_of(2);
+        root.local_grant(Kind::Member, b, 0).unwrap();
+        let outs = connect_with_caps(&mut root, b, 5, caps::R0 | (1 << 40));
+        assert!(root.connected_peers().is_empty());
+        assert!(outs.iter().any(|o| matches!(
+            o,
+            Output::Close { conn: 5, reason } if *reason == Reason::Unsupported
+        )));
+        assert!(!outs.iter().any(|o| matches!(o, Output::Established { .. })));
+        // Unknown optional bits are ignored.
+        let outs = connect_with_caps(&mut root, b, 6, caps::R0 | (1 << 20));
+        assert_eq!(root.connected_peers(), vec![b]);
+        assert!(outs.contains(&Output::Established {
+            conn: 6,
+            peer: b,
+            caps: caps::R0 | (1 << 20)
+        }));
+    }
+
+    #[test]
+    fn established_and_unestablished_outputs_pair_up() {
+        let mut root = Room::found(cfg(1), at(0), b"m");
+        let b = key_of(2);
+        root.local_grant(Kind::Member, b, 0).unwrap();
+        let outs = connect_with_caps(&mut root, b, 7, caps::R1);
+        assert!(outs.contains(&Output::Established {
+            conn: 7,
+            peer: b,
+            caps: caps::R1
+        }));
+        root.handle(at(3), Input::Disconnected { conn: 7 });
+        let outs: Vec<Output> = std::iter::from_fn(|| root.poll_output()).collect();
+        assert!(outs.contains(&Output::Unestablished { conn: 7 }));
     }
 }

@@ -275,6 +275,14 @@ impl Connection for MemConn {
         self.inbox().recv().await
     }
 
+    async fn recv_frame(&self) -> Option<(Lane, Vec<u8>)> {
+        self.inbox().recv_frame().await
+    }
+
+    async fn recv_datagram(&self) -> Option<Vec<u8>> {
+        self.inbox().recv_datagram().await
+    }
+
     fn close(&self, reason: Reason) {
         self.core.close(Some(self.dialer_side), reason);
     }

@@ -235,6 +235,9 @@ pub struct StatusJson {
     pub durable_bytes_mine: usize,
     /// One entry per live peer connection.
     pub routes: Vec<RouteJson>,
+    /// The realtime voice lane, when the daemon runs one.
+    #[serde(default)]
+    pub rt: Option<Box<crate::rt::RtJson>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -559,6 +562,7 @@ pub fn event_json(msg: &ClientMsg) -> Option<Event> {
                                 .iter()
                                 .map(route_json)
                                 .collect(),
+                            rt: msg.rt.clone(),
                         },
                     }
                 }

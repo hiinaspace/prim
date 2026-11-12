@@ -374,6 +374,7 @@ impl Sim {
                     }
                     self.nodes[i].events.push(event);
                 }
+                Output::Established { .. } | Output::Unestablished { .. } => {}
                 Output::PersistDirty => {
                     let p = self.nodes[i].room.as_ref().unwrap().persist();
                     self.nodes[i].persisted = Some(p);

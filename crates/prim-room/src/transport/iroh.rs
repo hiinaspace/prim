@@ -518,6 +518,14 @@ impl Connection for IrohConn {
         self.inner.inbox.recv().await
     }
 
+    async fn recv_frame(&self) -> Option<(Lane, Vec<u8>)> {
+        self.inner.inbox.recv_frame().await
+    }
+
+    async fn recv_datagram(&self) -> Option<Vec<u8>> {
+        self.inner.inbox.recv_datagram().await
+    }
+
     fn close(&self, reason: Reason) {
         if self.inner.closing.swap(true, Ordering::SeqCst) {
             return;

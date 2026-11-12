@@ -26,8 +26,9 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
+use crate::rt::{RtJson, RtShared, ViewEntry};
 use crate::state;
-use crate::transport::{ConnStats, Connection, Received, Route, Transport};
+use crate::transport::{ConnStats, Connection, Route, Transport};
 
 #[derive(Clone, Debug)]
 pub struct DriverConfig {
@@ -40,6 +41,9 @@ pub struct DriverConfig {
     pub conn_queue_bytes: usize,
     /// Per-client event queue; a client that lets it fill is detached.
     pub client_queue: usize,
+    /// The realtime voice lane's shared half. With it, datagram kinds 2 and 3 bypass the
+    /// core (stamped in the receive task) and the driver publishes the membership view.
+    pub rt: Option<RtShared>,
 }
 
 impl Default for DriverConfig {
@@ -50,6 +54,7 @@ impl Default for DriverConfig {
             datagram_queue: 128,
             conn_queue_bytes: 16 << 20,
             client_queue: 1024,
+            rt: None,
         }
     }
 }
@@ -60,6 +65,8 @@ pub struct ClientMsg {
     pub event: LocalEvent,
     /// Filled for `Reply::Status`: one entry per live connection.
     pub routes: Option<Vec<RouteInfo>>,
+    /// Filled for `Reply::Status` when the realtime lane runs.
+    pub rt: Option<Box<RtJson>>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,16 +181,46 @@ struct DgramItem {
     at: Instant,
     bytes: Vec<u8>,
     max_age_ms: u32,
+    /// 0 for ordinary datagrams; a voice stream's incarnation for voice (session fencing).
+    tag: u32,
 }
 
 #[derive(Default)]
-struct DgramQueue {
+pub(crate) struct DgramQueue {
     q: Mutex<VecDeque<DgramItem>>,
     notify: Notify,
     closed: AtomicBool,
     sent: AtomicU64,
     dropped_age: AtomicU64,
     dropped_queue: AtomicU64,
+}
+
+impl DgramQueue {
+    /// Queue a datagram, dropping the oldest while `cap` is reached.
+    pub(crate) fn push(&self, bytes: Vec<u8>, max_age_ms: u32, tag: u32, cap: usize) {
+        {
+            let mut q = self.q.lock().unwrap();
+            while q.len() >= cap.max(1) {
+                q.pop_front();
+                self.dropped_queue.fetch_add(1, Ordering::Relaxed);
+            }
+            q.push_back(DgramItem {
+                at: Instant::now(),
+                bytes,
+                max_age_ms,
+                tag,
+            });
+        }
+        self.notify.notify_one();
+    }
+
+    /// Drop queued voice datagrams of any stream but `keep` (session fencing).
+    pub(crate) fn purge_tagged_except(&self, keep: u32) {
+        self.q
+            .lock()
+            .unwrap()
+            .retain(|i| i.tag == 0 || i.tag == keep);
+    }
 }
 
 struct ConnEntry<C> {
@@ -385,6 +422,9 @@ impl<T: Transport> Driver<T> {
             }
             Msg::Closed { id } => {
                 if let Some(e) = self.conns.remove(&id) {
+                    if let Some(rt) = &self.cfg.rt {
+                        rt.unestablished(id);
+                    }
                     e.dgrams.closed.store(true, Ordering::Relaxed);
                     e.dgrams.notify.notify_one();
                     for t in e.tasks.iter().chain(e.lane_tasks.iter()) {
@@ -422,6 +462,12 @@ impl<T: Transport> Driver<T> {
         }
         let tasks = vec![
             tokio::spawn(recv_task(conn.clone(), id, self.tx.clone())),
+            tokio::spawn(recv_dgram_task(
+                conn.clone(),
+                id,
+                self.tx.clone(),
+                self.cfg.rt.clone(),
+            )),
             tokio::spawn(dgram_task(conn.clone(), dgrams.clone())),
         ];
         self.conns.insert(
@@ -496,19 +542,7 @@ impl<T: Transport> Driver<T> {
                 if e.closing {
                     return;
                 }
-                {
-                    let mut q = e.dgrams.q.lock().unwrap();
-                    while q.len() >= self.cfg.datagram_queue.max(1) {
-                        q.pop_front();
-                        e.dgrams.dropped_queue.fetch_add(1, Ordering::Relaxed);
-                    }
-                    q.push_back(DgramItem {
-                        at: Instant::now(),
-                        bytes,
-                        max_age_ms,
-                    });
-                }
-                e.dgrams.notify.notify_one();
+                e.dgrams.push(bytes, max_age_ms, 0, self.cfg.datagram_queue);
             }
             Output::Close { conn, reason } => {
                 if let Some(e) = self.conns.get_mut(&conn) {
@@ -516,16 +550,21 @@ impl<T: Transport> Driver<T> {
                 }
             }
             Output::Local { client, event } => {
-                let routes = matches!(
+                let is_status = matches!(
                     &event,
                     LocalEvent::Reply {
                         reply: Reply::Status(_),
                         ..
                     }
-                )
-                .then(|| self.routes());
+                );
+                let routes = is_status.then(|| self.routes());
+                let rt = if is_status {
+                    self.cfg.rt.as_ref().map(|r| Box::new(r.snapshot()))
+                } else {
+                    None
+                };
                 let overflow = match self.clients.get(&client) {
-                    Some(tx) => tx.try_send(ClientMsg { event, routes }).is_err(),
+                    Some(tx) => tx.try_send(ClientMsg { event, routes, rt }).is_err(),
                     None => false,
                 };
                 if overflow {
@@ -540,6 +579,24 @@ impl<T: Transport> Driver<T> {
                         },
                     );
                     // Outputs of that detach are picked up by the enclosing pump loop.
+                }
+            }
+            Output::Established { conn, peer, caps } => {
+                if let (Some(rt), Some(e)) = (&self.cfg.rt, self.conns.get(&conn)) {
+                    rt.established(
+                        conn,
+                        ViewEntry {
+                            peer,
+                            voice: caps & room_core::frame::caps::VOICE != 0,
+                            dgrams: e.dgrams.clone(),
+                            cap: self.cfg.datagram_queue,
+                        },
+                    );
+                }
+            }
+            Output::Unestablished { conn } => {
+                if let Some(rt) = &self.cfg.rt {
+                    rt.unestablished(conn);
                 }
             }
             Output::PersistDirty => {
@@ -646,23 +703,34 @@ async fn lane_task<C: Connection>(
     }
 }
 
+/// Frames for the core. Datagrams have their own task: they must never wait behind a
+/// frame that is blocked on a busy core.
 async fn recv_task<C: Connection>(conn: C, id: ConnId, tx: mpsc::Sender<Msg<C>>) {
-    loop {
-        match conn.recv().await {
-            Some(Received::Frame { lane, bytes }) => {
-                if tx.send(Msg::Frame { id, lane, bytes }).await.is_err() {
-                    return;
-                }
-            }
-            Some(Received::Datagram(bytes)) => {
-                // Datagrams never wait for the core.
-                let _ = tx.try_send(Msg::Datagram { id, bytes });
-            }
-            None => {
-                let _ = tx.send(Msg::Closed { id }).await;
-                return;
-            }
+    while let Some((lane, bytes)) = conn.recv_frame().await {
+        if tx.send(Msg::Frame { id, lane, bytes }).await.is_err() {
+            return;
         }
+    }
+    let _ = tx.send(Msg::Closed { id }).await;
+}
+
+/// Datagrams: voice and visemes go to the realtime lane, stamped right here; the rest go
+/// to the core without waiting for it.
+async fn recv_dgram_task<C: Connection>(
+    conn: C,
+    id: ConnId,
+    tx: mpsc::Sender<Msg<C>>,
+    rt: Option<RtShared>,
+) {
+    while let Some(bytes) = conn.recv_datagram().await {
+        let bytes = match &rt {
+            Some(rt) => match rt.offer(id, bytes) {
+                Some(b) => b,
+                None => continue,
+            },
+            None => bytes,
+        };
+        let _ = tx.try_send(Msg::Datagram { id, bytes });
     }
 }
 
@@ -710,5 +778,33 @@ async fn dgram_task<C: Connection>(conn: C, q: Arc<DgramQueue>) {
             return;
         }
         notified.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_keeps_other_traffic_and_the_current_voice_stream() {
+        let q = DgramQueue::default();
+        q.push(vec![1], 40, 5, 128); // old voice stream
+        q.push(vec![2], 0, 0, 128); // not voice
+        q.push(vec![3], 40, 6, 128); // current voice stream
+        q.push(vec![4], 40, 5, 128);
+        q.purge_tagged_except(6);
+        let kept: Vec<u8> = q.q.lock().unwrap().iter().map(|i| i.bytes[0]).collect();
+        assert_eq!(kept, vec![2, 3]);
+    }
+
+    #[test]
+    fn push_drops_the_oldest_at_capacity() {
+        let q = DgramQueue::default();
+        for i in 0..5u8 {
+            q.push(vec![i], 0, 0, 3);
+        }
+        let kept: Vec<u8> = q.q.lock().unwrap().iter().map(|i| i.bytes[0]).collect();
+        assert_eq!(kept, vec![2, 3, 4]);
+        assert_eq!(q.dropped_queue.load(Ordering::Relaxed), 2);
     }
 }

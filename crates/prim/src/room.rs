@@ -21,6 +21,8 @@ prim room resume <room-hex> [options]
 options:
   --state-dir DIR        state directory (default $XDG_STATE_HOME/prim/rooms/<room-hex>)
   --socket PATH          local API socket (default $XDG_RUNTIME_DIR/prim/room.sock)
+  --rt-socket PATH       realtime voice socket (default: rt.sock beside the local API socket)
+  --rt-clock-offset-us N fault hook: add N to every received_at_mono_us handed to voice
   --relay n0|none|URL    relay mode; repeat URL for several relays (default n0)
   --bind IP:PORT         bind one socket instead of the defaults
   --peer-addr KEY=IP:PORT  extra direct address for a member (repeatable)
@@ -34,6 +36,8 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
         &[
             "state-dir",
             "socket",
+            "rt-socket",
+            "rt-clock-offset-us",
             "relay",
             "bind",
             "peer-addr",
@@ -45,15 +49,25 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
         eprint!("{HELP}");
         return Ok(ExitCode::from(2));
     }
+    let socket = args
+        .value("socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(local::default_socket_path);
+    let rt_socket = args
+        .value("rt-socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| socket.with_file_name("rt.sock"));
     let mut opts = DaemonOpts {
         state_dir: args.value("state-dir").map(PathBuf::from),
-        socket: Some(
-            args.value("socket")
-                .map(PathBuf::from)
-                .unwrap_or_else(local::default_socket_path),
-        ),
+        socket: Some(socket),
+        rt_socket: Some(rt_socket),
+        rt_clock_offset_us: match args.value("rt-clock-offset-us") {
+            Some(v) => v.parse().context("--rt-clock-offset-us")?,
+            None => 0,
+        },
         ..Default::default()
     };
+    let rt_socket_shown = opts.rt_socket.clone();
     let start = match args.positional[0].as_str() {
         "found" => Start::Found {
             meta: args.value("meta").unwrap_or("").as_bytes().to_vec(),
@@ -125,6 +139,9 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
     println!("state-dir {}", daemon.state_dir.display());
     if let Some(s) = &daemon.socket {
         println!("socket {}", s.display());
+    }
+    if let Some(s) = &rt_socket_shown {
+        println!("rt-socket {}", s.display());
     }
     for a in listen.lock().unwrap().iter() {
         println!("listen {a}");

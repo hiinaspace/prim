@@ -147,6 +147,12 @@ pub trait Connection: Clone + Send + Sync + 'static {
     /// Next frame or datagram, lane 0 first. `None` after the connection closed and
     /// everything queued before that was delivered. One consumer at a time.
     fn recv(&self) -> impl Future<Output = Option<Received>> + Send;
+    /// Like `recv` but frames only, lane 0 first. Pair it with `recv_datagram` on a
+    /// second task (never with `recv`) so datagrams don't wait behind a consumer that
+    /// is blocked handing frames to a busy core. `None` after close and drain.
+    fn recv_frame(&self) -> impl Future<Output = Option<(Lane, Vec<u8>)>> + Send;
+    /// Like `recv` but datagrams only. `None` after close and drain.
+    fn recv_datagram(&self) -> impl Future<Output = Option<Vec<u8>>> + Send;
     /// Flush what is queued, then close with `reason`. Returns at once.
     fn close(&self, reason: Reason);
     /// Resolves when the connection is closed.

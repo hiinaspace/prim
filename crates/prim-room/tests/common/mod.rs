@@ -31,6 +31,8 @@ pub struct Node {
     pub client: Client,
     pub state_dir: PathBuf,
     pub socket: PathBuf,
+    /// The realtime voice socket, when started with `start_rt`.
+    pub rt_socket: Option<PathBuf>,
 }
 
 impl Node {
@@ -132,6 +134,15 @@ impl Fleet {
     }
 
     pub async fn start(&self, name: &str, start: Start) -> Node {
+        self.start_opts(name, start, false).await
+    }
+
+    /// Like `start`, with the realtime voice lane on.
+    pub async fn start_rt(&self, name: &str, start: Start) -> Node {
+        self.start_opts(name, start, true).await
+    }
+
+    async fn start_opts(&self, name: &str, start: Start, rt: bool) -> Node {
         let root = self.dir.path().join(name);
         let state_dir = root.join("state");
         let socket = root.join("s.sock");
@@ -141,8 +152,10 @@ impl Fleet {
             socket: Some(socket.clone()),
             timing: fast_timing(),
             persist_debounce: Duration::from_millis(50),
+            rt_socket: rt.then(|| root.join("rt.sock")),
             ..Default::default()
         };
+        let rt_socket = opts.rt_socket.clone();
         let daemon = match &self.kind {
             Kind::Mem(net) => {
                 let net = net.clone();
@@ -180,6 +193,7 @@ impl Fleet {
             client,
             state_dir,
             socket,
+            rt_socket,
         }
     }
 }

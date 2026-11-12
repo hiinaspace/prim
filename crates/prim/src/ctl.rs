@@ -409,4 +409,31 @@ fn print_status(s: &local::StatusJson) {
             r.datagrams_too_large,
         );
     }
+    if let Some(rt) = &s.rt {
+        let holders: Vec<String> = rt
+            .holders
+            .iter()
+            .map(|h| format!("{}:session={},incarnation={}", h.role, h.session, h.incarnation))
+            .collect();
+        println!(
+            "rt holders=[{}] queue_depth={} sent={} datagrams_enqueued={} received={}",
+            holders.join(" "),
+            rt.queue_depth,
+            rt.sent,
+            rt.datagrams_enqueued,
+            rt.received
+        );
+        let d = &rt.drops;
+        println!(
+            "rt drops no_lease={} not_member={} decode={} queue_full={} per_sender={} age={} wrong_incarnation={} channel_full={} bad_role={} viseme={} pose_replaced={} pose_dropped={}",
+            d.no_lease, d.not_member, d.decode, d.queue_full, d.per_sender, d.age,
+            d.wrong_incarnation, d.channel_full, d.bad_role, d.viseme, d.pose_replaced, d.pose_dropped
+        );
+        for (name, h) in [("out_hop", &rt.out_hop), ("in_queue", &rt.in_queue), ("pose_hop", &rt.pose_hop)] {
+            println!(
+                "rt {name} n={} p50_us={} p99_us={} p999_us={} max_us={}",
+                h.count, h.p50_us, h.p99_us, h.p999_us, h.max_us
+            );
+        }
+    }
 }

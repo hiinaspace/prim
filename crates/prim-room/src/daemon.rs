@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::driver::{Driver, DriverConfig, DriverHandle};
 use crate::local;
+use crate::rt::{self, RtLane, RtOptions, RtShared};
 use crate::state::{self, StateDir};
 use crate::transport::Transport;
 
@@ -35,6 +36,10 @@ pub struct DaemonOpts {
     pub socket: Option<PathBuf>,
     pub timing: Timing,
     pub persist_debounce: Duration,
+    /// Realtime voice socket (`rt.sock`). `None` runs without the voice lane.
+    pub rt_socket: Option<PathBuf>,
+    /// Fault hook: added to every `received_at_mono_us` the lane hands out.
+    pub rt_clock_offset_us: i64,
 }
 
 impl Default for DaemonOpts {
@@ -45,6 +50,8 @@ impl Default for DaemonOpts {
             socket: None,
             timing: Timing::default(),
             persist_debounce: Duration::from_millis(500),
+            rt_socket: None,
+            rt_clock_offset_us: 0,
         }
     }
 }
@@ -57,6 +64,9 @@ pub struct Daemon {
     pub state_dir: PathBuf,
     pub socket: Option<PathBuf>,
     pub incarnation: u32,
+    /// The voice lane's shared half (statistics); `None` without `rt_socket`.
+    pub rt: Option<RtShared>,
+    rt_lane: Option<RtLane>,
     task: JoinHandle<()>,
     api_task: Option<JoinHandle<()>>,
 }
@@ -123,7 +133,7 @@ impl Daemon {
             daemon_incarnation: u64::from_le_bytes(daemon_incarnation),
             entropy_seed: seed,
             timing: opts.timing.clone(),
-            caps: caps::R1,
+            caps: caps::R0,
         };
         let stored = dir.read_room().context("room.bin")?;
         let had_stored = stored.is_some();
@@ -155,15 +165,31 @@ impl Daemon {
             // A newly founded room is saved at once: a crash right after must not lose it.
             state::atomic_write(&dir.room_path(), &room.persist().encode(), 0o600)?;
         }
+        let rt_shared = opts
+            .rt_socket
+            .as_ref()
+            .map(|_| RtShared::new(opts.rt_clock_offset_us));
         let (handle, task) = Driver::spawn(
             room,
             transport,
             DriverConfig {
                 persist_path: Some(dir.room_path()),
                 persist_debounce: opts.persist_debounce,
+                rt: rt_shared.clone(),
                 ..Default::default()
             },
         );
+        let rt_lane = match (&opts.rt_socket, &rt_shared) {
+            (Some(path), Some(shared)) => Some(
+                rt::start(
+                    shared.clone(),
+                    handle.clone(),
+                    RtOptions::new(path.clone(), key),
+                )
+                .with_context(|| path.display().to_string())?,
+            ),
+            _ => None,
+        };
         let api_task = match &opts.socket {
             Some(path) => {
                 let listener = local::bind(path)
@@ -180,6 +206,8 @@ impl Daemon {
             state_dir: dir.path.clone(),
             socket: opts.socket,
             incarnation,
+            rt: rt_shared,
+            rt_lane,
             task,
             api_task,
         })
@@ -195,6 +223,9 @@ impl Daemon {
         let _ = (&mut self.task).await;
         if let Some(t) = self.api_task.take() {
             t.abort();
+        }
+        if let Some(mut l) = self.rt_lane.take() {
+            l.stop();
         }
         if let Some(p) = &self.socket {
             let _ = std::fs::remove_file(p);
