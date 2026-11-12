@@ -278,6 +278,7 @@ rejected.
 | 0x11 | snapshot_begin | `count u32` |
 | 0x12 | state | `bytes16 state record` |
 | 0x13 | snapshot_end | — |
+| 0x14 | records_end | — (ends the initial `records` sync; receivers decide membership only after it) |
 | 0x20 | message | `msg_id u64 channel u16 flags u8 target u8 payload bytes32` |
 | 0x21 | message_ack | `msg_id u64 status u8` |
 | 0x30 | goodbye | `reason u16` |

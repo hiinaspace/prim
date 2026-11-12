@@ -94,6 +94,9 @@ pub enum Frame {
         detail: Vec<u8>,
     },
     Records(Vec<Vec<u8>>),
+    /// Ends the initial grant-set sync: every `Records` frame the sender had at
+    /// connection start precedes it.
+    RecordsEnd,
     SnapshotBegin {
         count: u32,
     },
@@ -143,6 +146,9 @@ impl Frame {
                 for r in rs {
                     w.bytes16(r);
                 }
+            }
+            Frame::RecordsEnd => {
+                w.u8(0x14);
             }
             Frame::SnapshotBegin { count } => {
                 w.u8(0x11).u32(*count);
@@ -228,6 +234,7 @@ impl Frame {
                 }
                 Frame::Records(rs)
             }
+            0x14 => Frame::RecordsEnd,
             0x11 => Frame::SnapshotBegin { count: r.u32()? },
             0x12 => Frame::State(r.bytes16(RECORD_CAP, "state")?.to_vec()),
             0x13 => Frame::SnapshotEnd,

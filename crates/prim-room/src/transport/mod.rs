@@ -215,6 +215,18 @@ mod tests {
     }
 
     #[test]
+    fn raw_reader_passes_records_end_through() {
+        use room_core::frame::Frame;
+        let bytes = Frame::RecordsEnd.encode();
+        let mut r = RawFrameReader::default();
+        r.push(&bytes);
+        let got = r.next_frame().unwrap().expect("one frame");
+        assert_eq!(got, bytes);
+        assert_eq!(Frame::decode(&got), Ok(Frame::RecordsEnd));
+        assert_eq!(r.next_frame(), Ok(None));
+    }
+
+    #[test]
     fn raw_reader_rejects_oversize() {
         let mut r = RawFrameReader::default();
         r.push(&((room_core::frame::FRAME_CAP as u32 + 1).to_le_bytes()));

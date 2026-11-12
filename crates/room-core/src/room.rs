@@ -10,7 +10,7 @@ use crate::api::*;
 use crate::frame::{
     msg_flags, AckStatus, Datagram, Frame, Hello, Reason, Target, PROTOCOL_VERSION,
 };
-use crate::grants::{AdmitError, Epoch, GrantSet, Lifecycle};
+use crate::grants::{AdmitError, Epoch, GrantSet, InsertError, Lifecycle};
 use crate::ids::{Entropy, Identity, Key, Now, RecordId, RoomId};
 use crate::record::{build, Kind, Record};
 use crate::state::{is_presence, Insert, PresView, Slot, Store, Vis};
@@ -25,6 +25,11 @@ use crate::wire::{h, DecodeError, Reader, Writer};
 /// Largest accepted message payload (ROOM.md "Messages and datagrams").
 pub const MESSAGE_CAP: usize = 64 * 1024;
 const ORPHAN_CAP: usize = 256;
+/// State records a joiner holds before its grant set arrives.
+const PRE_GRANT_CAP: usize = 4096;
+/// Frames and bytes held per connection before its hello completes.
+const EARLY_FRAMES: usize = 4096;
+const EARLY_BYTES: usize = 4 << 20;
 const RECORDS_PER_FRAME: usize = 64;
 const DIAL_TIMEOUT_US: u64 = 15_000_000;
 
@@ -118,6 +123,14 @@ struct Conn {
     outbound: bool,
     state: CState,
     deadline_us: u64,
+    /// Grant records received during the peer's initial sync, held until its
+    /// `RecordsEnd` so membership is judged on the whole set. `None` once the sync
+    /// ended (later `Records` frames are incremental floods).
+    sync: Option<Vec<Record>>,
+    /// State-lane frames that overtook the hello (the lanes are separate streams):
+    /// held, bounded, and replayed once the connection is established.
+    early: Vec<(Lane, Vec<u8>)>,
+    early_bytes: usize,
 }
 
 #[derive(Default)]
@@ -189,7 +202,16 @@ pub struct Room {
     coord: Option<CoordState>,
     lifecycle_seen: Lifecycle,
     synced: bool,
+    /// Derived from the grant set (and our own grant's expiry); recomputed whenever
+    /// the set changes.
     removed: bool,
+    /// The last `(generation, term)` this node claimed; never claim it twice.
+    last_claim: Option<(u32, u32)>,
+    /// A joiner's `SnapshotEnd` arrived before its grant set did.
+    snapshot_end_early: bool,
+    /// A claim that probed invalid: `(generation, term, grant set size)`, so the probe
+    /// isn't repeated until the set changes.
+    claim_probe_failed: Option<(u32, u32, usize)>,
     left: bool,
     next_msg_id: u64,
     pending_msgs: BTreeMap<(ConnId, u64), (ClientId, Key)>,
@@ -276,6 +298,9 @@ impl Room {
             lifecycle_seen: Lifecycle::Dead,
             synced: false,
             removed: false,
+            last_claim: None,
+            snapshot_end_early: false,
+            claim_probe_failed: None,
             left: false,
             next_msg_id: 1,
             pending_msgs: BTreeMap::new(),
@@ -296,7 +321,9 @@ impl Room {
         r.entropy = entropy;
         let mut g = GrantSet::new(genesis);
         let open = build::open(&r.me, room, 1, r.entropy.bytes(), now.unix_ms);
-        let _ = g.insert(open);
+        if g.insert(open).is_err() {
+            r.stats.rejected_records += 1;
+        }
         r.grants = Some(g);
         r.synced = true;
         r.adopt_initial_view();
@@ -317,8 +344,13 @@ impl Room {
             recs.push(Record::decode(b)?);
         }
         let mut g = GrantSet::new(genesis);
+        let mut full = 0;
         for r in g.insert_all(recs) {
-            r.map_err(|_| DecodeError::Field("record for another room"))?;
+            match r {
+                Ok(_) => {}
+                Err(InsertError::Full) => full += 1,
+                Err(_) => return Err(DecodeError::Field("record for another room")),
+            }
         }
         let mut states = Vec::new();
         for b in &persisted.state {
@@ -329,6 +361,7 @@ impl Room {
             states.push(s);
         }
         let mut room = Room::blank(config, now, persisted.room);
+        room.stats.rejected_records += full;
         room.grants = Some(g);
         for s in states {
             // Orphans (writer no longer a member) are simply not restored.
@@ -425,14 +458,14 @@ impl Room {
         }
         let now = self.now.mono_us;
         let mut best: Option<u64> = None;
-        let mut cand = |t: u64| {
-            if t > now {
-                best = Some(best.map_or(t, |b| b.min(t)));
-            }
-        };
+        // `due` reports a deadline even if it has already passed: work that a
+        // `settle` has not yet acted on. Only deadlines that `settle` always consumes
+        // may use it. `cand` skips past ones (an expired presence or liveness
+        // threshold stays in the past forever and would spin the driver).
+        let mut due = |t: u64| best = Some(best.map_or(t, |b| b.min(t)));
         for c in self.conns.values() {
             if c.state != CState::Established {
-                cand(c.deadline_us);
+                due(c.deadline_us);
             }
         }
         if self.dialing_active() {
@@ -441,11 +474,19 @@ impl Room {
                     continue;
                 }
                 match d.in_flight_until {
-                    Some(t) => cand(t),
-                    None => cand(d.next_us),
+                    Some(t) => due(t),
+                    None => due(d.next_us),
                 }
             }
         }
+        if let Some(t) = self.next_expiry_us() {
+            due(t);
+        }
+        let mut cand = |t: u64| {
+            if t > now {
+                best = Some(best.map_or(t, |b| b.min(t)));
+            }
+        };
         if self.presence_active() {
             cand(self.next_presence_us);
             let t = &self.cfg.timing;
@@ -620,6 +661,13 @@ impl Room {
         }
     }
 
+    /// The next member-scope sequence number, `None` once the counter is exhausted
+    /// (a peer can push it by replaying a record of ours near `u64::MAX`).
+    fn bump_seq(&mut self) -> Option<u64> {
+        self.my_seq = self.my_seq.checked_add(1)?;
+        Some(self.my_seq)
+    }
+
     fn nonce16(&mut self) -> [u8; 16] {
         self.entropy.bytes()
     }
@@ -783,6 +831,9 @@ impl Room {
                 outbound,
                 state: CState::Handshake,
                 deadline_us: self.now.mono_us + self.cfg.timing.hello_timeout_ms * 1000,
+                sync: None,
+                early: Vec::new(),
+                early_bytes: 0,
             },
         );
         self.by_peer.insert(peer, conn);
@@ -824,6 +875,7 @@ impl Room {
         }
         if let Some(c) = self.conns.get_mut(&conn) {
             c.state = new_state;
+            c.sync = Some(Vec::new());
         }
         if new_state == CState::Established {
             self.on_established(peer);
@@ -834,6 +886,7 @@ impl Room {
         }
         if new_state == CState::Established && self.conns.contains_key(&conn) {
             self.send_sync(conn);
+            self.replay_early(conn);
         }
     }
 
@@ -872,16 +925,20 @@ impl Room {
             return Err(Reason::NotMember);
         };
         if g.is_member(&peer) {
-            return match g.admit(&peer, unix) {
-                Ok(()) => Ok((CState::Established, Vec::new())),
-                Err(AdmitError::Closed) => match g.lifecycle() {
-                    Lifecycle::Closed(cg) if hello.open_generation > cg => {
-                        Ok((CState::Probation, Vec::new()))
+            match g.admit(&peer, unix) {
+                Ok(()) => return Ok((CState::Established, Vec::new())),
+                Err(AdmitError::Closed) => {
+                    return match g.lifecycle() {
+                        Lifecycle::Closed(cg) if hello.open_generation > cg => {
+                            Ok((CState::Probation, Vec::new()))
+                        }
+                        _ => Err(Reason::Closed),
                     }
-                    _ => Err(Reason::Closed),
-                },
-                Err(e) => Err(admit_reason(e)),
-            };
+                }
+                // An expired member may come back with a fresh invite proof.
+                Err(AdmitError::Expired) if hello.proof.len() == 2 => {}
+                Err(e) => return Err(admit_reason(e)),
+            }
         }
         if hello.proof.len() != 2 {
             return Err(Reason::NotMember);
@@ -902,6 +959,8 @@ impl Room {
         for chunk in recs.chunks(RECORDS_PER_FRAME) {
             self.send(conn, Lane::Control, Frame::Records(chunk.to_vec()));
         }
+        // The receiver judges membership only once it has the whole set.
+        self.send(conn, Lane::Control, Frame::RecordsEnd);
         let snap: Vec<Vec<u8>> = self
             .store
             .durable_records()
@@ -921,7 +980,7 @@ impl Room {
         self.send(conn, Lane::State, Frame::SnapshotEnd);
     }
 
-    fn on_frame(&mut self, conn: ConnId, _lane: Lane, bytes: Vec<u8>) {
+    fn on_frame(&mut self, conn: ConnId, lane: Lane, bytes: Vec<u8>) {
         let Some(c) = self.conns.get(&conn) else {
             return;
         };
@@ -944,10 +1003,31 @@ impl Room {
             Frame::Records(recs) => match state {
                 CState::Handshake => self.close_conn(conn, Reason::Shutdown),
                 _ => {
-                    self.on_records(conn, recs);
-                    self.promote_probation(conn);
+                    if !self.buffer_sync_records(conn, &recs) {
+                        self.on_records(conn, recs);
+                        self.promote_probation(conn);
+                    }
                 }
             },
+            Frame::RecordsEnd => match state {
+                CState::Handshake => self.close_conn(conn, Reason::Shutdown),
+                _ => {
+                    let buffered = self.conns.get_mut(&conn).and_then(|c| c.sync.take());
+                    if let Some(buf) = buffered {
+                        self.apply_records(conn, buf);
+                        self.promote_probation(conn);
+                    }
+                }
+            },
+            Frame::SnapshotBegin { .. }
+            | Frame::State(_)
+            | Frame::SnapshotEnd
+            | Frame::Message { .. }
+            | Frame::MessageAck { .. }
+                if state != CState::Established =>
+            {
+                self.hold_early(conn, lane, bytes);
+            }
             _ if state != CState::Established => {}
             Frame::SnapshotBegin { .. } => {}
             Frame::State(b) => match StateRecord::decode(self.room, &b) {
@@ -955,11 +1035,11 @@ impl Room {
                 _ => self.stats.bad_state += 1,
             },
             Frame::SnapshotEnd => {
-                if !self.synced && self.grants.is_some() {
-                    self.synced = true;
-                    self.refresh();
-                    let edges = self.subs.reset_all(&self.published);
-                    self.ready(edges);
+                if self.grants.is_some() {
+                    self.finish_snapshot();
+                } else {
+                    // The state lane overtook the records lane: finish once adopted.
+                    self.snapshot_end_early = true;
                 }
             }
             Frame::Message {
@@ -984,6 +1064,41 @@ impl Room {
         }
     }
 
+    fn finish_snapshot(&mut self) {
+        if !self.synced && self.grants.is_some() {
+            self.synced = true;
+            self.refresh();
+            let edges = self.subs.reset_all(&self.published);
+            self.ready(edges);
+        }
+    }
+
+    fn hold_early(&mut self, conn: ConnId, lane: Lane, bytes: Vec<u8>) {
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        if c.early.len() >= EARLY_FRAMES || c.early_bytes + bytes.len() > EARLY_BYTES {
+            self.stats.bad_frames += 1;
+            return;
+        }
+        c.early_bytes += bytes.len();
+        c.early.push((lane, bytes));
+    }
+
+    /// Process what overtook the hello, now that `conn` is established.
+    fn replay_early(&mut self, conn: ConnId) {
+        let early = match self.conns.get_mut(&conn) {
+            Some(c) => {
+                c.early_bytes = 0;
+                std::mem::take(&mut c.early)
+            }
+            None => return,
+        };
+        for (lane, bytes) in early {
+            self.on_frame(conn, lane, bytes);
+        }
+    }
+
     /// A closed node that learned of a reopen from the peer's records: finish the
     /// handshake.
     fn promote_probation(&mut self, conn: ConnId) {
@@ -1002,6 +1117,7 @@ impl Room {
             self.conns.get_mut(&conn).unwrap().state = CState::Established;
             self.on_established(peer);
             self.send_sync(conn);
+            self.replay_early(conn);
         }
     }
 
@@ -1015,14 +1131,46 @@ impl Room {
     // Records (grants, lifecycle, claims)
     // ------------------------------------------------------------------
 
-    fn on_records(&mut self, conn: ConnId, recs: Vec<Vec<u8>>) {
+    fn decode_records(&mut self, recs: &[Vec<u8>]) -> Vec<Record> {
         let mut decoded = Vec::new();
-        for b in &recs {
+        for b in recs {
             match Record::decode(b) {
                 Ok(r) => decoded.push(r),
                 Err(_) => self.stats.bad_records += 1,
             }
         }
+        decoded
+    }
+
+    /// While `conn` is in its initial sync, hold `recs` until `RecordsEnd` and return
+    /// true. Bounded: a peer can't hold more than a full grant set (a bigger sync
+    /// closes the connection).
+    fn buffer_sync_records(&mut self, conn: ConnId, recs: &[Vec<u8>]) -> bool {
+        let syncing = self.conns.get(&conn).is_some_and(|c| c.sync.is_some());
+        if !syncing {
+            return false;
+        }
+        let decoded = self.decode_records(recs);
+        let Some(buf) = self.conns.get_mut(&conn).and_then(|c| c.sync.as_mut()) else {
+            return true;
+        };
+        // +1: the genesis rides in the set but not in `MAX_RECORDS`.
+        if buf.len() + decoded.len() > crate::grants::MAX_RECORDS + 1 {
+            self.stats.rejected_records += 1;
+            self.close_conn(conn, Reason::Shutdown);
+            return true;
+        }
+        buf.extend(decoded);
+        true
+    }
+
+    /// An incremental `records` frame on an established connection.
+    fn on_records(&mut self, conn: ConnId, recs: Vec<Vec<u8>>) {
+        let decoded = self.decode_records(&recs);
+        self.apply_records(conn, decoded);
+    }
+
+    fn apply_records(&mut self, conn: ConnId, decoded: Vec<Record>) {
         if self.grants.is_none() {
             return self.adopt_genesis(conn, decoded);
         }
@@ -1055,7 +1203,11 @@ impl Room {
             .into_iter()
             .filter(|r| r.kind != Kind::Genesis)
             .collect();
-        g.insert_all(rest);
+        for r in g.insert_all(rest) {
+            if r.is_err() {
+                self.stats.rejected_records += 1;
+            }
+        }
         if !g.is_member(&self.my_key) {
             // The peer that sent this did not admit us.
             return self.close_conn(conn, Reason::NotMember);
@@ -1071,6 +1223,9 @@ impl Room {
         self.after_grants_change(Vec::new(), Some(conn));
         for (c, _) in self.established_conns() {
             self.send_sync(c);
+        }
+        if std::mem::take(&mut self.snapshot_end_early) {
+            self.finish_snapshot();
         }
     }
 
@@ -1091,17 +1246,42 @@ impl Room {
     }
 
     /// Insert records we issued ourselves, flood them and reconcile.
-    fn commit_local_records(&mut self, recs: Vec<Record>) {
-        let g = self.grants.as_mut().unwrap();
+    fn commit_local_records(&mut self, recs: Vec<Record>) -> Result<(), ErrorCode> {
+        let Some(g) = self.grants.as_mut() else {
+            return Err(ErrorCode::NoRoom);
+        };
         let res = g.insert_all(recs.clone());
-        let new: Vec<Record> = recs
-            .into_iter()
-            .zip(res)
-            .filter(|(_, r)| matches!(r, Ok(true)))
-            .map(|(r, _)| r)
-            .collect();
+        let mut full = false;
+        let mut new = Vec::new();
+        for (r, res) in recs.into_iter().zip(res) {
+            match res {
+                Ok(true) => new.push(r),
+                Ok(false) => {}
+                Err(InsertError::Full) => full = true,
+                Err(_) => self.stats.rejected_records += 1,
+            }
+        }
+        if full {
+            self.stats.rejected_records += 1;
+        }
         if !new.is_empty() {
             self.after_grants_change(new, None);
+        }
+        if full {
+            Err(ErrorCode::OverBudget)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The grant set with `rec` added, to see whether it would count before it is
+    /// issued.
+    fn probe(&self, rec: &Record) -> Result<GrantSet, ErrorCode> {
+        let mut p = self.grants.as_ref().ok_or(ErrorCode::NoRoom)?.clone();
+        match p.insert(rec.clone()) {
+            Ok(_) => Ok(p),
+            Err(InsertError::Full) => Err(ErrorCode::OverBudget),
+            Err(_) => Err(ErrorCode::Unknown),
         }
     }
 
@@ -1111,9 +1291,13 @@ impl Room {
             return;
         };
         let me = self.my_key;
-        if !g.is_member(&me) {
+        if !g.is_member_at(&me, self.now.unix_ms) {
             return self.on_removed();
         }
+        if self.removed {
+            self.on_readmitted();
+        }
+        let g = self.grants.as_ref().unwrap();
         let life = g.lifecycle();
         let roster: BTreeSet<Key> = g
             .authority()
@@ -1195,6 +1379,16 @@ impl Room {
         self.refresh();
     }
 
+    /// The grant set (re)admits this node after it was marked removed: start again as
+    /// if freshly joined (everyone is newly known, the open is news).
+    fn on_readmitted(&mut self) {
+        self.removed = false;
+        self.roster_known.clear();
+        self.lifecycle_seen = Lifecycle::Dead;
+        self.coord = None;
+        self.next_presence_us = 0;
+    }
+
     fn on_removed(&mut self) {
         if self.removed {
             return;
@@ -1236,6 +1430,14 @@ impl Room {
 
     fn ingest_state(&mut self, rec: StateRecord, from: Option<ConnId>) {
         if self.grants.is_none() {
+            // A joiner's state lane can overtake its records lane: hold what arrives
+            // (bounded) and ingest it once the grant set exists.
+            if rec.class == Class::Durable
+                && self.orphans.len() < PRE_GRANT_CAP
+                && !self.orphans.iter().any(|o| o.bytes == rec.bytes)
+            {
+                self.orphans.push_back(rec);
+            }
             return;
         }
         if rec.writer == self.my_key && rec.scope == Scope::Member && rec.class == Class::Durable {
@@ -1309,11 +1511,13 @@ impl Room {
             }
             return;
         }
-        self.my_seq += 1;
+        let Some(seq) = self.bump_seq() else {
+            return;
+        };
         let version = Version {
             generation,
             term: inc,
-            seq: self.my_seq,
+            seq,
         };
         if let Ok(rec) = StateRecord::build(
             &self.me,
@@ -1397,11 +1601,13 @@ impl Room {
         } else {
             Vec::new()
         };
-        self.my_seq += 1;
+        let Some(seq) = self.bump_seq() else {
+            return;
+        };
         let version = Version {
             generation,
             term: self.cfg.member_incarnation,
-            seq: self.my_seq,
+            seq,
         };
         if let Ok(rec) = StateRecord::build(
             &self.me,
@@ -1621,17 +1827,41 @@ impl Room {
         }
         if let Some((rank, k)) = best {
             if k == self.my_key {
-                let claim = build::claim(
-                    self.signer(),
-                    self.room,
-                    g,
-                    epoch.term + 1,
-                    rank,
-                    self.now.unix_ms,
-                );
-                self.commit_local_records(vec![claim]);
+                self.try_claim(g, epoch, rank);
             }
         }
+    }
+
+    /// Claim the coordinator role for `(g, epoch.term + 1)`. Never twice for one term,
+    /// never past the last term, and only when the claim probes as valid and would
+    /// make this node the coordinator.
+    fn try_claim(&mut self, g: u32, epoch: Epoch, rank: u64) {
+        let Some(term) = epoch.term.checked_add(1) else {
+            return;
+        };
+        if self.last_claim == Some((g, term)) {
+            return;
+        }
+        let size = self.grants.as_ref().map_or(0, |x| x.len());
+        if self.claim_probe_failed == Some((g, term, size)) {
+            return;
+        }
+        let claim = build::claim(self.signer(), self.room, g, term, rank, self.now.unix_ms);
+        let wins = self.probe(&claim).is_ok_and(|p| {
+            p.coordinator().is_some_and(|(e, c)| {
+                e == Epoch {
+                    generation: g,
+                    term,
+                } && c.id == claim.id
+            })
+        });
+        if !wins {
+            self.claim_probe_failed = Some((g, term, size));
+            return;
+        }
+        self.claim_probe_failed = None;
+        self.last_claim = Some((g, term));
+        let _ = self.commit_local_records(vec![claim]);
     }
 
     /// Recompute visibility and push the differences to subscribers.
@@ -1669,7 +1899,50 @@ impl Room {
         self.refresh();
     }
 
+    /// Earliest grant expiry among this node and its connected peers, as a monotonic
+    /// deadline. An expiry already past is due now.
+    fn next_expiry_us(&self) -> Option<u64> {
+        let g = self.grants.as_ref()?;
+        let (now, unix) = (self.now.mono_us, self.now.unix_ms);
+        let mut keys = vec![self.my_key];
+        keys.extend(
+            self.conns
+                .values()
+                .filter(|c| c.state != CState::Handshake)
+                .map(|c| c.peer),
+        );
+        keys.into_iter()
+            .filter_map(|k| g.member_expiry_ms(&k))
+            .map(|t| now.saturating_add(t.saturating_sub(unix).saturating_mul(1000)))
+            .min()
+    }
+
+    /// Re-run admission against the wall clock: grants expire after they were checked.
+    fn check_expiry(&mut self) {
+        let unix = self.now.unix_ms;
+        let Some(g) = self.grants.as_ref() else {
+            return;
+        };
+        if !g.is_member_at(&self.my_key, unix) {
+            return self.on_removed();
+        }
+        let expired: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.state != CState::Handshake)
+            .filter(|(_, c)| g.is_member(&c.peer) && !g.is_member_at(&c.peer, unix))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.close_conn(id, Reason::Revoked);
+        }
+    }
+
     fn timers(&mut self) {
+        self.check_expiry();
+        if self.removed {
+            return;
+        }
         let now = self.now.mono_us;
         let late: Vec<ConnId> = self
             .conns
@@ -1991,11 +2264,11 @@ impl Room {
         }
         let version = match scope {
             Scope::Member => {
-                self.my_seq += 1;
+                let seq = self.bump_seq().ok_or(ErrorCode::Unknown)?;
                 Version {
                     generation,
                     term: self.cfg.member_incarnation,
-                    seq: self.my_seq,
+                    seq,
                 }
             }
             Scope::Room => {
@@ -2008,7 +2281,7 @@ impl Room {
                 }
                 let mine = self.store.max_room_seq(epoch, self.my_key);
                 let s = self.room_seq.entry(epoch).or_insert(0);
-                *s = (*s).max(mine) + 1;
+                *s = (*s).max(mine).checked_add(1).ok_or(ErrorCode::Unknown)?;
                 Version {
                     generation: epoch.generation,
                     term: epoch.term,
@@ -2136,7 +2409,10 @@ impl Room {
             relays,
         );
         let invite = tok.invite.clone();
-        self.commit_local_records(vec![invite]);
+        if !self.probe(&invite)?.is_valid(&invite.id) {
+            return Err(ErrorCode::NotAuthorized);
+        }
+        self.commit_local_records(vec![invite])?;
         Ok(tok.encode())
     }
 
@@ -2163,8 +2439,10 @@ impl Room {
             0,
             cites,
         );
-        self.commit_local_records(vec![rec]);
-        Ok(())
+        if !self.probe(&rec)?.is_valid(&rec.id) {
+            return Err(ErrorCode::NotAuthorized);
+        }
+        self.commit_local_records(vec![rec])
     }
 
     /// `retire = None` issues a revoke; `Some(keep_all)` a retire.
@@ -2208,13 +2486,15 @@ impl Room {
             }
         };
         // Would it take effect? (A keyholder can't remove a keyholder or root.)
-        let mut probe = g.clone();
-        probe.insert(rec.clone()).ok();
-        if !probe.authority().effective_revocations.contains(&rec.id) {
+        if !self
+            .probe(&rec)?
+            .authority()
+            .effective_revocations
+            .contains(&rec.id)
+        {
             return Err(ErrorCode::NotAuthorized);
         }
-        self.commit_local_records(vec![rec]);
-        Ok(())
+        self.commit_local_records(vec![rec])
     }
 
     fn local_close(&mut self) -> Result<(), ErrorCode> {
@@ -2224,8 +2504,10 @@ impl Room {
             return Err(ErrorCode::Closed);
         }
         let rec = build::close(self.signer(), self.room, n, self.now.unix_ms);
-        self.commit_local_records(vec![rec]);
-        Ok(())
+        if self.probe(&rec)?.lifecycle() != Lifecycle::Closed(n) {
+            return Err(ErrorCode::NotAuthorized);
+        }
+        self.commit_local_records(vec![rec])
     }
 
     fn local_reopen(&mut self) -> Result<(), ErrorCode> {
@@ -2234,9 +2516,329 @@ impl Room {
         if !matches!(g.lifecycle(), Lifecycle::Closed(_)) {
             return Err(ErrorCode::Unknown);
         }
+        let next = n.checked_add(1).ok_or(ErrorCode::Unknown)?;
         let nonce = self.nonce16();
-        let rec = build::open(self.signer(), self.room, n + 1, nonce, self.now.unix_ms);
-        self.commit_local_records(vec![rec]);
-        Ok(())
+        let rec = build::open(self.signer(), self.room, next, nonce, self.now.unix_ms);
+        if self.probe(&rec)?.lifecycle() != Lifecycle::Open(next) {
+            return Err(ErrorCode::NotAuthorized);
+        }
+        self.commit_local_records(vec![rec])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::Timing;
+    use crate::frame::caps;
+    use crate::grants::MAX_RECORDS;
+
+    const U0: u64 = 1_800_000_000_000;
+
+    fn cfg(seed: u8) -> Config {
+        Config {
+            identity: Identity::from_secret([seed; 32]),
+            member_incarnation: 1,
+            daemon_incarnation: 1,
+            entropy_seed: [seed; 32],
+            timing: Timing::default(),
+            caps: caps::R1,
+        }
+    }
+
+    fn at(ms: u64) -> Now {
+        Now {
+            mono_us: 1_000_000 + ms * 1000,
+            unix_ms: U0 + ms,
+        }
+    }
+
+    fn key_of(seed: u8) -> Key {
+        Identity::from_secret([seed; 32]).key()
+    }
+
+    /// Copy every record `from` has that `to` lacks.
+    fn sync_records(from: &Room, to: &mut Room) {
+        let recs: Vec<Record> = from.grants().unwrap().records().cloned().collect();
+        to.grants.as_mut().unwrap().insert_all(recs);
+    }
+
+    #[test]
+    fn removed_follows_the_grant_set_both_ways() {
+        let mut root = Room::found(cfg(1), at(0), b"m");
+        let b = key_of(2);
+        root.local_grant(Kind::Member, b, 0).unwrap();
+        let mut joiner = Room::resume(cfg(2), root.persist(), at(1)).unwrap();
+        assert!(!joiner.is_removed());
+
+        root.local_revoke(b, None).unwrap();
+        sync_records(&root, &mut joiner);
+        joiner.reconcile();
+        assert!(joiner.is_removed(), "revoked");
+
+        // A re-admission that cites the revocation heals it.
+        root.local_grant(Kind::Member, b, 0).unwrap();
+        sync_records(&root, &mut joiner);
+        joiner.reconcile();
+        assert!(!joiner.is_removed(), "re-admitted");
+        assert!(joiner.grants().unwrap().is_member(&b));
+        // And it is live again: dials and presence resume.
+        joiner.handle(at(2), Input::Tick);
+        assert!(joiner.poll_timeout().is_some());
+    }
+
+    #[test]
+    fn claim_term_overflow_does_not_claim_or_panic() {
+        let mut r = Room::found(cfg(1), at(0), b"m");
+        let n = r.grants().unwrap().len();
+        r.try_claim(
+            1,
+            Epoch {
+                generation: 1,
+                term: u32::MAX,
+            },
+            0,
+        );
+        assert_eq!(r.grants().unwrap().len(), n);
+        assert_eq!(r.last_claim, None);
+    }
+
+    #[test]
+    fn a_term_is_claimed_once() {
+        let mut r = Room::found(cfg(1), at(0), b"m");
+        let n = r.grants().unwrap().len();
+        let epoch = Epoch {
+            generation: 1,
+            term: 0,
+        };
+        r.try_claim(1, epoch, 0);
+        assert_eq!(r.grants().unwrap().len(), n + 1);
+        assert_eq!(r.coordinator().map(|(e, _)| e.term), Some(1));
+        r.try_claim(1, epoch, 0);
+        r.try_claim(1, epoch, 5);
+        assert_eq!(
+            r.grants().unwrap().len(),
+            n + 1,
+            "no second claim for term 1"
+        );
+    }
+
+    #[test]
+    fn an_invalid_claim_is_probed_and_not_committed() {
+        let root = Room::found(cfg(1), at(0), b"m");
+        // Not a member: its claim would not count.
+        let mut outsider = Room::resume(cfg(9), root.persist(), at(1)).unwrap();
+        let n = outsider.grants().unwrap().len();
+        outsider.try_claim(
+            1,
+            Epoch {
+                generation: 1,
+                term: 0,
+            },
+            0,
+        );
+        assert_eq!(outsider.grants().unwrap().len(), n);
+        assert_eq!(outsider.last_claim, None);
+    }
+
+    #[test]
+    fn grant_that_cannot_take_effect_is_refused() {
+        let root_id = Identity::from_secret([1; 32]);
+        let mut r = Room::found(cfg(1), at(0), b"m");
+        let (k, s) = (key_of(2), key_of(3));
+        r.local_grant(Kind::Keyholder, k, 0).unwrap();
+        r.local_grant(Kind::Member, s, 0).unwrap();
+        // Root and the keyholder revoke the member concurrently: neither cites the
+        // other, so no single cite can re-admit it (they are final in v1).
+        let room = r.room_id();
+        let k_id = Identity::from_secret([2; 32]);
+        let revs = vec![
+            build::revoke(&root_id, room, s, [1; 16], U0, RecordId::ZERO),
+            build::revoke(&k_id, room, s, [2; 16], U0, RecordId::ZERO),
+        ];
+        r.grants.as_mut().unwrap().insert_all(revs);
+        r.reconcile();
+        let n = r.grants().unwrap().len();
+        assert_eq!(
+            r.local_grant(Kind::Member, s, 0),
+            Err(ErrorCode::NotAuthorized)
+        );
+        assert_eq!(r.grants().unwrap().len(), n, "nothing was committed");
+    }
+
+    #[test]
+    fn full_grant_set_refuses_instead_of_panicking() {
+        let root_id = Identity::from_secret([1; 32]);
+        let mut r = Room::found(cfg(1), at(0), b"m");
+        let room = r.room_id();
+        let filler: Vec<Record> = (0..MAX_RECORDS as u32)
+            .map(|i| {
+                let mut subject = [0u8; 32];
+                subject[..4].copy_from_slice(&i.to_le_bytes());
+                let mut nonce = [0u8; 16];
+                nonce[..4].copy_from_slice(&i.to_le_bytes());
+                build::grant(
+                    &root_id,
+                    room,
+                    Kind::Invite,
+                    Key(subject),
+                    nonce,
+                    U0,
+                    0,
+                    1,
+                    RecordId::ZERO,
+                )
+            })
+            .collect();
+        r.grants.as_mut().unwrap().insert_all(filler);
+        assert_eq!(r.grants().unwrap().len(), MAX_RECORDS + 1);
+
+        assert_eq!(
+            r.local_grant(Kind::Member, key_of(5), 0),
+            Err(ErrorCode::OverBudget)
+        );
+        assert_eq!(r.local_invite(0, Vec::new()), Err(ErrorCode::OverBudget));
+        assert_eq!(r.local_close(), Err(ErrorCode::OverBudget));
+        assert_eq!(r.local_revoke(key_of(5), None), Err(ErrorCode::OverBudget));
+
+        // A peer's flood is counted and dropped.
+        let extra = build::grant(
+            &root_id,
+            room,
+            Kind::Inviter,
+            key_of(6),
+            [0xee; 16],
+            U0,
+            0,
+            0,
+            RecordId::ZERO,
+        );
+        let before = r.stats().rejected_records;
+        r.on_records(7, vec![extra.bytes.clone()]);
+        assert_eq!(r.stats().rejected_records, before + 1);
+        assert_eq!(r.grants().unwrap().len(), MAX_RECORDS + 1);
+        // So is our own claim.
+        let claim = build::claim(&root_id, room, 1, 1, 0, U0);
+        assert_eq!(
+            r.commit_local_records(vec![claim]),
+            Err(ErrorCode::OverBudget)
+        );
+    }
+
+    #[test]
+    fn member_expiry_is_a_deadline_and_removes_self() {
+        let mut root = Room::found(cfg(1), at(0), b"m");
+        let b = key_of(2);
+        root.local_grant(Kind::Member, b, U0 + 30_000).unwrap();
+        let mut member = Room::resume(cfg(2), root.persist(), at(1)).unwrap();
+        assert!(!member.is_removed());
+        assert_eq!(member.next_expiry_us(), Some(at(1).mono_us + 29_999_000));
+        // The deadline is a real timer deadline, not only a presence one.
+        member.handle(at(10_000), Input::Tick);
+        assert!(member
+            .poll_timeout()
+            .is_some_and(|t| t <= at(30_000).mono_us));
+
+        // An already-due expiry is reported too (not filtered as "past").
+        member.now = at(40_000);
+        assert!(member
+            .poll_timeout()
+            .is_some_and(|t| t <= member.now.mono_us));
+        member.handle(at(40_000), Input::Tick);
+        assert!(member.is_removed(), "own grant expired");
+        assert_eq!(member.poll_timeout(), None);
+    }
+
+    #[test]
+    fn expired_member_may_redeem_a_fresh_invite() {
+        let mut root = Room::found(cfg(1), at(0), b"m");
+        let b = key_of(2);
+        root.local_grant(Kind::Member, b, U0 + 1_000).unwrap();
+        root.handle(at(5_000), Input::Tick);
+        let room = root.room_id();
+        let hello = |proof: Vec<Vec<u8>>| Hello {
+            version: PROTOCOL_VERSION,
+            caps: caps::R1,
+            room,
+            member: b,
+            daemon_incarnation: 1,
+            open_generation: 1,
+            proof,
+        };
+        assert_eq!(
+            root.check_dialler(b, &hello(Vec::new())).map(|(s, _)| s),
+            Err(Reason::NotMember)
+        );
+        let token = root.local_invite(0, Vec::new()).unwrap();
+        let tok = InviteToken::decode(&token).unwrap();
+        let proof = tok.redeem(b, [9; 16], U0);
+        let proof: Vec<Vec<u8>> = proof.iter().map(|r| r.bytes.clone()).collect();
+        let (state, adopted) = root.check_dialler(b, &hello(proof)).unwrap();
+        assert_eq!(state, CState::Established);
+        assert_eq!(adopted.len(), 2);
+        assert!(root.grants().unwrap().admit(&b, root.now.unix_ms).is_ok());
+    }
+
+    #[test]
+    fn state_frames_that_overtake_the_hello_are_held_and_replayed() {
+        let mut root = Room::found(cfg(1), at(0), b"m");
+        let b = key_of(2);
+        root.local_grant(Kind::Member, b, 0).unwrap();
+        let rec = StateRecord::build(
+            &Identity::from_secret([2; 32]),
+            root.room_id(),
+            Class::Durable,
+            Lifetime::Persistent,
+            Scope::Member,
+            Version {
+                generation: 1,
+                term: 1,
+                seq: 1,
+            },
+            "kv/a",
+            b"early",
+        )
+        .unwrap();
+        let conn = 5;
+        root.handle(
+            at(1),
+            Input::Connected {
+                conn,
+                peer: b,
+                outbound: false,
+            },
+        );
+        // The state lane delivers first, then the hello on the control lane.
+        root.handle(
+            at(2),
+            Input::Frame {
+                conn,
+                lane: Lane::State,
+                bytes: Frame::State(rec.bytes.clone()).encode(),
+            },
+        );
+        assert!(root.store.best(&Slot::of(&rec)).is_none());
+        let hello = Frame::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            caps: caps::R1,
+            room: root.room_id(),
+            member: b,
+            daemon_incarnation: 1,
+            open_generation: 1,
+            proof: Vec::new(),
+        });
+        root.handle(
+            at(3),
+            Input::Frame {
+                conn,
+                lane: Lane::Control,
+                bytes: hello.encode(),
+            },
+        );
+        assert_eq!(root.connected_peers(), vec![b]);
+        assert_eq!(
+            root.store.best(&Slot::of(&rec)).map(|r| r.bytes.clone()),
+            Some(rec.bytes.clone())
+        );
     }
 }

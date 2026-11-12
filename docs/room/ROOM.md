@@ -55,13 +55,22 @@ keeps the one whose *dialler* key is lower and closes the other with
 **Joining.**
 - The joiner has no genesis until the first `records` frame arrives. It checks
   that the genesis hashes to the token's room ID, then builds its `GrantSet`.
-- Until then it buffers or drops other frames. Dropping is fine, because the
-  snapshot follows.
+- Until then it holds state records that arrive early (bounded) and ingests them
+  once the set exists; the state lane can overtake the records lane.
+- A sender ends its initial grant-set sync with `records_end` (0x14). The
+  receiver buffers every `records` frame until then (bounded by the grant-set
+  cap) and judges membership, removal and the open generation only on the whole
+  set, so a grant or ancestor that rides in a later chunk can't read as "not a
+  member". `records` frames after `records_end` are incremental floods and are
+  applied one by one.
 
 **Records** (grants, lifecycle, claims) are flooded:
 - A node that inserts a new record sends it in a `records` frame to every
   other established peer.
 - Duplicates are ignored, and so are records for another room.
+- `removed` is derived from the grant set (and this node's own grant expiry) and
+  recomputed whenever the set changes; a missing link that later arrives
+  re-admits the node.
 - Records that fail to decode are counted and dropped.
 
 **Durable state** is flooded too, but only when the record improved this node's

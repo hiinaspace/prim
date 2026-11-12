@@ -219,6 +219,25 @@ impl GrantSet {
         })
     }
 
+    /// When `k`'s membership lapses (wall-clock ms): the latest expiry among its
+    /// grants, if every grant expires. `None` for root, keyholders, non-members and
+    /// members holding a grant that never expires.
+    pub fn member_expiry_ms(&self, k: &Key) -> Option<u64> {
+        let grants = self.auth.members.get(k)?;
+        if *k == self.root || self.auth.keyholders.contains(k) || grants.is_empty() {
+            return None;
+        }
+        let mut latest = 0;
+        for id in grants {
+            let e = self.records[id].grant()?.expiry_ms;
+            if e == 0 {
+                return None;
+            }
+            latest = latest.max(e);
+        }
+        Some(latest)
+    }
+
     /// Members at `unix_ms`, sorted.
     pub fn roster(&self, unix_ms: u64) -> Vec<Key> {
         self.auth

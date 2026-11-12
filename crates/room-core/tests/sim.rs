@@ -914,3 +914,107 @@ fn same_seed_same_trace() {
     }
     assert_ne!(partition_run(1).trace_hash(), partition_run(2).trace_hash());
 }
+
+// ---------------------------------------------------------------------------
+// h. R1 audit fixes
+// ---------------------------------------------------------------------------
+
+/// The joiner's grant lands in a later `records` chunk (more than 64 records, ordered
+/// by hash). Membership must be judged after the whole sync, not on the first chunk.
+#[test]
+fn h_sync_bracket_judges_membership_after_all_chunks() {
+    let mut late_chunk = 0;
+    for seed in 0..12 {
+        let mut sim = Sim::new(seed, 2);
+        for _ in 0..150 {
+            let r = sim.request(0, |req| LocalCommand::CreateInvite {
+                req,
+                expiry_ms: 0,
+                relays: Vec::new(),
+            });
+            assert!(matches!(r, Reply::Invite { .. }), "seed {seed}");
+        }
+        sim.join(1, 0);
+        sim.run_for(30_000);
+        let me = sim.key(1);
+        let g0 = sim.room(0).grants().unwrap();
+        let pos = g0
+            .records()
+            .position(|r| r.subject() == Some(me) && r.kind == Kind::Member)
+            .expect("grant exists");
+        if pos >= 64 {
+            late_chunk += 1;
+        }
+        let g1 = sim
+            .room(1)
+            .grants()
+            .unwrap_or_else(|| panic!("seed {seed}: joiner never adopted a grant set"));
+        assert!(g1.is_member(&me), "seed {seed}");
+        assert!(!sim.room(1).is_removed(), "seed {seed}: removed");
+        assert_eq!(g1.len(), g0.len(), "seed {seed}");
+        assert!(
+            sim.room(1).connected_peers().contains(&sim.key(0)),
+            "seed {seed}: not connected"
+        );
+    }
+    assert!(
+        late_chunk > 0,
+        "no seed put the joiner's grant past chunk 1"
+    );
+}
+
+/// A member whose grant expires is dropped by its peers (and drops itself) at the
+/// deadline, with no other event to trigger the check.
+#[test]
+fn h_expiry_drops_connected_peers_and_self() {
+    use room_core::frame::caps;
+    use room_core::room::Room;
+    for seed in 0..5 {
+        let node = 3;
+        // Nodes 0..3 form the room; node 3 joins by a plain expiring member grant.
+        let mut sim = Sim::new(seed, 4);
+        for i in 1..3 {
+            sim.join(i, 0);
+            sim.run_for(2_000);
+        }
+        sim.run_for(15_000);
+        let k = sim.key(node);
+        let expiry = 1_800_000_000_000 + sim.now_us / 1000 + 40_000;
+        let r = sim.request(0, |req| LocalCommand::Grant {
+            req,
+            kind: Kind::Member,
+            subject: k,
+            expiry_ms: expiry,
+        });
+        assert_eq!(r, Reply::Ok);
+        let persisted = sim.room(0).persist();
+        let cfg = Config {
+            identity: sim.nodes[node].identity.clone(),
+            member_incarnation: 1,
+            daemon_incarnation: 7,
+            entropy_seed: [seed as u8; 32],
+            timing: Timing::default(),
+            caps: caps::R1,
+        };
+        let now = sim.now_of(node);
+        sim.nodes[node].room = Some(Room::resume(cfg, persisted, now).unwrap());
+        sim.input(node, Input::Tick);
+        sim.run_for(20_000);
+        assert!(
+            sim.room(0).connected_peers().contains(&k),
+            "seed {seed}: never connected before expiry"
+        );
+        assert!(!sim.room(node).is_removed(), "seed {seed}");
+        sim.run_for(40_000);
+        for j in 0..3 {
+            assert!(
+                !sim.room(j).connected_peers().contains(&k),
+                "seed {seed}: n{j} still connected to the expired member"
+            );
+        }
+        assert!(
+            sim.room(node).is_removed(),
+            "seed {seed}: kept its own expired grant"
+        );
+    }
+}

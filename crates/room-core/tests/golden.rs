@@ -199,6 +199,7 @@ fn vectors() -> BTreeMap<String, String> {
         "frame.records",
         &Frame::Records(vec![kh.bytes.clone(), open.bytes.clone()]).encode(),
     );
+    put("frame.records_end", &Frame::RecordsEnd.encode());
     put(
         "frame.snapshot_begin",
         &Frame::SnapshotBegin { count: 2 }.encode(),
