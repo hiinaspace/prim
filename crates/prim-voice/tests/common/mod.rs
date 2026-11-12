@@ -138,7 +138,7 @@ pub fn encode_tone(
 }
 
 pub fn env(p: &VoicePacket, incarnation: u32, sent: u64) -> VoiceEnvelope {
-    prim_voice::send::envelope(p, incarnation, sent).expect("non-empty payload")
+    prim_voice::send::envelope(p, incarnation, sent)
 }
 
 /// Deterministic jitter source (xorshift), microseconds in [0, max).

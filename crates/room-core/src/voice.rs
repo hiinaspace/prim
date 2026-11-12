@@ -14,7 +14,14 @@ pub const CODEC_OPUS_48K_MONO: u8 = 1;
 /// Largest Opus payload carried. 1 + 14 + 1000 bytes stays under the ~1.2 KB floor.
 pub const MAX_VOICE_PAYLOAD: usize = 1000;
 pub const VOICE_HEADER_LEN: usize = 14;
+/// Visemes carried per datagram, `count` 0..=32. Weights are indexed in `VISEME_ORDER`;
+/// a receiver ignores indices >= 15 (`VISEME_COUNT`) and treats `count = 0` as neutral.
 pub const MAX_VISEMES: usize = 32;
+/// The 15 visemes, in weight-index order.
+pub const VISEME_ORDER: [&str; VISEME_COUNT] = [
+    "sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS", "nn", "RR", "aa", "E", "ih", "oh", "ou",
+];
+pub const VISEME_COUNT: usize = 15;
 /// Retired incarnations remembered per sender.
 pub const FENCE_RETIRED: usize = 8;
 
@@ -36,9 +43,13 @@ pub struct VoiceEnvelope {
     pub incarnation: u32,
     /// +1 per packet, wraps.
     pub seq: u16,
-    /// 48 kHz sample index of the packet's first sample, wraps.
+    /// 48 kHz sample index of the packet's first sample, wraps. A packet carries exactly
+    /// one 20 ms Opus frame and the timestamp advances by 960 per frame, counting frames
+    /// the sender suppressed (DTX), so silence keeps pace with real time.
     pub timestamp: u32,
     pub flags: u8,
+    /// One 20 ms Opus frame, 1..=1000 bytes; empty only with `TALKSPURT_END` (the end
+    /// marker, whose `timestamp` is the next frame's).
     pub payload: Vec<u8>,
 }
 
@@ -78,7 +89,8 @@ impl VoiceEnvelope {
             return Err(DecodeError::Field("voice flags"));
         }
         let payload = r.bytes16(MAX_VOICE_PAYLOAD, "voice payload")?;
-        if payload.is_empty() {
+        // A 0-length payload is the end-of-talkspurt marker: legal only with that flag.
+        if payload.is_empty() && flags & voice_flags::TALKSPURT_END == 0 {
             return Err(DecodeError::Field("empty voice payload"));
         }
         Ok(VoiceEnvelope {
@@ -261,13 +273,28 @@ mod tests {
         let mut t = b.clone();
         t.push(0);
         assert!(VoiceEnvelope::decode(&t).is_err(), "trailing byte");
-        assert!(VoiceEnvelope::decode(&env(0).encode()).is_err(), "incarnation 0");
+        assert!(
+            VoiceEnvelope::decode(&env(0).encode()).is_err(),
+            "incarnation 0"
+        );
         let mut f = b.clone();
         f[11] |= 0x80;
         assert!(VoiceEnvelope::decode(&f).is_err(), "reserved flag");
         let mut big = env(1);
         big.payload = vec![0; MAX_VOICE_PAYLOAD + 1];
         assert!(VoiceEnvelope::decode(&big.encode()).is_err());
+    }
+
+    #[test]
+    fn empty_payload_is_legal_only_with_talkspurt_end() {
+        let mut e = env(3);
+        e.payload = vec![];
+        assert!(VoiceEnvelope::decode(&e.encode()).is_err(), "empty, no END");
+        e.flags = voice_flags::TALKSPURT_END;
+        assert_eq!(VoiceEnvelope::decode(&e.encode()).unwrap(), e);
+        // a non-empty END packet is still fine
+        e.payload = vec![1];
+        assert_eq!(VoiceEnvelope::decode(&e.encode()).unwrap(), e);
     }
 
     #[test]

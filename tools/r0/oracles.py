@@ -652,11 +652,24 @@ class Results:
 
 def environment(prim):
     e = {"kernel": platform.release(), "python": platform.python_version()}
-    try:
-        e["commit"] = sh(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], check=False).strip()
-        e["dirty"] = bool(sh(["git", "-C", ROOT, "status", "--porcelain"], check=False).strip())
-    except Exception:
-        pass
+    # The test host's tree is rsynced (no .git), so the commit comes from the sender:
+    # PRIM_R0_COMMIT = `git rev-parse --short HEAD` plus "+dirty" if uncommitted, and
+    # PRIM_R0_DIFF_SHA = sha256 of `git diff HEAD` there (see tools/r0/provenance.sh).
+    # Without them, fall back to asking git in ROOT.
+    env_commit = os.environ.get("PRIM_R0_COMMIT", "").strip()
+    if env_commit:
+        e["commit"] = env_commit.split("+")[0]
+        e["dirty"] = env_commit.endswith("+dirty")
+        e["commit_source"] = "PRIM_R0_COMMIT"
+        if os.environ.get("PRIM_R0_DIFF_SHA"):
+            e["diff_sha256"] = os.environ["PRIM_R0_DIFF_SHA"].strip()
+    else:
+        try:
+            e["commit"] = sh(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], check=False).strip()
+            e["dirty"] = bool(sh(["git", "-C", ROOT, "status", "--porcelain"], check=False).strip())
+            e["commit_source"] = "git (tree on the test host; unreliable if rsynced)"
+        except Exception:
+            pass
     e["pipewire"] = " ".join(sh(["pw-cli", "--version"], check=False).split()[-3:])
     try:
         md = sh(["pw-metadata", "-n", "settings"], check=False)
@@ -1081,7 +1094,7 @@ def scen_faults(args, res, audio):
                            resume_ms is not None and resume_ms <= 300,
                            "tone back to 50%% in %s ms; VoiceIn flow resumed in %s ms" % (None if resume_ms is None else round(resume_ms), None if flow_ms is None else round(flow_ms)))
                 res.oracle(scen, tag + "-stale", "stale inbound dropped by age (counter rises)", age_d + vage_d > 0,
-                           "daemon drops.age +%d (age_media +%d), voice drops.age +%d" % (age_d, rd("age_media"), vage_d))
+                           "daemon drops.age +%d (age_media +%d, stale_incarnation +%d), voice drops.age +%d" % (age_d, rd("age_media"), rd("stale_incarnation"), vage_d))
                 res.oracle(scen, tag + "-burst", "no burst of old audio (NetEq buffer within bound, nothing older than 100 ms)",
                            maxbuf <= pre_buf + 100 and ipcmax <= 100000,
                            "max NetEq buffer after resume %s ms (before: %s); max VoiceIn age at read %.1f ms" % (maxbuf, pre_buf, ipcmax / 1000))
@@ -1138,6 +1151,36 @@ def scen_faults(args, res, audio):
                 maxbuf = max(max((p.get("receiver", {}).get("buffer_ms", 0) for p in [s["peers"].get(cl.T[4].key, {})]), default=0) for tt, s in L.statlog if tt >= tc)
                 res.oracle(scen, tag + "-burst", "no burst of old T5 audio at L", maxbuf <= pre_buf + 100, "max T5 NetEq buffer after resume %s ms (before max %s)" % (maxbuf, pre_buf))
             time.sleep(3)
+
+        # ---- A2. voice-client pause (4e): the daemon keeps sending VoiceIn into the
+        # client's socket for 1.5 s (under the 2 s lease TTL); on resume the backlog must
+        # be dropped by age, not replayed.
+        rt_b = L.rt_status()["rt"]
+        vs_b = L.vstats()
+        pre_buf = max((r.get("buffer_ms", 0) for r in [p.get("receiver", {}) for p in vs_b["peers"].values()]), default=0)
+        amp0 = base_amp(recA, hz3, mono() - 5, mono() - 0.5)
+        ts = mono()
+        L.voice.sig(signal.SIGSTOP)
+        time.sleep(1.5)
+        L.voice.sig(signal.SIGCONT)
+        tc = mono()
+        time.sleep(5)
+        rt_a = L.rt_status()["rt"]
+        vs_a = L.vstats()
+        rdk = lambda k: rt_a["drops"].get(k, 0) - rt_b["drops"].get(k, 0)
+        vdk = lambda k: vs_a["drops"].get(k, 0) - vs_b["drops"].get(k, 0)
+        maxbuf = max(max((p.get("receiver", {}).get("buffer_ms", 0) for p in s["peers"].values()), default=0)
+                     for tt, s in L.statlog if tt >= tc)
+        counted = vdk("age") + rdk("age") + rdk("age_media") + rdk("queue_full") + rdk("per_sender")
+        mm = vs_a.get("clock_mismatch", 0) - vs_b.get("clock_mismatch", 0)
+        ser = amp_series(recA, hz3, tc, mono())
+        rec_t = next((t for t, a in ser if a >= 0.5 * amp0), None) if amp0 else None
+        res.oracle(scen, "4e", "L voice client SIGSTOP 1.5 s: no old audio replayed (NetEq buffer within the 4a-L-burst bound), drops counted, audio resumes",
+                   maxbuf <= pre_buf + 100 and counted > 0 and mm == 0 and rec_t is not None,
+                   "max NetEq buffer after resume %s ms (before: %s); counted drops: voice age +%d, daemon age +%d / age_media +%d / queue_full +%d / per_sender +%d / stale_incarnation +%d; clock_mismatch +%d; tone back to 50%% in %s ms"
+                   % (maxbuf, pre_buf, vdk("age"), rdk("age"), rdk("age_media"), rdk("queue_full"), rdk("per_sender"), rdk("stale_incarnation"), mm,
+                      None if rec_t is None else round((rec_t - tc) * 1000)))
+        time.sleep(2)
 
         # ---- B. voice crash and restart: T3
         hz_old = hz3

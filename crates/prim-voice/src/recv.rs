@@ -17,7 +17,8 @@ use crate::tone;
 
 /// A `VoiceIn` older than this at read is dropped (VOICE.md, queue bounds).
 pub const MAX_AGE_US: u64 = 100_000;
-/// A stamp more than this old means the clock domains don't match.
+/// Before any packet of the session has been judged matched, a stamp more than this old
+/// means the clock domains don't match.
 pub const MISMATCH_AGE_US: u64 = 1_000_000;
 pub const KEEPALIVE_US: u64 = 250_000;
 
@@ -29,12 +30,15 @@ pub fn spawn(sh: Arc<Shared>) -> std::thread::JoinHandle<()> {
 }
 
 fn reader_loop(sh: &Shared) {
+    // Per rt session: set by the first packet judged matched, never cleared. A reconnect
+    // is a new session (a new reader), so the latch starts unset again.
+    let mut matched = false;
     while !sh.is_shutdown() {
         match sh.conn.recv(Duration::from_millis(20)) {
             Ok(Some(b)) => {
                 let read_us = mono_us();
                 match RtMsg::decode(&b) {
-                    Ok(m) => handle(sh, m, read_us),
+                    Ok(m) => handle(sh, m, read_us, &mut matched),
                     Err(_) => sh.stats.bump("drop_rt_decode"),
                 }
             }
@@ -57,13 +61,13 @@ fn reader_loop(sh: &Shared) {
     }
 }
 
-fn handle(sh: &Shared, m: RtMsg, read_us: u64) {
+fn handle(sh: &Shared, m: RtMsg, read_us: u64, matched: &mut bool) {
     match m {
         RtMsg::VoiceIn {
             from,
             received_at_mono_us,
             env,
-        } => voice_in(sh, from, received_at_mono_us, env, read_us),
+        } => voice_in(sh, from, received_at_mono_us, env, read_us, matched),
         RtMsg::Listener {
             source_mono_us,
             forwarded_mono_us,
@@ -100,20 +104,38 @@ pub enum Timing {
     TooOld,
 }
 
+/// `matched` is the session's latch: once any packet has a stamp that is not in the
+/// future and at most 1 s old, the clock domains match for the rest of the session, and
+/// a stamp over 100 ms old is `TooOld`, never a mismatch. Until then a stamp in the
+/// future or over 1 s old is a mismatch and the read time stands in.
 pub fn judge_timing(
     received_at_us: u64,
     read_us: u64,
     policy: ArrivalPolicy,
+    matched: &mut bool,
     mismatch: &mut bool,
 ) -> Timing {
     *mismatch = false;
-    // A stamp in the future or over 1 s old: the domains don't match, use read time.
-    if received_at_us > read_us || read_us - received_at_us > MISMATCH_AGE_US {
-        *mismatch = true;
-        return Timing::Accept {
-            arrival_us: read_us,
-            delay_us: None,
-        };
+    let in_future = received_at_us > read_us;
+    if !in_future && read_us - received_at_us <= MISMATCH_AGE_US {
+        *matched = true;
+    }
+    if in_future || read_us - received_at_us > MISMATCH_AGE_US {
+        if !*matched {
+            *mismatch = true;
+            return Timing::Accept {
+                arrival_us: read_us,
+                delay_us: None,
+            };
+        }
+        if in_future {
+            // Same clock, so this can't happen; treat it as no delay.
+            return Timing::Accept {
+                arrival_us: read_us,
+                delay_us: None,
+            };
+        }
+        return Timing::TooOld;
     }
     let delay = read_us - received_at_us;
     if delay > MAX_AGE_US {
@@ -137,20 +159,32 @@ fn new_receiver(sh: &Shared) -> voice_core::Result<VoiceReceiver> {
     }
 }
 
-fn voice_in(sh: &Shared, from: Key, received_at_us: u64, env: VoiceEnvelope, read_us: u64) {
+fn voice_in(
+    sh: &Shared,
+    from: Key,
+    received_at_us: u64,
+    env: VoiceEnvelope,
+    read_us: u64,
+    matched: &mut bool,
+) {
     sh.stats.bump("voice_in");
     let mut mismatch = false;
-    let (arrival_us, delay_us) =
-        match judge_timing(received_at_us, read_us, sh.cfg.arrival, &mut mismatch) {
-            Timing::Accept {
-                arrival_us,
-                delay_us,
-            } => (arrival_us, delay_us),
-            Timing::TooOld => {
-                sh.stats.bump("drop_age");
-                return;
-            }
-        };
+    let (arrival_us, delay_us) = match judge_timing(
+        received_at_us,
+        read_us,
+        sh.cfg.arrival,
+        matched,
+        &mut mismatch,
+    ) {
+        Timing::Accept {
+            arrival_us,
+            delay_us,
+        } => (arrival_us, delay_us),
+        Timing::TooOld => {
+            sh.stats.bump("drop_age");
+            return;
+        }
+    };
     if mismatch {
         sh.stats.bump("clock_mismatch");
     }
@@ -244,7 +278,14 @@ mod tests {
     #[test]
     fn timing_rules() {
         let mut mm = false;
-        let t = judge_timing(1_000_000, 1_003_000, ArrivalPolicy::Stamp, &mut mm);
+        let mut matched = false;
+        let t = judge_timing(
+            1_000_000,
+            1_003_000,
+            ArrivalPolicy::Stamp,
+            &mut matched,
+            &mut mm,
+        );
         assert_eq!(
             t,
             Timing::Accept {
@@ -253,7 +294,13 @@ mod tests {
             }
         );
         assert!(!mm);
-        let t = judge_timing(1_000_000, 1_003_000, ArrivalPolicy::ReadTime, &mut mm);
+        let t = judge_timing(
+            1_000_000,
+            1_003_000,
+            ArrivalPolicy::ReadTime,
+            &mut matched,
+            &mut mm,
+        );
         assert_eq!(
             t,
             Timing::Accept {
@@ -263,11 +310,25 @@ mod tests {
         );
         // over 100 ms old: dropped
         assert_eq!(
-            judge_timing(1_000_000, 1_150_000, ArrivalPolicy::Stamp, &mut mm),
+            judge_timing(
+                1_000_000,
+                1_150_000,
+                ArrivalPolicy::Stamp,
+                &mut matched,
+                &mut mm
+            ),
             Timing::TooOld
         );
-        // future stamp, and over 1 s old: read time stands in, counted
-        let t = judge_timing(9_000_000, 1_000_000, ArrivalPolicy::Stamp, &mut mm);
+        // future stamp, and over 1 s old, before any packet matched: read time stands
+        // in, counted
+        matched = false;
+        let t = judge_timing(
+            9_000_000,
+            1_000_000,
+            ArrivalPolicy::Stamp,
+            &mut matched,
+            &mut mm,
+        );
         assert_eq!(
             t,
             Timing::Accept {
@@ -276,7 +337,7 @@ mod tests {
             }
         );
         assert!(mm);
-        let t = judge_timing(10, 2_000_000, ArrivalPolicy::Stamp, &mut mm);
+        let t = judge_timing(10, 2_000_000, ArrivalPolicy::Stamp, &mut matched, &mut mm);
         assert_eq!(
             t,
             Timing::Accept {
@@ -285,5 +346,83 @@ mod tests {
             }
         );
         assert!(mm);
+    }
+
+    #[test]
+    fn stall_replay_older_than_a_second_is_dropped_once_matched() {
+        let mut mm = false;
+        let mut matched = false;
+        // Live packets first: the session is matched.
+        let t = judge_timing(
+            1_000_000,
+            1_002_000,
+            ArrivalPolicy::Stamp,
+            &mut matched,
+            &mut mm,
+        );
+        assert!(matches!(t, Timing::Accept { .. }));
+        assert!(matched && !mm);
+        // The client stalled 1.5 s; the socket backlog is read on resume, stamps 1.0-1.5 s old.
+        let resume = 2_500_000;
+        for age in [1_500_000u64, 1_200_000, 1_000_001, 400_000, 101_000] {
+            let t = judge_timing(
+                resume - age,
+                resume,
+                ArrivalPolicy::Stamp,
+                &mut matched,
+                &mut mm,
+            );
+            assert_eq!(t, Timing::TooOld, "age {age}");
+            assert!(!mm, "never a mismatch once matched (age {age})");
+        }
+        let t = judge_timing(
+            resume - 5_000,
+            resume,
+            ArrivalPolicy::Stamp,
+            &mut matched,
+            &mut mm,
+        );
+        assert!(matches!(
+            t,
+            Timing::Accept {
+                delay_us: Some(5_000),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plus_minus_five_second_offset_is_still_a_mismatch_and_accepted() {
+        for (stamp, read) in [(9_000_000u64, 4_000_000u64), (4_000_000, 9_000_000)] {
+            let mut mm = false;
+            let mut matched = false;
+            for _ in 0..3 {
+                let t = judge_timing(stamp, read, ArrivalPolicy::Stamp, &mut matched, &mut mm);
+                assert_eq!(
+                    t,
+                    Timing::Accept {
+                        arrival_us: read,
+                        delay_us: None
+                    }
+                );
+                assert!(mm && !matched);
+            }
+        }
+    }
+
+    #[test]
+    fn matched_latch_ignores_a_single_old_stamp_before_it_is_set() {
+        // First packet already 500 ms old: matched (<= 1 s), but TooOld.
+        let mut mm = false;
+        let mut matched = false;
+        let t = judge_timing(
+            1_000_000,
+            1_500_000,
+            ArrivalPolicy::Stamp,
+            &mut matched,
+            &mut mm,
+        );
+        assert_eq!(t, Timing::TooOld);
+        assert!(matched && !mm);
     }
 }

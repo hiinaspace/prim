@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use room_core::frame::{caps, AckStatus, Datagram, Frame, Hello, Reason, Target};
 use room_core::grants::GrantSet;
 use room_core::record::{build, Kind, Record};
+use room_core::rt::{peer_flags, Pose, Role, RtMsg, RT_PROTO};
 use room_core::staterec::{Class, Lifetime, Presence, Scope, StateRecord, Version};
 use room_core::token::InviteToken;
-use room_core::rt::{peer_flags, Pose, Role, RtMsg, RT_PROTO};
 use room_core::voice::{
     voice_flags, voice_state, Viseme, VoiceEnvelope, VoiceState, CODEC_OPUS_48K_MONO,
 };
@@ -264,6 +264,22 @@ fn vectors() -> BTreeMap<String, String> {
     put("frame.hello.voice", &hello_voice.encode());
     let env = voice_env();
     put("datagram.voice", &Datagram::Voice(env.clone()).encode());
+    // The end-of-talkspurt marker: empty payload, legal only with TALKSPURT_END.
+    let end = VoiceEnvelope {
+        seq: 0x0000,
+        timestamp: 0xffff_fc40u32.wrapping_add(960),
+        flags: voice_flags::TALKSPURT_END,
+        payload: vec![],
+        ..voice_env()
+    };
+    put("datagram.voice.end", &Datagram::Voice(end).encode());
+    // Negative cases: every one of these must be rejected by the strict decoder.
+    for (name, bad) in voice_negatives() {
+        put(
+            &format!("datagram.voice.bad.{name}"),
+            &Datagram::Voice(bad).encode(),
+        );
+    }
     put(
         "datagram.viseme",
         &Datagram::Viseme(Viseme {
@@ -363,15 +379,53 @@ fn voice_env() -> VoiceEnvelope {
     }
 }
 
+fn voice_negatives() -> Vec<(&'static str, VoiceEnvelope)> {
+    let ok = voice_env();
+    vec![
+        (
+            "empty_without_end",
+            VoiceEnvelope {
+                payload: vec![],
+                ..ok.clone()
+            },
+        ),
+        (
+            "reserved_flag_bits",
+            VoiceEnvelope {
+                flags: ok.flags | 0x10,
+                ..ok.clone()
+            },
+        ),
+        (
+            "codec_0",
+            VoiceEnvelope {
+                codec: 0,
+                ..ok.clone()
+            },
+        ),
+        (
+            "payload_1001",
+            VoiceEnvelope {
+                payload: vec![0; 1001],
+                ..ok.clone()
+            },
+        ),
+    ]
+}
+
 /// Contract 5: the largest live-state datagram (a pose) and the largest voice datagram
 /// both fit the ~1.2 KB floor.
 #[test]
 fn datagrams_fit_the_floor() {
     let mut env = voice_env();
     env.payload = vec![0; room_core::voice::MAX_VOICE_PAYLOAD];
-    assert!(Datagram::Voice(env).encode().len() <= 1200);
-    // Live record: 54 header + 48 name + 2 + 200 value, plus ver_kind.
-    assert!(1 + 54 + 48 + 2 + 200 <= 1200);
+    let voice = Datagram::Voice(env).encode();
+    assert_eq!(voice.len(), 1015, "CONTRACTS section 6 states 1015 B");
+    assert!(voice.len() <= 1200);
+    // Live record: 54 header + 48 name + 2 + 200 value, encoded as a real datagram.
+    let live = Datagram::LiveState(vec![0; 54 + 48 + 2 + 200]).encode();
+    assert_eq!(live.len(), 1 + 54 + 48 + 2 + 200);
+    assert!(live.len() <= 1200);
 }
 
 #[test]
@@ -429,9 +483,31 @@ fn golden_vectors_decode() {
         let b = unhex(v);
         assert_eq!(Frame::decode(&b).unwrap().encode(), b, "{k}");
     }
-    for k in ["datagram.live", "datagram.app", "datagram.voice", "datagram.viseme"] {
+    for k in [
+        "datagram.live",
+        "datagram.app",
+        "datagram.voice",
+        "datagram.viseme",
+    ] {
         let b = unhex(&want[k]);
         assert_eq!(Datagram::decode(&b).unwrap().encode(), b, "{k}");
+    }
+    // R0 decoders accept the END marker and reject every negative case.
+    let end = Datagram::decode(&unhex(&want["datagram.voice.end"])).unwrap();
+    match end {
+        Datagram::Voice(e) => {
+            assert!(e.payload.is_empty());
+            assert_eq!(e.flags, voice_flags::TALKSPURT_END);
+        }
+        other => panic!("{other:?}"),
+    }
+    let bad: Vec<_> = want
+        .iter()
+        .filter(|(k, _)| k.starts_with("datagram.voice.bad."))
+        .collect();
+    assert_eq!(bad.len(), 4);
+    for (k, v) in bad {
+        assert!(Datagram::decode(&unhex(v)).is_err(), "{k} accepted");
     }
     for (k, v) in want.iter().filter(|(k, _)| k.starts_with("rt.")) {
         let b = unhex(v);

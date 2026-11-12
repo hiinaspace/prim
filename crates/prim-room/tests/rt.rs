@@ -567,6 +567,34 @@ async fn inbound_queue_is_bounded_in_size_and_age() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_incarnations_are_dropped_before_the_media_clock() {
+    let fleet = Fleet::mem();
+    let (a, _b) = pair(&fleet).await;
+    let shared = a.daemon.rt.clone().unwrap();
+    let _holder = acquire(rt_path(&a), Role::Voice, 5, LM).await;
+    shared.fake_member(2000, Key([7; 32]));
+    let offer = |inc: u32, seq: u16| {
+        let bytes = Datagram::Voice(env(inc, seq, vec![7; 20])).encode();
+        assert!(shared.offer(2000, bytes).is_none());
+    };
+    offer(11, 1);
+    offer(11, 2);
+    offer(12, 1); // a restart: a new stream, 11 is retired
+    offer(11, 3); // a late packet of the dead stream
+    offer(12, 2);
+    eventually!(5, "stale incarnation counted", {
+        shared.snapshot().drops.stale_incarnation == 1
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let d = shared.snapshot();
+    assert_eq!(d.drops.stale_incarnation, 1, "{d:?}");
+    assert_eq!(
+        d.drops.age_media, 0,
+        "the old packet never reached MediaAge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listener_poses_are_forwarded_at_once_and_replaced_not_queued() {
     let fleet = Fleet::mem();
     let (a, _b) = pair(&fleet).await;

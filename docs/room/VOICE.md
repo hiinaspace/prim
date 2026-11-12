@@ -65,7 +65,10 @@ A lease is a role held by one realtime-socket session. Roles: `voice` and
 | daemon → voice client (`VoiceIn`) | 256 messages, ≤ 32 per sender | 100 ms since `received_at` | drop oldest; counted per reason |
 | voice client → network (per peer datagram queue) | the driver's datagram queue (128) | `max_age_ms` 40 | drop; counted |
 | socket buffers | `SO_SNDBUF` 64 KiB each way | — | `EAGAIN` keeps the message in the user-space queue, where the age bound applies |
-| `prim-voice` receive | NetEq's own buffer | `VoiceIn` older than 100 ms at read is dropped | counted |
+| `prim-voice` receive | NetEq's own buffer | `VoiceIn` older than 100 ms at read is dropped; in a matched session (below) this holds for every stamp, so a stall replay is dropped | counted |
+| capture ring (device callback → encoder) | 2 s of samples | **none.** After an encoder or process stall, stale mic audio is encoded with a fresh `sent_mono_us`, so `out_age` can't see it; the far daemon's media-time bound drops it | overwrite oldest in the ring |
+| iroh inbox pipe (transport → daemon, before the arrival stamp) | 64 KiB | **none**, and it sits before the stamp, so the stamp can't see its backlog; only the media-time bound does | `EAGAIN`/drop at the transport |
+| `prim-voice` receive in *mismatch mode* | NetEq's own buffer | **none:** until a packet has been judged matched, the age bound doesn't apply (read time stands in) | counted `clock_mismatch` |
 | listener pose | latest value only | — | overwritten |
 
 **Why the read stamp alone can't bound age.** `received_at` is taken when the daemon
@@ -76,11 +79,17 @@ timestamp doesn't have that problem: per sender (reset when its incarnation chan
 the daemon keeps `offset = arrival - media_time` and `base`, the running minimum
 (`base = min(offset, base + 1000 ppm of the wall time since the last packet)`, which
 absorbs ±500 ppm drift). A packet with `offset - base > IN_MAX_AGE_US` is late and is
-dropped. If a sender has had nothing but late packets for 1 s, `base` jumps to the
-current offset, so a lasting rise in path delay costs about 1 s of audio, not minutes.
+dropped. If a sender has had nothing but late packets for 200 ms, `base` jumps to the
+current offset, so a lasting rise in path delay (a relay fallback, a sender hiccup)
+costs about 200-250 ms of audio, not minutes. A real pause backlog is read within
+milliseconds, so lateness sustained over 200 ms of arrival time is a new path delay,
+not a backlog.
 Timestamps advance in real time through DTX and talkspurt gaps (the encoder counts
-every captured 20 ms frame, sent or not, and a device change skips the gap in whole
-frames), so silence is not mistaken for lateness. The 32-bit timestamp is unwrapped
+every captured 20 ms frame, sent or not, and polls until no full frame is pending, so
+it can't fall behind the capture ring; a device change skips the gap in whole
+frames), so silence is not mistaken for lateness. A capture xrun or process stall that
+loses samples is not covered: the media clock then lags real time for good, and the
+200 ms escape is what absorbs it. The 32-bit timestamp is unwrapped
 by signed distance from the previous one.
 
 All drop counters (`age`, `age_media`, `out_age`, …) are in `prim ctl status` (daemon) and the `prim-voice` stats JSON.
@@ -92,8 +101,13 @@ All drop counters (`age`, `age_media`, `out_age`, …) are in `prim ctl status` 
   receive. `prim-voice` hands that stamp to NetEq as the packet's arrival time, so
   NetEq measures network jitter, not IPC jitter. The IPC delay is
   `read_mono_us − received_at_mono_us`, recorded as a histogram.
-- A stamp in the future or over 1 s old means the domains don't match. `prim-voice`
-  then uses its own read time and counts `clock_mismatch`.
+- Match is decided once per rt session. Until a packet has been judged matched (stamp
+  not in the future and at most 1 s old), a stamp in the future or over 1 s old means
+  the domains don't match: `prim-voice` uses its own read time and counts
+  `clock_mismatch`. Once any packet is matched the session is matched for good (the
+  latch resets on reconnect), and a stamp over 100 ms old is `TooOld`, never a
+  mismatch. So a 1.5 s stall of the voice client drops its backlog instead of
+  replaying it.
 - Sender and receiver sample clocks differ by device drift. NetEq absorbs that by
   time-stretching; the fault matrix runs talkers at ±500 ppm.
 

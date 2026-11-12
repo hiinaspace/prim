@@ -745,6 +745,9 @@ async fn dgram_task<C: Connection>(conn: C, q: Arc<DgramQueue>) {
         tokio::pin!(notified);
         notified.as_mut().enable();
         loop {
+            // Read the space before taking the queue lock: `datagram_space()` goes into
+            // the QUIC connection, and the rt thread's `push` waits on `q.q`.
+            let space = conn.datagram_space();
             let step = {
                 let mut g = q.q.lock().unwrap();
                 match g.front() {
@@ -757,7 +760,7 @@ async fn dgram_task<C: Connection>(conn: C, q: Arc<DgramQueue>) {
                             q.dropped_age.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        if conn.datagram_space() < item.bytes.len() {
+                        if space < item.bytes.len() {
                             Step::Wait
                         } else {
                             Step::Send(g.pop_front().unwrap().bytes)

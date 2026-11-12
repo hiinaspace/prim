@@ -27,7 +27,9 @@ use room_core::frame::{datagram_kind, dgram_kind, Datagram};
 use room_core::ids::Key;
 use room_core::rt::{peer_flags, refuse, revoke, Role, RtMsg, RT_MAX_MESSAGE, RT_PROTO};
 use room_core::staterec::{Class, Lifetime, Scope};
-use room_core::voice::{voice_state, VoiceEnvelope, VoiceState, VOICE_KEY};
+use room_core::voice::{
+    voice_state, Fence, IncarnationFence, VoiceEnvelope, VoiceState, VOICE_KEY,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, Notify};
@@ -310,6 +312,7 @@ impl SeqListener {
 
 /// Log2 histogram in microseconds plus a ring of the latest samples for exact
 /// percentiles over that window.
+#[derive(Clone)]
 struct Hist {
     buckets: [u64; 41],
     ring: Vec<u32>,
@@ -388,6 +391,9 @@ pub struct DropsJson {
     /// media clock says it should (listener-side pause; see `media_age`).
     #[serde(default)]
     pub age_media: u64,
+    /// Dropped at the daemon's per-sender incarnation fence: a retired stream's packet.
+    #[serde(default)]
+    pub stale_incarnation: u64,
     /// Dropped from the voice client: sent over `OUT_MAX_AGE_MS` before the daemon read it.
     #[serde(default)]
     pub out_age: u64,
@@ -442,6 +448,7 @@ struct Counters {
     per_sender: AtomicU64,
     age: AtomicU64,
     age_media: AtomicU64,
+    stale_incarnation: AtomicU64,
     out_age: AtomicU64,
     wrong_incarnation: AtomicU64,
     channel_full: AtomicU64,
@@ -583,6 +590,7 @@ impl RtShared {
                 per_sender: g(&c.per_sender),
                 age: g(&c.age),
                 age_media: g(&c.age_media),
+                stale_incarnation: g(&c.stale_incarnation),
                 out_age: g(&c.out_age),
                 wrong_incarnation: g(&c.wrong_incarnation),
                 channel_full: g(&c.channel_full),
@@ -591,9 +599,11 @@ impl RtShared {
                 pose_replaced: g(&c.pose_replaced),
                 pose_dropped: g(&c.pose_dropped),
             },
-            out_hop: s.out_hop.lock().unwrap().json(),
-            in_queue: s.in_queue.lock().unwrap().json(),
-            pose_hop: s.pose_hop.lock().unwrap().json(),
+            // Copy under the lock (a memcpy), sort outside it: the rt thread takes these
+            // per packet, and a sort of the whole reservoir would stall it.
+            out_hop: s.out_hop.lock().unwrap().clone().json(),
+            in_queue: s.in_queue.lock().unwrap().clone().json(),
+            pose_hop: s.pose_hop.lock().unwrap().clone().json(),
         }
     }
 }
@@ -700,7 +710,14 @@ struct Core {
     me: u64,
     next_req: u64,
     last_written: Option<VoiceState>,
+    /// The voice-key value the lane last tried to write, for retry after a refusal or
+    /// a room reset.
+    want_voice: Option<VoiceState>,
+    /// The request id of that write.
+    voice_req: Option<u64>,
     media_age: HashMap<Key, MediaAge>,
+    /// Per-sender incarnation fence, ahead of `media_age`.
+    fences: HashMap<Key, IncarnationFence>,
 }
 
 type CoreRef = Rc<RefCell<Core>>;
@@ -742,7 +759,10 @@ async fn lane_main(
         me,
         next_req: 2,
         last_written: None,
+        want_voice: None,
+        voice_req: None,
         media_age: HashMap::new(),
+        fences: HashMap::new(),
     }));
     tokio::task::spawn_local(client_events(core.clone(), events));
     core.borrow_mut().refresh_peers();
@@ -795,9 +815,16 @@ async fn client_events(core: CoreRef, mut events: mpsc::Receiver<crate::driver::
                 }
             },
             LocalEvent::Reply {
+                req,
                 reply: room_core::api::Reply::Error(e),
-                ..
-            } => tracing::debug!("rt lane write refused: {e:?}"),
+            } => {
+                tracing::debug!("rt lane write refused: {e:?}");
+                // Forget the dedup so the next view or room change retries the write.
+                let mut c = core.borrow_mut();
+                if c.voice_req == Some(req) {
+                    c.last_written = None;
+                }
+            }
             _ => {}
         }
     }
@@ -817,6 +844,10 @@ impl Core {
                 for p in self.peers.values_mut() {
                     p.vstate = None;
                 }
+                // The room closed or reopened: the presence-bound key may be gone or
+                // stamped with the old generation. Write it again.
+                self.last_written = None;
+                self.retry_voice_key();
             }
             Update::Value { writer, value, .. } => {
                 if writer == *self_key {
@@ -846,6 +877,7 @@ impl Core {
     /// Recompute who is connected (from the driver's view), then queue a `Peer` for every
     /// member whose flags changed since the voice holder last heard of it.
     fn refresh_peers(&mut self) {
+        self.retry_voice_key();
         {
             let view = self.shared.view.read().unwrap();
             for p in self.peers.values_mut() {
@@ -897,14 +929,25 @@ impl Core {
         *self.shared.holders.lock().unwrap() = h;
     }
 
+    /// Write the wanted voice key again if the last write was refused or the room reset.
+    fn retry_voice_key(&mut self) {
+        if self.last_written.is_none() {
+            if let Some(w) = self.want_voice {
+                self.write_voice_key(w);
+            }
+        }
+    }
+
     /// Write `member/<me>/voice` from the voice lease (`None` = lease ended).
     fn write_voice_key(&mut self, state: VoiceState) {
+        self.want_voice = Some(state);
         if self.last_written == Some(state) {
             return;
         }
         self.last_written = Some(state);
         let req = self.next_req;
         self.next_req += 1;
+        self.voice_req = Some(req);
         self.driver.local(
             self.me,
             LocalCommand::Write {
@@ -1024,6 +1067,18 @@ impl Core {
             bump(&c.no_lease);
             return;
         };
+        // Fence by incarnation first, so a late packet of a retired stream can't reset
+        // the media-time state of the current one.
+        match self.fences.entry(peer).or_default().judge(env.incarnation) {
+            Fence::Stale => {
+                bump(&c.stale_incarnation);
+                return;
+            }
+            Fence::NewStream { .. } => {
+                self.media_age.remove(&peer);
+            }
+            Fence::Current => {}
+        }
         // Bound by media time: the read stamp alone can't see a backlog released all at
         // once after this daemon was stopped.
         let verdict = self
@@ -1117,6 +1172,10 @@ impl Core {
             return;
         }
         if flags & !(voice_state::LISTENING | voice_state::MIC) != 0 {
+            bump(&self.shared.counters.decode);
+            return;
+        }
+        if flags & voice_state::MIC != 0 && incarnation == 0 {
             bump(&self.shared.counters.decode);
             return;
         }

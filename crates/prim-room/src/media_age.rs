@@ -13,8 +13,10 @@
 /// way) with margin, per wall time since the sender's last packet.
 const CREEP_PPM: i64 = 1000;
 /// A sender with nothing but lateness drops for this long gets `base` reset: a lasting
-/// rise in path delay costs this much audio, not minutes.
-const ESCAPE_US: u64 = 1_000_000;
+/// rise in path delay costs this much audio, not minutes. A real pause backlog is read
+/// within milliseconds, so lateness sustained over 200 ms of arrival time is a new path
+/// delay, not a backlog.
+const ESCAPE_US: u64 = 200_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -162,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn permanent_step_recovers_within_about_a_second() {
+    fn permanent_step_recovers_within_about_200_ms() {
         let mut m = MediaAge::new(MAX);
         let mut t = 1_000_000u64;
         let mut i = 0u64;
@@ -182,7 +184,7 @@ mod tests {
             t += FRAME;
         }
         let f = first_kept.expect("recovers");
-        assert!((900_000..=1_100_000).contains(&f), "recovered after {f} us");
+        assert!((200_000..=250_000).contains(&f), "recovered after {f} us");
         // and stays recovered
         assert_eq!(m.check(t, 1, ts_of(i * FRAME)), Verdict::Keep);
     }

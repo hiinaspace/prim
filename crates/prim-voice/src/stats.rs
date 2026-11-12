@@ -94,7 +94,6 @@ pub fn snapshot(sh: &Shared) -> Value {
         "sent": {
             "packets": c("sent_packets"),
             "bytes": c("sent_bytes"),
-            "end_markers_not_sent": c("end_markers_not_sent"),
             "keepalives": c("keepalives"),
             "device_changes": c("device_changes"),
         },

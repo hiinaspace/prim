@@ -73,6 +73,15 @@ impl RtConn {
             {
                 return Err(io::Error::last_os_error());
             }
+            // The client-to-daemon bound is a documented 64 KiB, not the system default.
+            let buf: libc::c_int = 64 * 1024;
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
             Ok(RtConn { fd })
         }
     }

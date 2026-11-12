@@ -339,10 +339,10 @@ Decoders are strict (section 0); an unknown kind or version is dropped and count
 | 1 | 1 | `voice_ver`: high nibble envelope version = 1, low nibble codec (1 = Opus, 48 kHz, mono; others rejected) |
 | 2 | 4 | `incarnation` u32: random, nonzero, fresh per stream start, never reused by a sender |
 | 6 | 2 | `seq` u16: +1 per packet, wraps |
-| 8 | 4 | `timestamp` u32: 48 kHz sample index of the packet's first sample, wraps |
+| 8 | 4 | `timestamp` u32: 48 kHz sample index of the packet's first sample, wraps; advances by 960 per 20 ms frame, counting frames the sender suppressed (DTX) |
 | 12 | 1 | `flags`: bit0 talkspurt start, bit1 talkspurt end, bit2 FEC included, bit3 stream start (set on the first five packets of an incarnation); bits 4–7 zero |
-| 13 | 2 | payload length `n`, 1..=1000 |
-| 15 | n | one Opus packet |
+| 13 | 2 | payload length `n`, 1..=1000; 0 is legal **only** when `flags` has bit1 (talkspurt end) |
+| 15 | n | exactly one 20 ms Opus frame (codec 1); empty for an end marker |
 
 - **Sender binding.** There is no sender field. The sender is the authenticated
   remote key of the connection, which the hello bound to a member of this room at
@@ -360,13 +360,31 @@ Decoders are strict (section 0); an unknown kind or version is dropped and count
   Incarnations are random, so there is no "newer" comparison, and a restart is
   never mistaken for reordering of the old stream. `seq` and `timestamp` are
   compared only within one incarnation.
+- **Frame size.** Codec 1 carries exactly one 20 ms Opus frame per packet, so
+  `timestamp` advances by 960 per frame, counting frames the sender suppressed with
+  DTX. A receiver may assume 20 ms and 960 samples; a sender of any other duration
+  needs a new codec value (see Extension rule).
+- **Talkspurt end.** A sender ends a talkspurt with a packet whose `flags` has
+  `TALKSPURT_END`; its payload may be empty (`n = 0`), and then it is the only kind of
+  packet allowed to be. It consumes a `seq` like any other packet and its `timestamp`
+  is that of the next (suppressed) frame. The strict decoder rejects `n = 0` without
+  the flag, reserved flag bits (4-7), codec 0 or any other unknown codec, version
+  other than 1, and `n > 1000` (golden vectors `datagram.voice.bad.*`).
+- **Extension rule.** An R0 decoder rejects an unknown envelope version, codec or
+  flag bit and drops the datagram. So a new envelope version or codec is sent only to
+  peers that advertise an *optional* caps bit for it (the hello's caps; never a
+  required one, which would lock R0 peers out of the whole room). Senders keep
+  sending codec 1 / version 1 to the rest.
 - **Timestamps** start at any value (R0's sender starts at 0) and advance by the
   samples each packet covers, including over silence and device gaps, so NetEq sees
   one continuous clock per incarnation.
 
 **Datagram kind 3, visemes.** After `ver_kind = 0x13`: `viseme_ver u8 = 1,
 incarnation u32 (nonzero, the voice stream described), sample_pos u32 (48 kHz voice
-timestamp at the analysis window's centre), count u8 ≤ 32, weights u8 × count`.
+timestamp at the analysis window's centre), count u8 0..=32, weights u8 × count`.
+`weights[i]` is the weight (0..=255) of viseme `i` in this order: `sil PP FF TH DD kk CH SS
+nn RR aa E ih oh ou` (15 visemes, `room_core::voice::VISEME_ORDER`). A receiver ignores
+indices ≥ 15 and treats `count = 0` as neutral (all weights 0).
 A receiver aligns visemes to audio by comparing `sample_pos` with the timestamp it
 is playing out for that incarnation (a local playout observation, VOICE.md), and
 drops visemes whose incarnation isn't the sender's current one. R0 defines the
