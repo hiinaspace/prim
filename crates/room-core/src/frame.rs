@@ -297,7 +297,7 @@ impl FrameReader {
         self.buf.extend_from_slice(data);
     }
     /// Next complete frame, `Ok(None)` if more bytes are needed.
-    pub fn next(&mut self) -> Result<Option<Frame>, DecodeError> {
+    pub fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
         if self.buf.len() < 4 {
             return Ok(None);
         }

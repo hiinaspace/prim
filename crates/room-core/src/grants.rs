@@ -144,6 +144,37 @@ impl GrantSet {
         Ok(true)
     }
 
+    /// Add several records and recompute once. One result per input, in order.
+    pub fn insert_all(
+        &mut self,
+        recs: impl IntoIterator<Item = Record>,
+    ) -> Vec<Result<bool, InsertError>> {
+        let mut changed = false;
+        let mut out = Vec::new();
+        for rec in recs {
+            if rec.kind == Kind::Genesis {
+                out.push(if rec.id == self.genesis.id {
+                    Ok(false)
+                } else {
+                    Err(InsertError::SecondGenesis)
+                });
+            } else if rec.room != self.room {
+                out.push(Err(InsertError::WrongRoom));
+            } else if let std::collections::btree_map::Entry::Vacant(e) = self.records.entry(rec.id)
+            {
+                e.insert(rec);
+                changed = true;
+                out.push(Ok(true));
+            } else {
+                out.push(Ok(false));
+            }
+        }
+        if changed {
+            self.recompute();
+        }
+        out
+    }
+
     pub fn is_valid(&self, id: &RecordId) -> bool {
         self.auth.valid.contains(id)
     }
@@ -406,6 +437,34 @@ impl GrantSet {
         // Stage-1 records masked by another stage-1 record don't need removal: a masked
         // self-revocation only ever concerns a subject that is revoked anyway.
         let masked = |g: &Record| self.masked_by(effective.iter().copied(), g);
+        // A retire lists records its subject issued that stay valid even though the
+        // subject no longer holds the authority that issued them.
+        // Only authority the subject really held is preserved: a root-issued keyholder
+        // grant (or, for invites, a keyholder-issued inviter grant) that no *revoke*
+        // masks. Without this, any member could sign grants and self-retire with them
+        // in `kept`.
+        let revoked = |g: &Record| {
+            effective
+                .iter()
+                .any(|x| x.kind == Kind::Revoke && self.masks(x, g))
+        };
+        let held = |k: Key, kind: Kind, issuer_ok: &dyn Fn(Key) -> bool| {
+            recs.iter().any(|r| {
+                r.kind == kind && r.subject() == Some(k) && issuer_ok(r.issuer) && !revoked(r)
+            })
+        };
+        let kept_ok = |g: &Record| {
+            let k = g.issuer;
+            let listed = effective.iter().any(|x| {
+                x.kind == Kind::Retire
+                    && x.subject() == Some(k)
+                    && x.revocation().unwrap().kept.binary_search(&g.id).is_ok()
+            });
+            listed
+                && (held(k, Kind::Keyholder, &|i| i == root)
+                    || (g.kind == Kind::Invite
+                        && held(k, Kind::Inviter, &|i| keyholders.contains(&i))))
+        };
 
         let mut valid: BTreeSet<RecordId> = BTreeSet::from([self.genesis.id]);
         valid.extend(effective.iter().map(|x| x.id));
@@ -421,7 +480,7 @@ impl GrantSet {
         // 4. Inviters (issued by keyholders only: non-transitive).
         let mut inviters = BTreeSet::new();
         for g in recs.iter().filter(|r| r.kind == Kind::Inviter) {
-            if keyholders.contains(&g.issuer) && !masked(g) {
+            if (keyholders.contains(&g.issuer) || kept_ok(g)) && !masked(g) {
                 inviters.insert(g.subject().unwrap());
                 valid.insert(g.id);
             }
@@ -430,7 +489,9 @@ impl GrantSet {
         // 5. Invites.
         let mut invites: BTreeMap<Key, Vec<RecordId>> = BTreeMap::new();
         for g in recs.iter().filter(|r| r.kind == Kind::Invite) {
-            if (keyholders.contains(&g.issuer) || inviters.contains(&g.issuer)) && !masked(g) {
+            if (keyholders.contains(&g.issuer) || inviters.contains(&g.issuer) || kept_ok(g))
+                && !masked(g)
+            {
                 invites.entry(g.subject().unwrap()).or_default().push(g.id);
                 valid.insert(g.id);
             }
@@ -450,6 +511,7 @@ impl GrantSet {
             keyholders.iter().map(|k| (*k, Vec::new())).collect();
         for g in recs.iter().filter(|r| r.kind == Kind::Member) {
             let issuer_ok = keyholders.contains(&g.issuer)
+                || kept_ok(g)
                 || (invites.contains_key(&g.issuer) && !equivocated.contains(&g.issuer));
             if issuer_ok && !masked(g) {
                 members.entry(g.subject().unwrap()).or_default().push(g.id);
@@ -462,7 +524,7 @@ impl GrantSet {
         let mut max_close = 0u32;
         for r in recs.iter().copied() {
             if !matches!(r.kind, Kind::Open | Kind::Close)
-                || !keyholders.contains(&r.issuer)
+                || !(keyholders.contains(&r.issuer) || kept_ok(r))
                 || masked(r)
             {
                 continue;

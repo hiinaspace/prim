@@ -121,6 +121,11 @@ revocation covers `G` (below) and `G.cites_revoke` does not **cover** `X`:
 - A **retire** covers keyholder and inviter grants whose subject is `K`, and
   records issued by `K` that are not listed in `kept`. Members `K` admitted stay
   if they are kept. `K`'s own member grant isn't touched.
+- A record named in an effective retire's `kept` still counts after its issuer `K`
+  loses authority, but only if `K` really held that authority: a root-issued
+  keyholder grant for `K` (or, for invites, a keyholder-issued inviter grant) that
+  no *revoke* masks. A member with no authority can't self-retire to launder
+  grants it signed, and a later revoke of `K` still cascades past the kept list.
 
 `covers(c, X)` holds when `c == X.id`, or when `c` names a revoke or retire `C` in the set
 with `covers(C.cites_revoke, X)`. A revocation's own `cites_revoke` names
