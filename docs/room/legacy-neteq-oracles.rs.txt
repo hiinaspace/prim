@@ -1,0 +1,139 @@
+// Seeded-fault proof: the new receiver's oracle scenarios, run against the old NetEq receiver in
+// REAL time (the old receiver reads Instant::now internally). Prints numbers.
+mod h;
+use h::*;
+use std::time::{Duration, Instant};
+use voice_core::{PacketArrival, VoiceEncoderConfig, VoicePacket, VoiceReceiver};
+
+struct Out {
+    output: Vec<f32>,
+    active_from: usize,
+    stats: voice_core::ReceiverStats,
+    max_buffer: u32,
+}
+
+fn run_rt(events: &[Scheduled], end_us: u64) -> Out {
+    let mut rx = VoiceReceiver::new(48_000).unwrap();
+    let t0 = Instant::now() - Duration::from_micros(START);
+    let mut next = 0;
+    let mut output = Vec::new();
+    let mut tick = START / 10_000;
+    let mut frame = vec![0.0f32; 480];
+    let mut active_from = None;
+    let mut max_buffer = 0;
+    loop {
+        let t = tick * 10_000;
+        if t > end_us {
+            break;
+        }
+        let due = t0 + Duration::from_micros(t);
+        let now = Instant::now();
+        if due > now {
+            std::thread::sleep(due - now);
+        }
+        while next < events.len() && events[next].local_us <= t {
+            let e = &events[next];
+            let now_us = t0.elapsed().as_micros() as u64;
+            let _ = rx.push_packet_with_now_mono(
+                e.packet.clone(),
+                PacketArrival { received_at_mono_us: e.daemon_us },
+                now_us.max(e.daemon_us),
+            );
+            next += 1;
+        }
+        rx.pull_frame(&mut frame);
+        if active_from.is_none() && frame.iter().any(|v| *v != 0.0) {
+            active_from = Some(output.len());
+        }
+        max_buffer = max_buffer.max(rx.stats().current_buffer_size_ms);
+        output.extend_from_slice(&frame);
+        tick += 1;
+    }
+    Out { output, active_from: active_from.unwrap_or(0), stats: rx.stats(), max_buffer }
+}
+
+const START: u64 = 1_000_000;
+fn end_of(p: &[VoicePacket]) -> u64 {
+    START + (p.last().unwrap().timestamp.wrapping_sub(p[0].timestamp) as u64) * 1000 / 48 + 1_000_000
+}
+fn voiced(secs: f32) -> Vec<VoicePacket> {
+    encode_stream(&voiced_signal(secs, 0.3), VoiceEncoderConfig::default()).unwrap()
+}
+fn deliver(p: &[VoicePacket], drop: impl Fn(usize) -> bool) -> Vec<Scheduled> {
+    schedule(p, START, 0.0, |i, pk| if !pk.payload.is_empty() && drop(i) { Fate::Drop } else { Fate::Deliver { net_delay_us: 30_000, local_us: 0 } })
+}
+
+fn loss_case(name: &str, drop: impl Fn(usize) -> bool + Copy + Send + 'static) -> String {
+    let p = voiced(4.0);
+    let slots = p.iter().filter(|x| !x.payload.is_empty()).count();
+    let dropped = (0..p.len()).filter(|&i| !p[i].payload.is_empty() && drop(i)).count();
+    let clean = run_rt(&deliver(&p, |_| false), end_of(&p));
+    let lossy = run_rt(&deliver(&p, drop), end_of(&p));
+    let cs = max_step(&clean.output[clean.active_from..]);
+    let ls = max_step(&lossy.output[lossy.active_from..]);
+    let s = &lossy.stats;
+    let c = &clean.stats;
+    format!(
+        "{name} [lossless control: neteq_output_samples {}, concealed_samples {}]: slots {slots}, dropped {dropped}; (a) neteq_output_samples {} vs expected {} (diff {:+}); (b) max step {ls:.4} vs lossless {cs:.4} (x{:.2}); (c) concealed {:.2} % vs scripted {:.2} %; talkspurt_flushes {}",
+        c.neteq_output_samples, c.concealed_samples,
+        s.neteq_output_samples, slots * 960, s.neteq_output_samples as i64 - (slots * 960) as i64, ls / cs,
+        100.0 * s.concealed_samples as f64 / s.neteq_output_samples.max(1) as f64,
+        100.0 * dropped as f64 / slots as f64, s.talkspurt_flushes
+    )
+}
+
+#[test]
+fn legacy_numbers() {
+    let mut handles = Vec::new();
+    handles.push(std::thread::spawn(|| loss_case("every 50th", |i| i % 50 == 25)));
+    handles.push(std::thread::spawn(|| loss_case("every 20th", |i| i % 20 == 10)));
+    handles.push(std::thread::spawn(|| loss_case("bursts 2-3", |i| matches!(i % 60, 20 | 21) || matches!(i % 90, 55..=57))));
+    handles.push(std::thread::spawn(|| {
+        let p = encode_stream(&chirp(3.0, 300.0, 3000.0, 0.3), VoiceEncoderConfig { enable_dtx: false, ..Default::default() }).unwrap();
+        let slots = p.iter().filter(|x| !x.payload.is_empty()).count();
+        let mut ev = schedule(&p, START, 0.0, |i, _| Fate::Deliver { net_delay_us: match i { 40 | 70 => 85_000, 100 => 700_000, _ => 30_000 }, local_us: 0 });
+        let d = ev.iter().find(|e| e.packet.seq == p[60].seq).unwrap().clone();
+        ev.push(Scheduled { daemon_us: d.daemon_us + 20_000, local_us: d.local_us + 20_000, ..d });
+        ev.sort_by_key(|e| e.local_us);
+        let o = run_rt(&ev, end_of(&p));
+        let bank: Vec<f64> = (0..=140).map(|i| 200.0 + 25.0 * i as f64).collect();
+        let f: Vec<f64> = o.output[o.active_from..].chunks_exact(4800).map(|w| dominant_frequency(w, &bank)).collect();
+        let worst = f.windows(2).map(|w| w[0] - w[1]).fold(0.0, f64::max);
+        format!("ordering: slots {slots}, neteq_output_samples {} (expected {}), late_packets_discarded {} (new: late 1, duplicate 1), concealed_samples {} (new: 960), worst chirp fall {worst:.0} Hz (pass: < 75)", o.stats.neteq_output_samples, slots * 960, o.stats.late_packets_discarded, o.stats.concealed_samples)
+    }));
+    handles.push(std::thread::spawn(|| {
+        let mut s = voiced_signal(1.0, 0.3);
+        s.extend(vec![0.0; 48_000 * 4]);
+        s.extend(voiced_signal(0.6, 0.3));
+        s.extend(vec![0.0; 48_000 * 4]);
+        let p = encode_stream(&s, VoiceEncoderConfig::default()).unwrap();
+        let o = run_rt(&deliver(&p, |_| false), end_of(&p));
+        format!("dtx refresh: talkspurt_flushes {} (pass: 0 target resets, prebuffer only at the 2 real onsets)", o.stats.talkspurt_flushes)
+    }));
+    handles.push(std::thread::spawn(|| {
+        let mut p = encode_stream(&voiced_signal(3.0, 0.3), VoiceEncoderConfig { enable_dtx: false, ..Default::default() }).unwrap();
+        let slots = p.iter().filter(|x| !x.payload.is_empty()).count();
+        for (i, k) in p.iter_mut().enumerate() {
+            k.seq = 65_516u16.wrapping_add(i as u16);
+            k.timestamp = u32::MAX.wrapping_sub(20 * 960 - 1).wrapping_add(i as u32 * 960);
+        }
+        let ev = schedule(&p, START, 0.0, |i, _| if i == 21 { Fate::Drop } else { Fate::Deliver { net_delay_us: if i == 19 { 60_000 } else { 30_000 }, local_us: 0 } });
+        let o = run_rt(&ev, end_of(&p));
+        format!("wrap: neteq_output_samples {} (expected {}), concealed_samples {} (new: 960), late {} (new 0), talkspurt_flushes {}", o.stats.neteq_output_samples, slots * 960, o.stats.concealed_samples, o.stats.late_packets_discarded, o.stats.talkspurt_flushes)
+    }));
+    for ppm in [500.0, -500.0] {
+        handles.push(std::thread::spawn(move || {
+            let p = encode_stream(&voiced_signal(60.0, 0.3), VoiceEncoderConfig { enable_dtx: false, ..Default::default() }).unwrap();
+            let mut x = 12345u32;
+            let ev = schedule(&p, START, ppm, |_, _| { x = x.wrapping_mul(1664525).wrapping_add(1013904223); Fate::Deliver { net_delay_us: 30_000 + ((x >> 16) % 6_000) as u64, local_us: 0 } });
+            let o = run_rt(&ev, end_of(&p));
+            format!("drift {ppm:+} ppm / 60 s: concealed_samples {} (new: 0), late {} (new 0), max buffer {} ms, accel/s {:.2}, preemptive/s {:.2}, talkspurt_flushes {}", o.stats.concealed_samples, o.stats.late_packets_discarded, o.max_buffer, o.stats.accelerate_per_sec, o.stats.preemptive_expand_per_sec, o.stats.talkspurt_flushes)
+        }));
+    }
+    for h in handles {
+        match h.join() {
+            Ok(m) => println!("LEGACY {m}"),
+            Err(e) => println!("LEGACY PANIC in old receiver: {:?}", e.downcast_ref::<String>().cloned().or(e.downcast_ref::<&str>().map(|s| s.to_string()))),
+        }
+    }
+}

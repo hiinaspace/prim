@@ -170,10 +170,11 @@ Threads; the device callbacks only copy between preallocated ring buffers:
 
 - **rt reader:** decodes `VoiceIn`, fences it by incarnation per sender
   (`room_core::voice::IncarnationFence`), resets that sender's receiver on a new
-  stream, pushes to the sender's `voice_core::VoiceReceiver` (NetEq) with the
-  daemon's arrival stamp. Stores the newest `Listener`.
+  stream, pushes to the sender's `voice_core::PlayoutReceiver` (see "Receiver" below)
+  with both the daemon's arrival stamp and its own read time. Stores the newest
+  `Listener`.
 - **mixer:** paced by the output ring's fill (two 10 ms blocks ahead). Per block,
-  per active sender: pull 480 samples from NetEq, render with `prim_hrtf::Renderer`
+  per active sender: pull 480 samples from the receiver, render with `prim_hrtf::Renderer`
   from the sender's seat relative to the listener pose, gain
   `prim_hrtf::voice_gain(distance) × level_match`, sum. `level_match` is −4.7 dB:
   prim-hrtf runs that much louder than the Godot/Steam Audio path at equal gain
@@ -192,6 +193,67 @@ Threads; the device callbacks only copy between preallocated ring buffers:
 - **Restart:** a new process draws a new incarnation. Nothing of the old stream
   survives it: its daemon queues are discarded (session fencing) and receivers fence
   its late packets.
+
+## Receiver (timeline playout, 2026-11-18)
+
+`voice_core::PlayoutReceiver` replaced the NetEq wrapper. One per sender, no clock of its
+own (every time is a `u64` of microseconds the caller passes).
+
+- **Timeline.** Fixed 20 ms slots on the packets' 48 kHz timestamps (+960 per slot, wrap-safe,
+  `u16` seq and `u32` timestamp). A cursor says which slot plays next. Each slot is decoded,
+  recovered from the next packet's in-band FEC (only if the packet carries it *and* the
+  receiver config has `fec` on), or concealed with Opus PLC. A packet behind the cursor is
+  counted `late` and never played; a repeat is `duplicate`; nothing plays after a newer
+  timestamp. Seq only separates loss from DTX (a timestamp gap with contiguous seq is
+  silence, not loss). Packets that are not exactly one 960-sample mono 48 kHz Opus frame are
+  `Rejected` before any accounting.
+- **Delay.** WebRTC-style: relative delay against a 2 s trailing minimum, a peak tracker that
+  rises at once and decays 5 ms/s, target = peak + 10 ms clamped to 20..250 ms. The estimator
+  sees the daemon stamp only; a late packet whose daemon-side delay was within the target is
+  counted `local_late` (the miss was in this process). The buffer is held at
+  `floor(target/20)+2` slots: a stretch needs 1.5 slots in hand, so the target counts the
+  slot being played plus one.
+- **Level control.** Accelerate / PreemptiveExpand (copied from the videocall-rs fork) on
+  the 20 ms boundary only, never on concealed audio, not in the first 160 ms of a talkspurt.
+  The search costs about 330 us per operation at 48 kHz in a release build (1.6 % of a core
+  per peer if it ran every slot), so it is not downsampled. The fork's Accelerate is
+  energy-based, not pitch-synchronous: in normal mode it only cuts inside a quiet stretch.
+- **Talkspurts.** START/END are hints. A one-packet DTX refresh is decoded and played with no
+  target reset and no prebuffer (`dtx_refreshes`). A real onset sets the cursor to the first
+  packet's timestamp and waits for the buffer to reach the target. Between talkspurts the
+  output is digital zero and `is_idle()` is true. Concealment is bounded at 120 ms of
+  consecutive lost slots; then the receiver goes idle and the next packet is a new onset.
+- **Opus.** `audiopus_sys` is patched to the in-repo `opus-sys` crate (a pinned libopus 1.5.2
+  source tree built with cmake, linked statically), so desktop and the aarch64 shell use the
+  same codec; `voice_core::opus_version()` is asserted in a unit test and printed as
+  `opus_version` in the stats JSON.
+
+### Seeded-fault proof
+
+The loss, ordering, DTX, wrap and drift oracles live in `voice-core/tests/`. Each was run
+against the old receiver (`56b4c31`, NetEq) on the same scenarios, in real time because the old
+receiver reads `Instant::now` itself (`docs/room/legacy-neteq-oracles.rs.txt` is the runner; it
+needs the harness from `voice-core/src/fixture_harness.rs` as `tests/h.rs` in that checkout).
+Real Opus encode of a 4 s synthetic voiced signal, 200 slots, 30 ms network delay.
+
+| oracle | timeline receiver (pass criterion) | old NetEq receiver |
+|---|---|---|
+| loss every 50th (a) samples out vs 200 x 960 | exact | +1920 (two extra slots) |
+| (c) concealed vs scripted 2 % | 2.00 % | 3.71 % (a 4-slot start-up concealment counted too) |
+| loss every 20th (b) max step vs lossless | 0.1430 vs 0.1440 | 0.2692 vs 0.0573 (x4.70 splice) |
+| (c) concealed vs scripted 5 % | 5.00 % | 7.18 % |
+| bursts of 2-3: concealed vs 6 % | 6.00 % | 7.43 %; output +1920 |
+| ordering (reorder, duplicate, 700 ms late) | dominant frequency never falls more than 75 Hz; 1 late, 1 duplicate, 960 samples concealed | chirp falls back 2725 Hz (old audio played after newer); `late_packets_discarded` 0; 3840 samples concealed; output +4800 |
+| DTX refresh: target resets | 0, 2 prebuffers | 19 talkspurt flushes |
+| seq + timestamp wrap | exact count, 960 concealed | debug-build panic, "attempt to multiply with overflow" in neteq `delay_manager.rs:118` |
+| 60 s, +500 ppm, no DTX | 0 PLC, 0 late | 6240 samples concealed |
+| 60 s, -500 ppm, no DTX | 0 PLC, 0 late | 4320 samples concealed; both runs kept 88 ms buffered |
+
+The old receiver's numbers are not all failures of the same kind. Its per-loss concealment
+count is near the scripted rate once the 3840-sample start-up concealment is subtracted, and
+its continuity only breaks at 5 % loss. What it fails outright is ordering, DTX refreshes,
+wrap, drift and the exact sample count. The step-delay and sparse-spike estimator tests were
+not run against the old receiver.
 
 ## Oracles (R0)
 
