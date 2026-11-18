@@ -12,7 +12,8 @@ iroh = "1.4.1"
 iroh-base = "1.4.1"
 
 [patch.crates-io]
-neteq = { git = "https://github.com/hiinaspace/videocall-rs.git", rev = "e854b5a85cfabd8bb550e510c5380a50b159145b" }
+# One vendored libopus (1.5.2, static) for desktop and aarch64.
+audiopus_sys = { path = "dependencies/godot-network-audio/opus-sys" }
 
 # Crypto in debug builds is ~300x slower; the room-core simulator tests need dependencies optimised.
 [profile.dev.package."*"]

@@ -163,7 +163,7 @@ impl Client {
     pub fn peer_receiver_stats(
         &self,
         key: &room_core::ids::Key,
-    ) -> Option<voice_core::ReceiverStats> {
+    ) -> Option<voice_core::PlayoutStats> {
         let arc = self.sh.senders.lock().unwrap().map.get(key)?.clone();
         let p = arc.lock().unwrap();
         p.receiver.as_ref().map(|r| r.stats())

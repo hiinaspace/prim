@@ -160,7 +160,7 @@ impl Mixer {
             let Some(rx) = p.receiver.as_mut() else {
                 continue;
             };
-            rx.pull_frame(&mut self.pull);
+            rx.pull(&mut self.pull);
             p.blocks_pulled += 1;
             drop(p);
 

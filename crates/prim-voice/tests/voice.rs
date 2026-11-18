@@ -313,17 +313,17 @@ fn restart_fencing_drops_late_old_incarnation_and_the_old_tone_is_gone() {
 #[derive(Default, Debug)]
 struct Delay {
     target: f64,
-    preferred: f64,
+    peak: f64,
     buffer: f64,
     accel_per_s: f64,
     expand_per_s: f64,
     preempt_per_s: f64,
 }
 
-/// Mean NetEq delay figures over the last 5 s of an 8 s call whose packets are due
+/// Mean receiver delay figures over the last 5 s of an 8 s call whose packets are due
 /// 20 ms apart, reach the daemon up to `net_us` late (it stamps them then), and reach
 /// the client up to `ipc_us` after that.
-fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> Delay {
+fn playout_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> Delay {
     let (mock, conn) = Mock::spawn(key(9), false);
     let cfg = Config {
         arrival,
@@ -349,11 +349,11 @@ fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> D
         if mono_us() - t0 > 3_000_000 {
             if let Some(s) = c.peer_receiver_stats(&key(1)) {
                 d.target += s.target_delay_ms as f64;
-                d.preferred += s.preferred_buffer_size_ms as f64;
-                d.buffer += s.current_buffer_size_ms as f64;
-                d.accel_per_s += s.accelerate_per_sec as f64;
-                d.expand_per_s += s.expand_per_sec as f64;
-                d.preempt_per_s += s.preemptive_expand_per_sec as f64;
+                d.peak += s.peak_delay_ms;
+                d.buffer += s.buffer_ms;
+                d.accel_per_s += s.accelerate_ops as f64 / (mono_us() - t0) as f64 * 1e6;
+                d.expand_per_s += s.plc_samples as f64 / 960.0 / (mono_us() - t0) as f64 * 1e6;
+                d.preempt_per_s += s.preemptive_ops as f64 / (mono_us() - t0) as f64 * 1e6;
                 n += 1.0;
             }
         }
@@ -362,7 +362,7 @@ fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> D
     c.stop();
     drop(mock);
     d.target /= n;
-    d.preferred /= n;
+    d.peak /= n;
     d.buffer /= n;
     d.accel_per_s /= n;
     d.expand_per_s /= n;
@@ -371,21 +371,21 @@ fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> D
 }
 
 #[test]
-fn neteq_arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
-    // NetEq quantises its target in 20 ms steps, so the effect shows near a step: with
-    // 24 or 26 ms of network jitter (which the daemon's stamp does see) the control
-    // targets 20 ms. Add 0..8 ms of IPC jitter between the stamp and the read and
-    // compare arrival = the daemon's stamp with arrival = read time. All six calls
+fn arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
+    // The timeline receiver's target follows the observed delay peak plus a margin, in
+    // milliseconds (NetEq quantised it to 20 ms steps). Add 0..8 ms of IPC jitter between
+    // the stamp and the read and compare arrival = the daemon's stamp with arrival = read
+    // time: the stamp must leave the target alone, the read time must raise it. All six calls
     // run at once with the same jitter pattern, so they share the load.
     let run = |net: u64| {
         (
-            std::thread::spawn(move || neteq_delay(ArrivalPolicy::Stamp, net, 0, 12)),
-            std::thread::spawn(move || neteq_delay(ArrivalPolicy::Stamp, net, 8_000, 12)),
-            std::thread::spawn(move || neteq_delay(ArrivalPolicy::ReadTime, net, 8_000, 12)),
+            std::thread::spawn(move || playout_delay(ArrivalPolicy::Stamp, net, 0, 12)),
+            std::thread::spawn(move || playout_delay(ArrivalPolicy::Stamp, net, 8_000, 12)),
+            std::thread::spawn(move || playout_delay(ArrivalPolicy::ReadTime, net, 8_000, 12)),
         )
     };
     let runs = [(24_000, run(24_000)), (26_000, run(26_000))];
-    eprintln!("NetEq means over the last 5 s (ms), packets 20 ms apart (buffer is noisy: preemptive expand runs the whole call):");
+    eprintln!("receiver means over the last 5 s (ms), packets 20 ms apart (buffer is noisy: preemptive expand runs the whole call):");
     for (net, (a, b, c)) in runs {
         let (ctl, stamp, read) = (a.join().unwrap(), b.join().unwrap(), c.join().unwrap());
         eprintln!(" network jitter 0..{} ms:", net / 1000);
@@ -395,8 +395,8 @@ fn neteq_arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
             ("IPC 0..8, arrival = read time", &read),
         ] {
             eprintln!(
-                "  {name:30} target {:5.1}  preferred {:5.1}  buffer {:5.1}  accel/s {:.2} expand/s {:.2}",
-                x.target, x.preferred, x.buffer, x.accel_per_s, x.expand_per_s
+                "  {name:30} target {:5.1}  peak {:5.1}  buffer {:5.1}  accel/s {:.2} expand/s {:.2}",
+                x.target, x.peak, x.buffer, x.accel_per_s, x.expand_per_s
             );
         }
         assert!(
@@ -406,7 +406,7 @@ fn neteq_arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
             ctl.target
         );
         assert!(
-            read.target >= stamp.target + 10.0,
+            read.target >= stamp.target + 3.0,
             "read-time arrival should grow the target: {:.1} vs {:.1}",
             read.target,
             stamp.target

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use room_core::ids::Key;
 use room_core::rt::Pose;
 use room_core::voice::IncarnationFence;
-use voice_core::VoiceReceiver;
+use voice_core::PlayoutReceiver;
 
 use crate::config::Config;
 use crate::hist::{AtomicHist, Hist};
@@ -41,7 +41,7 @@ pub struct ListenerState {
 
 pub struct PeerRx {
     pub fence: IncarnationFence,
-    pub receiver: Option<VoiceReceiver>,
+    pub receiver: Option<PlayoutReceiver>,
     pub incarnation: u32,
     pub slot: Option<usize>,
     pub last_packet_us: u64,

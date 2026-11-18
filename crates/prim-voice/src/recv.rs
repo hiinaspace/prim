@@ -8,7 +8,9 @@ use std::time::Duration;
 use room_core::ids::Key;
 use room_core::rt::{peer_flags, RtMsg};
 use room_core::voice::{voice_flags, Fence, VoiceEnvelope};
-use voice_core::{PacketArrival, PacketFlags, VoicePacket, VoiceReceiver};
+use voice_core::{
+    PacketFlags, PacketObservation, PlayoutConfig, PlayoutReceiver, PushOutcome, VoicePacket,
+};
 
 use crate::clock::mono_us;
 use crate::config::ArrivalPolicy;
@@ -150,12 +152,14 @@ pub fn judge_timing(
     }
 }
 
-fn new_receiver(sh: &Shared) -> voice_core::Result<VoiceReceiver> {
+fn new_receiver(sh: &Shared) -> voice_core::Result<PlayoutReceiver> {
     match sh.cfg.min_delay_ms {
-        None => VoiceReceiver::new(crate::shared::SAMPLE_RATE),
-        Some(min) => {
-            VoiceReceiver::new_with_delay_bounds(crate::shared::SAMPLE_RATE, min, 250.max(min))
-        }
+        None => PlayoutReceiver::new(),
+        Some(min) => PlayoutReceiver::with_config(PlayoutConfig {
+            min_delay_ms: min,
+            max_delay_ms: 250.max(min),
+            ..PlayoutConfig::default()
+        }),
     }
 }
 
@@ -248,25 +252,26 @@ fn voice_in(
         ),
         payload: env.payload,
     };
-    // `now` is read just before the call: voice-core turns (arrival, now) into the
-    // Instant NetEq's delay estimator sees, `Instant::now() - (now - arrival)`.
+    // Both observations go in: the delay estimator uses `arrival_us` (the daemon's stamp,
+    // or the read time under the ReadTime experiment); `read_us` is when this process had
+    // the packet, and lets the receiver tell local lateness from network lateness.
     let now = mono_us();
-    match rx.push_packet_with_now_mono(
+    match rx.push_packet(
         pkt,
-        PacketArrival {
-            received_at_mono_us: arrival_us,
+        PacketObservation {
+            daemon_arrival_us: arrival_us,
+            local_us: read_us,
         },
-        now,
     ) {
-        Ok(()) => {
-            peer.packets_accepted += 1;
-            peer.last_packet_us = now;
-            peer.active = true;
-        }
-        Err(_) => {
+        PushOutcome::Rejected => {
             peer.push_errors += 1;
             drop(peer);
             sh.stats.bump("drop_push_error");
+        }
+        _ => {
+            peer.packets_accepted += 1;
+            peer.last_packet_us = now;
+            peer.active = true;
         }
     }
 }
