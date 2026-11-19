@@ -35,7 +35,7 @@ Faults, each of which must turn the run red (--fault NAME):
 Tests use private tone/null audio only; nothing touches real microphones or speakers.
 Pass an output directory as the first positional argument (default /tmp/prim-session-survive).
 """
-import argparse, json, os, shutil, signal, socket, subprocess, sys, time
+import argparse, json, os, re, shutil, signal, socket, subprocess, sys, time
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
@@ -209,7 +209,7 @@ try:
     # state must be the one asked for (not just the same state before and after).
     def peer_sees_update():
         # B's daemon: wait for the next update of A's voice key (started before the toggle).
-        return subprocess.Popen([str(prim), "ctl", "--socket", str(sock_b), "sub", f"member/{info['key']}/voice", "--count", "1", "--timeout", "6"],
+        return subprocess.Popen([str(prim), "ctl", "--socket", str(sock_b), "sub", f"member/{info['key']}/voice", "--count", "99", "--timeout", "4"],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
     steps = [(("deafen", "on"), {"deaf": True, "mic": True}), (("deafen", "off"), {"deaf": False, "mic": True}),
@@ -226,13 +226,16 @@ try:
             rc = ctl(sock_a, "session", *op)[0]
         time.sleep(1.5)
         snap = snapshot()
-        early = sub.poll() is not None  # a `sub` that ended before the toggle proves nothing
-        out = sub.communicate(timeout=15)[0]
+        out = sub.communicate(timeout=20)[0]
+        # `sub` first replays the current value (version N); a toggle the peer saw arrives as a
+        # later value with a higher version.
+        versions = sorted({tuple(int(x) for x in v.split(".")) for v in re.findall(r"version=([\d.]+)", out)})
+        early = len(versions) < 2
         ok = (rc == 0 and snap["voice"]["deaf"] == want["deaf"] and snap["voice"]["mic"] == want["mic"]
               and snap["voice"]["pid"] == before["voice"]["pid"] and snap["voice"]["starts"] == before["voice"]["starts"]
               and snap["incarnation"] == before["incarnation"] and bool(snap["incarnation"]))
         check(f"toggle {' '.join(op)}: ok, state as asked, same voice process/starts/incarnation", ok, {"rc": rc, "want": want, "voice": snap["voice"], "incarnation": snap["incarnation"]})
-        check(f"toggle {' '.join(op)}: the peer's daemon saw a voice-flag update", sub.returncode == 0 and bool(out.strip()) and not early, {"rc": sub.returncode, "early": early, "out": out.strip()[:120]})
+        check(f"toggle {' '.join(op)}: the peer's daemon saw a voice-flag update", not early, {"versions": versions, "out": out.strip()[-160:]})
     # Leave mic on, deafen off for the rest.
     ctl(sock_a, "session", "mic", "on"); ctl(sock_a, "session", "deafen", "off")
     time.sleep(1.0)
@@ -242,6 +245,9 @@ try:
 
     # Step 7: kill -9 the session; a new one adopts the running voice; a toggle keeps it.
     sess0 = jctl(sock_a, "session", "status")
+    if sess0.get("pid") is None or not (sess0.get("voice") or {}).get("pid"):
+        check("step 7 needs a live session and voice (they are gone)", False, sess0)
+        raise SystemExit
     voice_pid = sess0["voice"]["pid"]
     inc0 = snapshot()["incarnation"]
     os.kill(sess0["pid"], signal.SIGKILL)
