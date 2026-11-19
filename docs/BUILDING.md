@@ -150,13 +150,14 @@ These are the tested recipe stages; compiler paths are supplied locally:
    lto=none -j4`, with `MINGW_PREFIX` pointing to the cross toolchain.
    **Keep OpenGL enabled** even though prim uses Vulkan: removing it changes the
    generated class API (notably WebXR) expected by the Rust bindings.
-3. Build libplacebo v7.360.1 with the dependency's libplacebo patch, recursively
+3. Build libplacebo v7.387.0 with the dependency's libplacebo patch, recursively
    initialized source submodules, shared libraries, Vulkan/shaderc enabled,
    OpenGL/D3D11 disabled, and xxhash disabled. The latter avoids an unsysrooted
    pkg-config include path in this cross setup. Install under `/mingw64` using
    the MSYS staging directory as `DESTDIR`.
-4. Build the mpv fork at `970250ad1480e78ca03999e1733d212278f07dbb` plus all four
-   patches in `patches/mpv`. Meson options: `--prefix /mingw64 --libdir lib
+4. Build the mpv fork at `5f4d6211187375568c273262eacb44304ea618b1` (0.42.0 base; branch
+   `claude/m0-mpv-042`) plus all four patches in `patches/mpv`. The Windows recipe has not been
+   re-run on 0.42 (see the M0 round report). Meson options: `--prefix /mingw64 --libdir lib
    -Ddefault_library=shared -Dbuildtype=release -Dauto_features=disabled
    -Dlibmpv=true -Dcplayer=false -Dlua=luajit -Dgl=disabled -Dvulkan=enabled
    -Dshaderc=enabled -Dwin32-threads=enabled -Diconv=enabled -Dzlib=enabled`.

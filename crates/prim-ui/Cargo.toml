@@ -1,0 +1,29 @@
+[package]
+name = "prim-ui"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "The Prim room window: participant list, voice and client launchers, text chat, advanced room inspector (egui)"
+
+[lib]
+name = "prim_ui"
+path = "src/lib.rs"
+
+[features]
+default = ["gui"]
+# The egui window itself; without it the crate is only the client layer and chat.
+gui = ["dep:eframe"]
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"], optional = true }
+libc = "0.2"
+prim-room = { path = "../prim-room" }
+room-core = { path = "../room-core" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros", "net", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
+prim-voice = { path = "../prim-voice" }

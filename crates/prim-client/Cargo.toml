@@ -1,0 +1,23 @@
+[package]
+name = "prim-client"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "Blocking client for the prim room daemon's local socket (room.sock): worker thread, reconnect, subscriptions replay. Godot wraps it as PrimClient in native/."
+
+[dependencies]
+data-encoding = "2"
+prim-events = { path = "../prim-events" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+prim-room = { path = "../prim-room" }
+room-core = { path = "../room-core" }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+[[bin]]
+name = "prim-bot"
+path = "src/bin/prim-bot.rs"
