@@ -561,6 +561,98 @@ fn coordinator_watcher_restart_rejoins() {
     assert!(s < 0.5, "still split {s:.2}s");
 }
 
+impl Watcher {
+    fn path(&mut self) -> Option<String> {
+        self.ipc.get("path")?.as_str().map(str::to_string)
+    }
+}
+
+fn plays(w: &mut Watcher, media: &Path) -> bool {
+    w.path().as_deref() == media.to_str() && w.pos().is_some()
+}
+
+/// The reported bug: stop a watcher and start a new one with another URL; the new one (and
+/// everybody following) must play the new URL, whichever member restarted: the coordinator
+/// or a guest. The old run's records are still in the room when the new process starts.
+#[test]
+fn restarted_watcher_with_a_new_url_plays_the_new_one() {
+    need_tools!();
+    let dir = testdir();
+    let a_media = clip(dir.path(), "a45.mp4", 45);
+    let b_media = clip(dir.path(), "b60.mp4", 60);
+    let c_media = clip(dir.path(), "c50.mp4", 50);
+    let ds = room(dir.path(), 2);
+    let mut w0 = watch(dir.path(), &ds[0], "w0", Some(a_media.to_str().unwrap()), &[]);
+    let mut w1 = watch(dir.path(), &ds[1], "w1", None, &[]);
+    wait_for(60.0, "both playing a", || plays(&mut w0, &a_media) && plays(&mut w1, &a_media));
+    settle(20.0, "together", &mut w0, &mut w1, 0.4);
+    // Revisions pile up in the old run: a few seeks.
+    for t in [10.0, 12.0, 14.0] {
+        w1.ipc.call(json!(["seek", t, "absolute"]));
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    std::thread::sleep(Duration::from_secs(4));
+
+    // 1. the coordinator's watcher is restarted with b
+    drop(w0);
+    let mut w0 = watch(dir.path(), &ds[0], "w0b", Some(b_media.to_str().unwrap()), &[]);
+    let t = wait_for(30.0, "restarted coordinator and guest play b", || plays(&mut w0, &b_media) && plays(&mut w1, &b_media));
+    eprintln!("coordinator restart: both on b after {t:.1}s");
+    // and it stays: nothing flips back to a
+    for _ in 0..40 {
+        assert!(plays(&mut w0, &b_media) && plays(&mut w1, &b_media), "flipped back: {:?} / {:?}", w0.path(), w1.path());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    settle(10.0, "together on b", &mut w0, &mut w1, 0.4);
+
+    // 2. the guest's watcher is restarted with c
+    drop(w1);
+    let mut w1 = watch(dir.path(), &ds[1], "w1c", Some(c_media.to_str().unwrap()), &[]);
+    let t = wait_for(30.0, "restarted guest and coordinator play c", || plays(&mut w0, &c_media) && plays(&mut w1, &c_media));
+    eprintln!("guest restart: both on c after {t:.1}s");
+    for _ in 0..40 {
+        assert!(plays(&mut w0, &c_media) && plays(&mut w1, &c_media), "flipped back: {:?} / {:?}", w0.path(), w1.path());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    settle(10.0, "together on c", &mut w0, &mut w1, 0.4);
+}
+
+/// The person changes the source in a running mpv (here: `loadfile`, as a drag and drop
+/// does): no respawn needed, the room follows, from either member.
+#[test]
+fn changing_the_source_in_a_running_watcher_changes_it_for_the_room() {
+    need_tools!();
+    let dir = testdir();
+    let a_media = clip(dir.path(), "a45.mp4", 45);
+    let b_media = clip(dir.path(), "b60.mp4", 60);
+    let c_media = clip(dir.path(), "c50.mp4", 50);
+    let ds = room(dir.path(), 2);
+    let mut w0 = watch(dir.path(), &ds[0], "w0", Some(a_media.to_str().unwrap()), &[]);
+    let mut w1 = watch(dir.path(), &ds[1], "w1", None, &[]);
+    wait_for(60.0, "both playing a", || plays(&mut w0, &a_media) && plays(&mut w1, &a_media));
+    settle(20.0, "together", &mut w0, &mut w1, 0.4);
+
+    // from the guest (a request to the coordinator)
+    w1.ipc.call(json!(["loadfile", b_media.to_str().unwrap(), "replace"]));
+    let t = wait_for(30.0, "both on b", || plays(&mut w0, &b_media) && plays(&mut w1, &b_media));
+    eprintln!("guest changed the source: both on b after {t:.1}s");
+    for _ in 0..30 {
+        assert!(plays(&mut w0, &b_media) && plays(&mut w1, &b_media), "flipped back: {:?} / {:?}", w0.path(), w1.path());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    settle(15.0, "together on b", &mut w0, &mut w1, 0.4);
+
+    // from the coordinator
+    w0.ipc.call(json!(["loadfile", c_media.to_str().unwrap(), "replace"]));
+    let t = wait_for(30.0, "both on c", || plays(&mut w0, &c_media) && plays(&mut w1, &c_media));
+    eprintln!("coordinator changed the source: both on c after {t:.1}s");
+    for _ in 0..30 {
+        assert!(plays(&mut w0, &c_media) && plays(&mut w1, &c_media), "flipped back: {:?} / {:?}", w0.path(), w1.path());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    settle(15.0, "together on c", &mut w0, &mut w1, 0.4);
+}
+
 /// One YouTube URL through mpv's yt-dlp path. Network and yt-dlp needed:
 /// `PRIM_WATCH_YT=https://www.youtube.com/watch?v=... cargo test -p prim --test watch -- --ignored youtube`
 #[test]

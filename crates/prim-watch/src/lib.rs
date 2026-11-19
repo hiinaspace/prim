@@ -83,6 +83,9 @@ struct Host {
     pending: HashMap<u64, Pending>,
     msg_tokens: HashMap<u64, u64>,
     subs: HashMap<u32, &'static str>,
+    /// Subscriptions whose first snapshot has arrived.
+    snaps: std::collections::HashSet<&'static str>,
+    synced: bool,
     player: player::Player,
     verbose: bool,
 }
@@ -285,7 +288,7 @@ impl Host {
         Ok(())
     }
 
-    fn update(&mut self, kind: &str, u: UpdateJson) {
+    fn update(&mut self, kind: &'static str, u: UpdateJson) {
         let room = kind == "room";
         match u {
             UpdateJson::Reset => self.feed(if kind == "cap" {
@@ -312,7 +315,13 @@ impl Host {
                     _ => Event::PlaybackRemoved { room, writer: if room { None } else { w } },
                 });
             }
-            UpdateJson::SnapshotDone => {}
+            UpdateJson::SnapshotDone => {
+                self.snaps.insert(kind);
+                if !self.synced && self.snaps.len() == 3 {
+                    self.synced = true;
+                    self.feed(Event::Synced);
+                }
+            }
         }
     }
 }
@@ -340,15 +349,12 @@ pub fn run(args: &dyn Flags) -> Result<ExitCode> {
         .value("ipc")
         .map(PathBuf::from)
         .unwrap_or_else(|| socket.with_file_name(format!("mpv-{}.sock", std::process::id())));
-    let source = args.positional().first().cloned().filter(|s| !s.trim().is_empty())
-        .map(|s| {
-            // A relative file path means a different file on every member; make it absolute.
-            if !s.contains("://") && std::path::Path::new(&s).exists() {
-                std::fs::canonicalize(&s).map(|p| p.to_string_lossy().into_owned()).unwrap_or(s)
-            } else {
-                s
-            }
-        });
+    let source = args
+        .positional()
+        .first()
+        .cloned()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| player::normalize_source(&s));
     let verbose = std::env::var_os("PRIM_WATCH_DEBUG").is_some();
 
     // SAFETY: the handler only stores to an atomic.
@@ -403,6 +409,8 @@ pub fn run(args: &dyn Flags) -> Result<ExitCode> {
         pending: HashMap::new(),
         msg_tokens: HashMap::new(),
         subs,
+        snaps: Default::default(),
+        synced: false,
         player,
         verbose,
     };
