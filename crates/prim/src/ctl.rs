@@ -21,6 +21,8 @@ prim ctl [--socket PATH] <subcommand>
   sub PATTERN [--count N] [--timeout SECS]         print updates
   send TO CHANNEL TEXT [--reliable]                TO: all, coordinator or a member key
   listen CHANNEL [--count N] [--timeout SECS]      register the channel, print messages
+  chat send TEXT...                    post a line to the room chat (channel 100; see docs/room/WINDOW.md)
+  chat tail [--count N] [--timeout SECS]  print chat lines as they arrive (nothing from before you started)
 ";
 
 pub async fn run(args: Vec<String>) -> Result<ExitCode> {
@@ -34,6 +36,9 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("PRIM_SOCKET").map(PathBuf::from))
         .unwrap_or_else(local::default_socket_path);
+    if args.positional[0] == "chat" {
+        return chat(&socket, &args).await;
+    }
     let mut c = Client::connect(&socket)
         .await
         .with_context(|| format!("connecting to {}", socket.display()))?;
@@ -444,5 +449,88 @@ fn print_status(s: &local::StatusJson) {
                 h.count, h.p50_us, h.p99_us, h.p999_us, h.max_us
             );
         }
+    }
+}
+
+/// `prim ctl chat send|tail`: room chat for scripts and agents. The same channel and
+/// message format the window uses (docs/room/WINDOW.md).
+async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
+    use prim_ui::client::{self, AttachOpts};
+    let p = &args.positional;
+    match p.get(1).map(String::as_str) {
+        Some("send") => {
+            let text = p[2..].join(" ");
+            if text.trim().is_empty() {
+                bail!("chat send needs some text");
+            }
+            let (ok, total, failed) =
+                client::send_chat_once(socket, &text, Duration::from_secs(5))
+                    .await
+                    .with_context(|| format!("sending via {}", socket.display()))?;
+            for (who, status) in &failed {
+                eprintln!("not delivered to {} ({status})", &who[..8.min(who.len())]);
+            }
+            println!("delivered to {ok} of {total} other members");
+            Ok(if failed.is_empty() && ok == total {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Some("tail") => {
+            let h = client::attach(
+                socket,
+                AttachOpts {
+                    chat: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| format!("connecting to {}", socket.display()))?;
+            let want = count(args)?;
+            let timeout = args.value("timeout").map(str::parse::<u64>).transpose()?;
+            let start = std::time::Instant::now();
+            let mut printed = 0usize;
+            let mut seen_id = 0u64;
+            loop {
+                let lines: Vec<_> = {
+                    let m = h.lock();
+                    if !m.attached {
+                        break;
+                    }
+                    m.chat
+                        .iter()
+                        .filter(|l| l.id >= seen_id)
+                        .map(|l| {
+                            (
+                                l.id,
+                                l.at,
+                                l.from.as_ref().map(|k| m.name_of(k)),
+                                l.text.clone(),
+                            )
+                        })
+                        .collect()
+                };
+                for (id, at, who, text) in lines {
+                    seen_id = id + 1;
+                    match who {
+                        Some(w) => {
+                            println!("[{}] {w}: {text}", prim_ui::chat::clock(at, true));
+                            printed += 1;
+                        }
+                        None => println!("[{}] * {text}", prim_ui::chat::clock(at, true)),
+                    }
+                }
+                if want.is_some_and(|n| printed >= n) {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if timeout.is_some_and(|t| start.elapsed() >= Duration::from_secs(t)) {
+                    return Ok(if want.is_some() { ExitCode::FAILURE } else { ExitCode::SUCCESS });
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(ExitCode::FAILURE)
+        }
+        _ => bail!("chat: use `chat send TEXT` or `chat tail`"),
     }
 }
