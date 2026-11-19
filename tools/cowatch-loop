@@ -232,6 +232,7 @@ def main() -> int:
     ap.add_argument("--godot", help="Godot binary")
     ap.add_argument("--xrprobe", default=os.environ.get("XRPROBE", str(HOME / "code/xrprobe")))
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--no-godot", action="store_true", help="debug: daemons + bot only, print what daemon A sees")
     ap.add_argument("--allow-busy", action="store_true", help="start VR even if the real Monado has clients")
     ap.add_argument("--out", type=Path, help="run directory (default ~/.local/state/prim-loop/runs/<ts>)")
     a = ap.parse_args()
@@ -282,6 +283,13 @@ def main() -> int:
 
         env = os.environ | {"PRIM_EVENT_LOG": str(events.path), "PRIM_SOCKET": str(sa)}
         procs.start("bot", [str(bot), "--socket", str(sb), "--events", str(events.path)], run / "bot.log", env=env)
+
+        if a.no_godot:
+            time.sleep(3)
+            for cmd in (["status"], ["sub", "member/*/pose", "--count", "4", "--timeout", "10"]):
+                r = subprocess.run([str(prim), "ctl", "--socket", str(sa), *cmd], capture_output=True, text=True)
+                print(r.stdout, r.stderr)
+            return 0
 
         report = run / "godot-report.json"
         shot = run / "desktop.png"
