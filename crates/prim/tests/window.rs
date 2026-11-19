@@ -250,7 +250,14 @@ async fn roster_chat_voice_and_non_members() {
     assert_eq!(pids.len(), 1, "one voice client: {pids:?}");
     // SAFETY: signalling our own child.
     unsafe { libc::kill(pids[0], libc::SIGSTOP) };
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    // The lease must really expire while the process is frozen (TTL 2 s): watch the
+    // daemon's holder go away, so a pass cannot mean "the freeze was too short to matter".
+    let mut expired = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        expired |= !a.win.lock().voice_lease_held();
+    }
+    assert!(expired, "the frozen client's lease never expired");
     unsafe { libc::kill(pids[0], libc::SIGCONT) };
     // Round VC: a lost lease no longer ends the client. It reconnects inside the same
     // process (same pid, same incarnation), so nothing is relaunched.
@@ -264,6 +271,8 @@ async fn roster_chat_voice_and_non_members() {
         "voice should have reconnected in place after lease expiry: {:?} {now:?} vs {pids:?}",
         voice.sup.state
     );
+    // ... and the same process took the lease again.
+    a.win.wait_until(5, "lease held again", || a.win.lock().voice_lease_held()).await.unwrap();
     b.win.wait_until(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     voice.stop();
 
