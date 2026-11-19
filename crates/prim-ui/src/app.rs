@@ -23,6 +23,8 @@ use crate::supervise::{self, ProcState, StartMode, Voice};
 pub enum ClientKind {
     /// `prim voice`, with the mic and deafen controls.
     Voice,
+    /// `prim watch`, with a link or file entry.
+    Watch,
     /// A program started with `argv` (the `prim` binary itself is `argv[0] == "prim"`).
     Program(&'static [&'static str]),
 }
@@ -58,8 +60,8 @@ pub const CLIENTS: &[ClientSpec] = &[
         label: "Watch together (mpv)",
         blurb: "Play a video in sync with the room",
         icon: Icon::Play,
-        kind: ClientKind::Program(&[]),
-        unavailable: Some("Not ready yet (player round PM)."),
+        kind: ClientKind::Watch,
+        unavailable: None,
     },
 ];
 
@@ -120,6 +122,9 @@ pub struct App {
     /// A background daemon start or stop in progress, with what the user sees.
     busy: Option<(String, Receiver<Result<(), String>>)>,
     voice: Voice,
+    /// `prim watch` (mpv), and the link or file typed for it.
+    watch: supervise::Supervised,
+    watch_url: String,
     audio: crate::audio::Panel,
     audio_test_pending: Option<Instant>,
     sent_clients: Option<Clients>,
@@ -151,6 +156,8 @@ impl App {
             act: std::env::var("PRIM_UI_ACT").map(|v| v.split(';').map(str::to_string).collect()).unwrap_or_default(),
             adopted: false,
             voice: Voice::new(&socket),
+            watch: supervise::Supervised::new("watch"),
+            watch_url: String::new(),
             audio_test_pending: None,
             audio: crate::audio::Panel::new(&socket, std::env::var_os("PRIM_UI_VOICE_TEST").is_some()),
             socket,
@@ -212,6 +219,7 @@ impl App {
             h.send(client::Cmd::Leave);
         }
         self.voice.stop();
+        self.watch.stop();
         let socket = self.socket.clone();
         let (tx, rx) = channel();
         let cb = self.repaint_cb();
@@ -227,8 +235,22 @@ impl App {
         self.sent_clients = None;
     }
 
+    /// Start `prim watch` for this room (replacing a running one). Empty `url` joins
+    /// whatever the room is already watching.
+    fn start_watch(&mut self, url: String) {
+        let mut args = vec!["watch".to_string(), format!("--socket={}", self.socket.display())];
+        let url = url.trim();
+        if !url.is_empty() {
+            args.push(url.to_string());
+        }
+        if let Err(e) = self.watch.start(&args) {
+            self.watch.state = ProcState::Failed(e.to_string());
+        }
+    }
+
     fn tick(&mut self, ctx: &egui::Context) {
         self.voice.tick();
+        self.watch.poll(false);
         // The panel reads the level from voice when its microphone is live, else runs its own meter.
         let mic_live = self.voice.sup.running() && self.voice.mic;
         self.audio.tick(mic_live);
@@ -255,6 +277,9 @@ impl App {
         }
         if self.handle.as_ref().is_some_and(|h| h.lock().in_room()) {
             if let Some(d) = self.demo.take() {
+                if let Some(u) = d.split(',').find_map(|p| p.strip_prefix("watch=")) {
+                    self.start_watch(u.to_string());
+                }
                 if d.contains("voice") {
                     self.voice.start(false);
                     let (mic, deaf) = (d.contains("mic"), d.contains("deaf"));
@@ -939,6 +964,11 @@ impl App {
                                     (_, true) => RichText::new(if self.voice.mic { "On, microphone live" } else { "On, microphone muted" }).color(GREEN),
                                     (_, false) => RichText::new(spec.blurb).color(DIM),
                                 },
+                                (None, ClientKind::Watch) => match &self.watch.state {
+                                    ProcState::Failed(e) => RichText::new(e).color(RED),
+                                    _ if self.watch.running() => RichText::new("Playing in mpv").color(GREEN),
+                                    _ => RichText::new(spec.blurb).color(DIM),
+                                },
                                 (None, _) => RichText::new(spec.blurb).color(DIM),
                             };
                             ui.label(sub.size(12.0));
@@ -961,6 +991,34 @@ impl App {
                                     }
                                 } else if ui.button("Turn on").clicked() {
                                     self.voice.start(false);
+                                }
+                            }
+                            (ClientKind::Watch, None) => {
+                                let running = self.watch.running();
+                                if running {
+                                    if ui.button("Stop").on_hover_text("Close mpv and stop watching with the room").clicked() {
+                                        self.watch.stop();
+                                    }
+                                }
+                                let typed = !self.watch_url.trim().is_empty();
+                                let label = if running { "Load this" } else { "Watch together" };
+                                let hint = if typed {
+                                    "Everyone in the room who is watching sees this"
+                                } else if running {
+                                    "Paste a link or a file path first"
+                                } else {
+                                    "Join what the room is already watching"
+                                };
+                                let go = ui.add_enabled(!running || typed, egui::Button::new(label)).on_hover_text(hint).clicked();
+                                let te = ui.add(
+                                    egui::TextEdit::singleline(&mut self.watch_url)
+                                        .hint_text("Paste a link or file path")
+                                        .desired_width(220.0),
+                                );
+                                let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if go || (enter && typed) {
+                                    let u = self.watch_url.clone();
+                                    self.start_watch(u);
                                 }
                             }
                             (ClientKind::Program(_), None) => {

@@ -3,6 +3,7 @@ extends Node3D
 ## reload of res://room/*, VR/desktop view setup, and the --verify oracles.
 ##
 ## User args (after `--`): --socket PATH  --desktop  --verify  --hold SECS
+##   --name DISPLAY_NAME  (C1) --role host|guest|forged|replay|expired --test-dir DIR
 ##   --report FILE  --screenshot FILE
 ## Env: PRIM_SOCKET, PRIM_EVENT_LOG (JSONL event sink), PRIM_FAULT (views1: attach the
 ##   eye probe to a mono viewport, which must trip "render views == scene views").
@@ -52,6 +53,8 @@ var xr_camera: XRCamera3D
 var xr_active := false
 var xrprobe: XRProbe
 var probe_vp: SubViewport
+var session # RoomSession (net/room_session.gd): host/join/invite/identity/profile
+var menu # RoomMenu (ui/room_menu.gd)
 var sub_pose := -1
 var sub_profile := -1
 var _status_timer := 0.0
@@ -79,7 +82,19 @@ func _ready() -> void:
 	client.state_removed.connect(_on_state_removed)
 	var sock: String = args.get("socket", OS.get_environment("PRIM_SOCKET"))
 	print("prim-loop: socket=%s xr=%s verify=%s" % [sock, xr_active, args.has("verify")])
-	client.connect_to(sock)
+	session = preload("res://net/room_session.gd").new()
+	session.name = "RoomSession"
+	add_child(session)
+	session.setup(client, sock, str(args.get("name", OS.get_environment("PRIM_NAME"))))
+	menu = preload("res://ui/room_menu.gd").new()
+	menu.name = "RoomMenu"
+	add_child(menu)
+	menu.setup(session)
+	if args.has("role"):
+		var t = preload("res://net/room_test.gd").new()
+		t.name = "RoomTest"
+		add_child(t)
+		t.run(self, args["role"], args.get("test-dir", ""))
 	sub_pose = client.subscribe("member/*/pose")
 	sub_profile = client.subscribe("member/*/profile")
 	RenderingServer.frame_post_draw.connect(_on_first_frame, CONNECT_ONE_SHOT)
@@ -92,7 +107,7 @@ func _parse_args() -> void:
 	var i := 0
 	while i < a.size():
 		var k: String = a[i]
-		if k in ["--socket", "--hold", "--report", "--screenshot"]:
+		if k in ["--socket", "--hold", "--report", "--screenshot", "--name", "--role", "--test-dir"]:
 			args[k.substr(2)] = a[i + 1]
 			i += 2
 		else:

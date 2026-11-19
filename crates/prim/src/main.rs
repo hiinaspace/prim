@@ -5,6 +5,7 @@
 mod ctl;
 mod room;
 mod voice;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -13,6 +14,7 @@ fn usage() -> ExitCode {
         "usage: prim room found|join <token>|resume <room-hex> [options]\n       \
          prim ctl [--socket PATH] <status|invite|grant|revoke|retire|close|reopen|leave|write|sub|send|listen> ...\n\
          prim voice [track] [options]\n       \
+         prim watch [URL-or-file]   cowatch a video in mpv\n\
          prim ui                    the room window\n\
          \n\
          run `prim room --help`, `prim ctl --help` or `prim voice --help` for the options"
@@ -30,6 +32,7 @@ fn main() -> ExitCode {
         "prim-room" => Some("room".to_string()),
         "prim-ctl" => Some("ctl".to_string()),
         "prim-voice" => Some("voice".to_string()),
+        "prim-watch" => Some("watch".to_string()),
         _ => None,
     };
     let (which, rest): (String, Vec<String>) = match which {
@@ -55,6 +58,7 @@ fn main() -> ExitCode {
         "room" => rt.block_on(room::run(rest)),
         "ctl" => rt.block_on(ctl::run(rest)),
         "voice" => voice::run(rest),
+        "watch" => watch::run(rest),
         "ui" => run_ui(rest),
         _ => return usage(),
     };

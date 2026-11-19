@@ -4045,6 +4045,7 @@ dependencies = [
  "prim-room",
  "prim-ui",
  "prim-voice",
+ "prim-watch",
  "room-core",
  "serde_json",
  "tempfile",
@@ -4136,6 +4137,19 @@ dependencies = [
  "room-core",
  "serde_json",
  "voice-core",
+]
+
+[[package]]
+name = "prim-watch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "data-encoding",
+ "libc",
+ "prim-client",
+ "prim-cowatch",
+ "prim-room",
+ "serde_json",
 ]
 
 [[package]]

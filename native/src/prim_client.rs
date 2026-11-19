@@ -253,6 +253,46 @@ impl PrimClient {
         })
     }
 
+    /// Mint a one-time invite token (reply kind "invite", field "token"). 0 = daemon default.
+    #[func]
+    fn create_invite(&mut self, expiry_ms: i64) -> i64 {
+        self.client
+            .as_ref()
+            .and_then(|c| {
+                c.request(|req| prim_client::wire::Request::CreateInvite {
+                    req,
+                    expiry_in_ms: expiry_ms.max(0) as u64,
+                    relays: vec![],
+                })
+                .ok()
+            })
+            .map_or(-1, |r| r as i64)
+    }
+
+    /// Revoke a member (hex key) or an unused invite's key.
+    #[func]
+    fn revoke(&mut self, subject: GString) -> i64 {
+        self.client
+            .as_ref()
+            .and_then(|c| {
+                c.request(|req| prim_client::wire::Request::Revoke {
+                    req,
+                    subject: subject.to_string(),
+                })
+                .ok()
+            })
+            .map_or(-1, |r| r as i64)
+    }
+
+    /// Leave the room (the daemon then exits).
+    #[func]
+    fn leave(&mut self) -> i64 {
+        self.client
+            .as_ref()
+            .and_then(|c| c.request(|req| prim_client::wire::Request::Leave { req }).ok())
+            .map_or(-1, |r| r as i64)
+    }
+
     /// Ask for the room status; the answer is a `reply` whose data has "status".
     #[func]
     fn request_status(&mut self) -> i64 {
