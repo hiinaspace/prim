@@ -28,7 +28,9 @@ fn cap(who: u8, since: u64) -> Event {
 fn machine(me: u8, since: u64, faults: Faults) -> Cowatch {
     let mut cfg = Config::new(k(me), since);
     cfg.faults = faults;
-    Cowatch::new(cfg, 0).0
+    let mut m = Cowatch::new(cfg, 0).0;
+    m.handle(0, Event::Synced);
+    m
 }
 fn intent(rev: u32, pos_s: u64, ref_us: u64) -> Intent {
     Intent {
@@ -476,6 +478,7 @@ fn playing_alone(faults: Faults) -> (Cowatch, u32) {
     let mut cfg = Config::new(k(A), 1);
     cfg.faults = faults;
     let (mut a, _) = Cowatch::new(cfg, 0);
+    a.handle(0, Event::Synced);
     let acts = a.handle(
         S,
         Event::Command(UserCommand::Load {
@@ -862,4 +865,105 @@ fn the_record_vanishing_before_the_member_event_still_leaves_a_timeline() {
             .any(|w| Intent::decode(&w.2).unwrap().paused),
         "{acts:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------
+// A restarted process with the same member key
+// ---------------------------------------------------------------------------------
+
+fn load_cmd(src: &str) -> Event {
+    Event::Command(UserCommand::Load {
+        kind: SourceKind::Url,
+        source: src.as_bytes().to_vec(),
+    })
+}
+
+fn load_sources(acts: &[Action]) -> Vec<Vec<u8>> {
+    acts.iter()
+        .filter_map(|a| match a {
+            Action::Player(PlayerCmd::Load { source, .. }) => Some(source.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn fresh_coordinator() -> Cowatch {
+    let mut cfg = Config::new(k(A), 50);
+    cfg.faults = Faults::default();
+    let (mut a, _) = Cowatch::new(cfg, 0);
+    a.handle(0, coord(0, A));
+    a
+}
+
+/// A `Load` given before the snapshot is held; the previous run's record then arrives; the
+/// load is applied above it and is what plays.
+#[test]
+fn a_load_before_the_snapshot_waits_and_lands_above_the_previous_runs_record() {
+    let mut a = fresh_coordinator();
+    let acts = a.handle(10_000, load_cmd("https://x.test/b"));
+    assert!(writes(&acts).is_empty() && load_sources(&acts).is_empty(), "held");
+    // The previous run's record (same key, revision 7) is in the snapshot.
+    a.handle(20_000, room_rec(A, &intent(7, 30, 0)));
+    let acts = a.handle(30_000, Event::Synced);
+    assert_eq!(load_sources(&acts), vec![b"https://x.test/b".to_vec()]);
+    let w = writes(&acts);
+    assert_eq!(w.len(), 1);
+    let rec = Intent::decode(&w[0].2).unwrap();
+    assert!(rec.rev > 7, "written above the old run's revision: {}", rec.rev);
+    assert_eq!(rec.source, b"https://x.test/b".to_vec());
+}
+
+/// The host never says `Synced`: the command is released after `sync_wait_ms`.
+#[test]
+fn held_commands_are_released_after_the_wait() {
+    let mut a = fresh_coordinator();
+    a.handle(10_000, load_cmd("https://x.test/b"));
+    let acts = a.handle(2_900_000, Event::Tick);
+    assert!(load_sources(&acts).is_empty());
+    let acts = a.handle(3_100_000, Event::Tick);
+    assert_eq!(load_sources(&acts), vec![b"https://x.test/b".to_vec()]);
+}
+
+/// The snapshot is late (after the wait): the previous run's record arrives after the
+/// command was applied. Our latest is written again above it, and the old run does not win.
+#[test]
+fn a_previous_runs_record_arriving_after_our_write_does_not_win() {
+    let mut a = fresh_coordinator();
+    a.handle(0, Event::Synced);
+    let acts = a.handle(10_000, load_cmd("https://x.test/b"));
+    let first = Intent::decode(&writes(&acts)[0].2).unwrap();
+    assert_eq!(first.rev, 1);
+    // Old run's rev 7 arrives, then the echo of our rev 1.
+    let acts = a.handle(20_000, room_rec(A, &intent(7, 30, 0)));
+    let w = writes(&acts);
+    assert_eq!(w.len(), 1, "restated");
+    let again = Intent::decode(&w[0].2).unwrap();
+    assert_eq!(again.rev, 8);
+    assert_eq!(again.source, b"https://x.test/b".to_vec());
+    let acts = a.handle(25_000, room_rec(A, &first));
+    assert!(writes(&acts).is_empty(), "our own old echo changes nothing");
+    assert_eq!(a.view(26_000).rev, Some(8));
+    // A normal echo of our newest is not a predecessor.
+    let acts = a.handle(30_000, room_rec(A, &again));
+    assert!(writes(&acts).is_empty());
+}
+
+/// Request ids differ between restarts of the same key.
+#[test]
+fn request_ids_are_seeded_from_the_start_time() {
+    let ids = |since: u64| -> u32 {
+        let mut cfg = Config::new(k(B), since);
+        cfg.faults = Faults::default();
+        let (mut b, _) = Cowatch::new(cfg, 0);
+        b.handle(0, Event::Synced);
+        b.handle(0, cap(A, 1));
+        b.handle(0, coord(0, A));
+        let acts = b.handle(S, load_cmd("https://x.test/b"));
+        match sends(&acts)[0].2.clone() {
+            Control::Request { req_id, .. } => req_id,
+            _ => panic!(),
+        }
+    };
+    assert!(ids(5_000) < ids(65_000));
+    assert!(ids(1_800_000_000_000) != ids(1_800_000_060_000));
 }

@@ -37,6 +37,8 @@ pub struct Player {
     seek_done: Option<(u64, f64)>,
     last_us: u64,
     pub has_src: bool,
+    /// What the last `Load` asked for.
+    pub src: Vec<u8>,
     /// Drop the stream (early end of file) when the position first reaches this.
     pub drop_at: Option<f64>,
     /// Fail the next N loads immediately (server refusing).
@@ -62,6 +64,7 @@ impl Player {
             seek_done: None,
             last_us: 0,
             has_src: false,
+            src: Vec::new(),
             drop_at: None,
             fail_loads: 0,
             loads: 0,
@@ -106,8 +109,9 @@ impl Player {
 
     pub fn apply(&mut self, now_us: u64, c: &PlayerCmd) {
         match c {
-            PlayerCmd::Load { token, .. } => {
+            PlayerCmd::Load { token, source, .. } => {
                 self.token = *token;
+                self.src = source.clone();
                 self.loads += 1;
                 self.has_src = true;
                 self.seek_done = None;
@@ -182,6 +186,9 @@ pub struct World {
     pub sim: Sim,
     pub nodes: Vec<Option<Node>>,
     pub faults: Faults,
+    /// Issued by the next `start`, after the machine is up but before it has seen any
+    /// subscription snapshot: a host that feeds `Load` straight after construction.
+    pub early_cmd: Option<UserCommand>,
 }
 
 pub fn net(loss_pct: u64, jitter_ms: u64) -> NetConfig {
@@ -206,6 +213,7 @@ impl World {
             sim,
             nodes: (0..n).map(|_| None).collect(),
             faults: Faults::default(),
+            early_cmd: None,
         }
     }
 
@@ -264,7 +272,11 @@ impl World {
         }
         self.exec(i, actions, &mut q);
         self.drain(i, q);
+        if let Some(c) = self.early_cmd.take() {
+            self.command(i, c);
+        }
         self.collect(i);
+        self.drain(i, vec![Event::Synced]);
     }
 
     /// Player process dies; the daemon stays up with its channels unregistered and the
