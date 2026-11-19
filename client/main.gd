@@ -55,6 +55,9 @@ var xrprobe: XRProbe
 var probe_vp: SubViewport
 var session # RoomSession (net/room_session.gd): host/join/invite/identity/profile
 var menu # RoomMenu (ui/room_menu.gd)
+var avatars # AvatarManager (avatar/avatar_manager.gd): remote members' heads and hands
+var publisher # PosePublisher (avatar/pose_publisher.gd): my head and hands, 20 Hz
+var hand_nodes := {} # "left"/"right" -> XRController3D when in VR
 var sub_pose := -1
 var sub_profile := -1
 var _status_timer := 0.0
@@ -90,12 +93,25 @@ func _ready() -> void:
 	menu.name = "RoomMenu"
 	add_child(menu)
 	menu.setup(session)
+	avatars = preload("res://avatar/avatar_manager.gd").new()
+	add_child(avatars)
+	avatars.setup(client, func(): return session.me, func(k): return session.names.get(k, ""))
+	avatars.sample.connect(_on_avatar_sample)
+	publisher = preload("res://avatar/pose_publisher.gd").new()
+	add_child(publisher)
+	publisher.setup(client, self, func(): return session.lifecycle == "open" and session.me != "")
+	if OS.get_environment("PRIM_FAULT") == "stale":
+		avatars.stale_s = 0.05 # the fault: avatars expire faster than poses arrive
+	if args.has("pose-test"):
+		var pt = preload("res://avatar/pose_test.gd").new()
+		pt.name = "PoseTest"
+		add_child(pt)
+		pt.run(self, args["pose-test"], args.get("test-dir", ""))
 	if args.has("role"):
 		var t = preload("res://net/room_test.gd").new()
 		t.name = "RoomTest"
 		add_child(t)
 		t.run(self, args["role"], args.get("test-dir", ""))
-	sub_pose = client.subscribe("member/*/pose")
 	sub_profile = client.subscribe("member/*/profile")
 	RenderingServer.frame_post_draw.connect(_on_first_frame, CONNECT_ONE_SHOT)
 	if args.has("verify"):
@@ -107,7 +123,7 @@ func _parse_args() -> void:
 	var i := 0
 	while i < a.size():
 		var k: String = a[i]
-		if k in ["--socket", "--hold", "--report", "--screenshot", "--name", "--role", "--test-dir"]:
+		if k in ["--socket", "--hold", "--report", "--screenshot", "--name", "--role", "--test-dir", "--pose-test"]:
 			args[k.substr(2)] = a[i + 1]
 			i += 2
 		else:
@@ -134,6 +150,7 @@ func _setup_camera() -> void:
 			var c := XRController3D.new()
 			c.tracker = hand
 			origin.add_child(c)
+			hand_nodes[hand.trim_suffix("_hand")] = c
 	else:
 		camera = Camera3D.new()
 		camera.position = Vector3(0, 1.7, 3.5)
@@ -213,25 +230,27 @@ func _on_state_value(_sub: int, path: String, writer: String, _live: bool, value
 	var parts := path.split("/")
 	if parts.size() != 3 or parts[0] != "member":
 		return
+	if parts[2] != "profile": # poses are the avatar manager's (binary), not JSON
+		return
 	var parsed = JSON.parse_string(value.get_string_from_utf8())
 	if not (parsed is Dictionary):
 		return
 	if parts[2] == "profile":
 		model.names[writer] = str(parsed.get("name", ""))
-	elif parts[2] == "pose" and parsed.has("pos"):
-		var p: Array = parsed["pos"]
-		var pos := Vector3(p[0], p[1], p[2])
-		var now := Time.get_ticks_msec()
-		model.poses[writer] = {"pos": pos, "yaw": float(parsed.get("yaw", 0.0)),
-			"n": int(parsed.get("n", 0)), "recv_ms": now}
-		var log: Array = model.pose_log.get(writer, [])
-		log.append([now, pos])
-		if log.size() > 600:
-			log = log.slice(log.size() - 600)
-		model.pose_log[writer] = log
-		if writer != model.me and not _peer_pose_sent:
-			_peer_pose_sent = true
-			PrimEvents.emit("peer_pose", JSON.stringify({"writer": writer}))
+
+
+## An avatar sample arrived: keep the model's per-member head track (verify oracles).
+func _on_avatar_sample(key: String, head: Vector3) -> void:
+	var now := Time.get_ticks_msec()
+	model.poses[key] = {"pos": head, "yaw": 0.0, "n": 0, "recv_ms": now}
+	var log: Array = model.pose_log.get(key, [])
+	log.append([now, head])
+	if log.size() > 600:
+		log = log.slice(log.size() - 600)
+	model.pose_log[key] = log
+	if key != model.me and not _peer_pose_sent:
+		_peer_pose_sent = true
+		PrimEvents.emit("peer_pose", JSON.stringify({"writer": key}))
 
 
 func _on_state_removed(_sub: int, path: String) -> void:
@@ -315,7 +334,7 @@ func _verify() -> void:
 			var eyes_ok: bool = xrprobe.check_capture(rec, {"sky": true, "world": true})
 			_checks.append({"name": "per-eye capture (views, non-black, sky/world)", "pass": eyes_ok,
 				"detail": {"buffers": rec.get("buffers"), "scene": rec.get("scene")}})
-			var bp: Variant = view.marker_position(remote[0]) if not remote.is_empty() else null
+			var bp: Variant = avatars.head_position(remote[0]) if not remote.is_empty() else null
 			_check("bot in view of the camera at capture",
 				bp != null and camera.is_position_in_frustum((bp as Vector3) + Vector3(0, 0.8, 0)),
 				{"marker": str(bp)})
@@ -328,14 +347,14 @@ func _verify() -> void:
 		var key: String = remote[0]
 		var travel := _travel(key, 3.0)
 		var age_ms := Time.get_ticks_msec() - int(model.poses.get(key, {}).get("recv_ms", 0))
-		_check("bot marker moves (last 3 s)", travel > 0.3 and age_ms < 1500,
+		_check("bot avatar moves (last 3 s)", travel > 0.3 and age_ms < 1500,
 			{"travel_m": snappedf(travel, 0.01), "last_pose_age_ms": age_ms})
-		var vp: Variant = view.marker_position(key)
+		var vp: Variant = avatars.head_position(key)
 		var want: Vector3 = model.poses.get(key, {}).get("pos", Vector3.ZERO)
-		_check("marker follows pose", vp != null and (vp as Vector3).distance_to(want) < 0.1,
+		_check("avatar head follows pose", vp != null and (vp as Vector3).distance_to(want) < 0.1,
 			{"marker": str(vp), "pose": str(want)})
 	else:
-		_check("bot marker moves (last 3 s)", false, {"reason": "no remote member"})
+		_check("bot avatar moves (last 3 s)", false, {"reason": "no remote member"})
 	if args.has("screenshot"):
 		await RenderingServer.frame_post_draw
 		get_viewport().get_texture().get_image().save_png(args["screenshot"])

@@ -9,6 +9,7 @@
 //! drift fails a test.
 
 pub mod client;
+pub mod pose;
 pub mod transport;
 pub mod wire;
 
