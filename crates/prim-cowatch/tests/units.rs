@@ -692,3 +692,174 @@ fn a_new_authority_continues_the_timeline_and_the_higher_revision_wins() {
     );
     assert_eq!(rec.ref_us, 4 * S);
 }
+
+// ---------------------------------------------------------------------------------
+// Found by the independent review of 728753d
+// ---------------------------------------------------------------------------------
+
+/// B follows A (both have players; A is the coordinator and the record is A's).
+fn follower_with_record() -> Cowatch {
+    let mut b = machine(B, 20, Faults::default());
+    b.handle(0, cap(A, 1));
+    b.handle(0, coord(0, A));
+    b.handle(0, room_rec(A, &intent(1, 10, 5 * S)));
+    b
+}
+
+#[test]
+fn a_restarted_requester_whose_ids_are_behind_is_not_ignored() {
+    let mut a = authority_with_record();
+    // The old process got to id 9.
+    a.handle(2 * S, req(&a, 9, paused(true)));
+    // The new process starts at 1: the authority says stale and names its last id ...
+    let acts = a.handle(3 * S, req(&a, 1, paused(false)));
+    assert_eq!(reply_of(&acts), (1, ReplyStatus::Stale, 9));
+    // ... and a requester that gets that answer re-sends with a higher id, once.
+    let mut b = follower_with_record();
+    let acts = b.handle(S, Event::Command(UserCommand::Pause));
+    let Control::Request { req_id, .. } = sends(&acts)[0].2.clone() else {
+        panic!()
+    };
+    let acts = b.handle(
+        S + 1,
+        Event::Message {
+            from: k(A),
+            payload: Control::Reply {
+                req_id,
+                status: ReplyStatus::Stale,
+                rev: 9,
+            }
+            .encode(),
+        },
+    );
+    assert!(b.view(S + 1).request_pending, "dropped on Stale");
+    let s = sends(&acts);
+    assert_eq!(s.len(), 1);
+    let Control::Request {
+        req_id: again,
+        body,
+        ..
+    } = s[0].2.clone()
+    else {
+        panic!()
+    };
+    assert!(again > 9, "{again}");
+    assert_eq!(body.paused, Some(true));
+}
+
+#[test]
+fn rapid_relative_controls_stack_on_the_pending_request() {
+    let mut b = follower_with_record();
+    // No clock yet: the base is the record's own 10 s. The last request on the wire
+    // carries 40 s, not 20 s.
+    let _ = &mut b;
+    let mut b = follower_with_record();
+    let mut last = None;
+    for n in 0..3 {
+        let acts = b.handle(S + n * 50_000, Event::Command(UserCommand::SeekBy(10.0)));
+        if let Some(x) = sends(&acts).pop() {
+            last = Some(x.2);
+        }
+    }
+    let Some(Control::Request { body, .. }) = last else {
+        panic!()
+    };
+    assert_eq!(body.seek_ms, Some(40_000));
+    // Two toggles inside one round trip cancel out.
+    let mut b = follower_with_record();
+    b.handle(S, Event::Command(UserCommand::Toggle));
+    let acts = b.handle(S + 10_000, Event::Command(UserCommand::Toggle));
+    let Control::Request { body, .. } = sends(&acts)[0].2.clone() else {
+        panic!()
+    };
+    assert_eq!(body.paused, Some(false));
+}
+
+#[test]
+fn hostile_values_neither_panic_nor_freeze_the_room() {
+    let mut b = follower_with_record();
+    // A revision at the top of the range is ignored.
+    let mut evil = intent(u32::MAX, 10, 5 * S);
+    evil.rev = u32::MAX;
+    b.handle(
+        S,
+        Event::Playback {
+            room: false,
+            writer: k(C),
+            value: evil.encode(),
+        },
+    );
+    assert_eq!(b.view(S).rev, Some(1));
+    // A pong from the writer with absurd timestamps is dropped.
+    let acts = b.handle(S + 2_000_000, Event::Tick);
+    let ps = pings(&acts);
+    assert!(!ps.is_empty(), "{acts:?}");
+    let Probe::Ping { id, key, t1_us } = ps[0] else {
+        panic!()
+    };
+    let pong = Probe::Pong {
+        id,
+        key,
+        t1_us,
+        t2_us: 1 << 63,
+        t3_us: 1 << 63,
+    };
+    b.handle(
+        S + 1000,
+        Event::Datagram {
+            from: k(A),
+            payload: pong.encode(),
+        },
+    );
+    assert_eq!(b.view(S + 1000).clock_offset_us, None);
+    // A host clock that steps backwards does not panic.
+    b.handle(10, Event::Tick);
+}
+
+#[test]
+fn the_record_vanishing_before_the_member_event_still_leaves_a_timeline() {
+    // B and C follow A, who is acting (coordinator has no player). A's record is removed
+    // first, then A's member event arrives; B takes over and Pause still works.
+    let mut b = machine(B, 20, Faults::default());
+    b.handle(0, cap(A, 1));
+    b.handle(0, cap(C, 30));
+    let ra = intent(1, 10, 5 * S);
+    b.handle(
+        0,
+        Event::Playback {
+            room: false,
+            writer: k(A),
+            value: ra.encode(),
+        },
+    );
+    b.handle(
+        S,
+        Event::PlaybackRemoved {
+            room: false,
+            writer: Some(k(A)),
+        },
+    );
+    let acts = b.handle(
+        S,
+        Event::Member {
+            key: k(A),
+            state: MemberState::Offline,
+        },
+    );
+    let _ = acts;
+    let mut t = S;
+    let mut acts = Vec::new();
+    for _ in 0..40 {
+        t += 250_000;
+        acts.extend(b.handle(t, Event::Tick));
+    }
+    assert!(b.view(t).is_authority);
+    assert!(b.view(t).rev.is_some(), "timeline lost");
+    let acts = b.handle(t, Event::Command(UserCommand::Pause));
+    assert!(
+        writes(&acts)
+            .iter()
+            .any(|w| Intent::decode(&w.2).unwrap().paused),
+        "{acts:?}"
+    );
+}

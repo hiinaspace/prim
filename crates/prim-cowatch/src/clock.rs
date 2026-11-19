@@ -85,7 +85,8 @@ impl Estimator {
         if !self.ignore_epoch && (Some(key) != self.key || pkey != key) {
             return false;
         }
-        if sent != t1_us || t4 < t1_us || t3_us < t2_us {
+        const LIM: u64 = 1 << 60;
+        if sent != t1_us || t4 < t1_us || t3_us < t2_us || t2_us > LIM || t3_us > LIM || t4 > LIM {
             return false;
         }
         let rtt = (t4 - t1_us) as i64 - (t3_us - t2_us) as i64;

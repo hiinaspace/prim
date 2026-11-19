@@ -333,6 +333,10 @@ pub struct Cowatch {
     caps: BTreeMap<Key, Cap1>,
     blocked: BTreeMap<Key, (u64, u32)>,
     fails: BTreeMap<Key, u32>,
+    ghost: Option<(Key, Intent)>,
+    /// Retest pings in flight to blocked members: member -> probe id.
+    retests: BTreeMap<Key, u32>,
+    next_retest_id: u32,
     room_rec: Option<(Key, Intent)>,
     acting: BTreeMap<Key, Intent>,
     last_written_rev: u32,
@@ -404,6 +408,9 @@ impl Cowatch {
             caps,
             blocked: BTreeMap::new(),
             fails: BTreeMap::new(),
+            ghost: None,
+            retests: BTreeMap::new(),
+            next_retest_id: 0x8000_0000,
             room_rec: None,
             acting: BTreeMap::new(),
             last_written_rev: 0,
@@ -529,6 +536,8 @@ impl Cowatch {
             Event::CapRemoved { writer } => {
                 if writer != self.cfg.me {
                     self.caps.remove(&writer);
+                    self.blocked.remove(&writer);
+                    self.retests.remove(&writer);
                     self.reevaluate(now_us, &mut out);
                 }
             }
@@ -556,6 +565,20 @@ impl Cowatch {
                 }
             }
             Event::PlaybackRemoved { room, writer } => {
+                // The record in force may vanish before the daemon's member event reaches
+                // us (presence-bound records go with their writer): keep it as a ghost so
+                // the successor still has a timeline to continue and players keep going.
+                let was_effective = self.effective().map(|(w, i)| (w, i.clone()));
+                if let Some((w, i)) = was_effective {
+                    let hit = if room {
+                        self.room_rec.as_ref().is_some_and(|r| r.0 == w)
+                    } else {
+                        writer == Some(w)
+                    };
+                    if hit {
+                        self.ghost = Some((w, i));
+                    }
+                }
                 if room {
                     self.room_rec = None;
                 } else if let Some(w) = writer {
@@ -579,9 +602,18 @@ impl Cowatch {
     // ----- record store ------------------------------------------------------
 
     fn store_intent(&mut self, room: bool, writer: Key, i: Intent) {
+        // A revision this high can only be hostile or corrupt; it would freeze the room.
+        if i.rev >= 0x8000_0000 {
+            return;
+        }
+        self.ghost = None;
         if room {
+            // The daemon only delivers room records valid for their epoch, so a foreign
+            // writer's record replaces ours whatever its revision (we may be an
+            // ex-coordinator whose partition-time record is now void). Only our own
+            // echo is ordered against our latest.
             if let Some((w, old)) = &self.room_rec {
-                if *w == self.cfg.me && old.rev > i.rev {
+                if *w == self.cfg.me && writer == self.cfg.me && old.rev > i.rev {
                     return;
                 }
             }
@@ -604,6 +636,7 @@ impl Cowatch {
         room.chain(acting)
             .max_by_key(|(w, i, r)| (i.rev, *r, std::cmp::Reverse(*w)))
             .map(|(w, i, _)| (w, i))
+            .or_else(|| self.ghost.as_ref().map(|(w, i)| (*w, i)))
     }
 
     fn max_rev(&self) -> u32 {
@@ -651,10 +684,10 @@ impl Cowatch {
 
     // ----- authority ---------------------------------------------------------
 
-    fn is_blocked(&self, k: &Key, now_us: u64) -> bool {
-        self.blocked
-            .get(k)
-            .is_some_and(|(until, _)| now_us < *until)
+    /// A member whose player stopped answering stays blocked until it answers again: the
+    /// timestamp in the entry only says when to try it with the next retest ping.
+    fn is_blocked(&self, k: &Key, _now_us: u64) -> bool {
+        self.blocked.contains_key(k)
     }
 
     fn eligible(&self, k: &Key, now_us: u64) -> bool {
@@ -772,10 +805,12 @@ impl Cowatch {
             Some((p, pa, _)) => (p, pa),
             None => {
                 let since = *self.adopt_since.get_or_insert(now_us);
-                if now_us - since < 3_000_000 {
+                if now_us.saturating_sub(since) < 3_000_000 {
                     return;
                 }
-                (base.position_ms as f64 / 1000.0, true)
+                // No timeline to project: hold where our own player is, else at the record.
+                let own = self.player.filter(|_| self.loaded).map(|p| p.position_s);
+                (own.unwrap_or(base.position_ms as f64 / 1000.0), true)
             }
         };
         self.adopt_since = None;
@@ -795,7 +830,7 @@ impl Cowatch {
         body: Option<Body>,
         out: &mut Vec<Action>,
     ) -> u32 {
-        let rev = self.max_rev() + 1;
+        let rev = self.max_rev().saturating_add(1);
         self.last_written_rev = rev;
         let dur_ms = match (&self.player_src, self.player) {
             (Some((k, s)), Some(p))
@@ -953,8 +988,11 @@ impl Cowatch {
                 }
             }
             UserCommand::Play | UserCommand::Pause | UserCommand::Toggle => {
-                let cur = view
-                    .map(|v| v.1)
+                let cur = self
+                    .pending
+                    .as_ref()
+                    .and_then(|p| p.body.paused)
+                    .or_else(|| view.map(|v| v.1))
                     .or_else(|| self.effective().map(|(_, i)| i.paused));
                 let Some(cur) = cur else { return };
                 let paused = match c {
@@ -968,8 +1006,12 @@ impl Cowatch {
                 }
             }
             UserCommand::SeekTo(_) | UserCommand::SeekBy(_) => {
-                let cur = view
-                    .map(|v| v.0)
+                let cur = self
+                    .pending
+                    .as_ref()
+                    .and_then(|p| p.body.seek_ms)
+                    .map(|ms| ms as f64 / 1000.0)
+                    .or_else(|| view.map(|v| v.0))
                     .or_else(|| self.effective().map(|(_, i)| i.position_ms as f64 / 1000.0));
                 let Some(cur) = cur else { return };
                 let mut t = match c {
@@ -1070,6 +1112,7 @@ impl Cowatch {
 
     fn alive(&mut self, k: &Key) {
         self.blocked.remove(k);
+        self.retests.remove(k);
         self.fails.remove(k);
     }
 
@@ -1153,7 +1196,10 @@ impl Cowatch {
                         return;
                     }
                     if req_id < last {
-                        self.send_reply(from, req_id, ReplyStatus::Stale, rev, out);
+                        // A stale reply carries the highest request id seen from this sender, so a
+                        // restarted sender (ids back at 1) can jump past it.
+                        let _ = rev;
+                        self.send_reply(from, req_id, ReplyStatus::Stale, last, out);
                         return;
                     }
                 }
@@ -1175,15 +1221,28 @@ impl Cowatch {
             Control::Reply {
                 req_id,
                 status,
-                rev: _,
+                rev,
             } => {
                 self.alive(&from);
                 if self.pending.as_ref().is_none_or(|p| p.req_id != req_id) {
                     return;
                 }
                 match status {
-                    ReplyStatus::Applied | ReplyStatus::BadRequest | ReplyStatus::Stale => {
-                        self.pending = None
+                    ReplyStatus::Applied | ReplyStatus::BadRequest => self.pending = None,
+                    ReplyStatus::Stale => {
+                        // Our ids are behind what the authority has seen from us (we
+                        // restarted): this request is the newest we have, so re-send it
+                        // with an id above the authority's.
+                        if rev >= req_id {
+                            self.next_req = self.next_req.max(rev.saturating_add(1));
+                            let id = self.next_req;
+                            self.next_req = self.next_req.saturating_add(1);
+                            let p = self.pending.as_mut().unwrap();
+                            p.req_id = id;
+                            p.next_try_us = now_us;
+                        } else {
+                            self.pending = None;
+                        }
                     }
                     ReplyStatus::WrongAuthority => {
                         self.pending.as_mut().unwrap().next_try_us = now_us + 500_000;
@@ -1213,7 +1272,14 @@ impl Cowatch {
                     });
                 }
             }
-            Probe::Pong { .. } => {
+            Probe::Pong { id, .. } => {
+                if id & 0x8000_0000 != 0 {
+                    // Answer to a retest of a blocked member: it has a player again.
+                    if self.retests.get(&from) == Some(&id) {
+                        self.alive(&from);
+                    }
+                    return;
+                }
                 if Some(from) != self.est.key().map(|k| k.holder)
                     && !self.cfg.faults.probe_ignores_epoch
                 {
@@ -1245,7 +1311,7 @@ impl Cowatch {
             return None;
         }
         let off = self.est.offset_us(now_us)?;
-        Some((now_us as i64 + off).max(0) as u64)
+        Some((now_us as i64).saturating_add(off).max(0) as u64)
     }
 
     fn duration_s(&self) -> f64 {
@@ -1397,6 +1463,39 @@ impl Cowatch {
         self.reevaluate(now_us, out);
         self.adopt(now_us, out);
         self.sync_clock(now_us);
+        // Retest blocked members now and then; a pong unblocks them.
+        let due: Vec<Key> = self
+            .blocked
+            .iter()
+            .filter(|(k, (until, _))| {
+                now_us >= *until
+                    && self.caps.contains_key(*k)
+                    && matches!(self.members.get(*k), None | Some(MemberState::Online))
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in due {
+            let id = self.next_retest_id;
+            self.next_retest_id = 0x8000_0000 | self.next_retest_id.wrapping_add(1);
+            self.retests.insert(k, id);
+            let (g, t) = self.coord.map_or((0, 0), |c| (c.generation, c.term));
+            out.push(Action::Datagram {
+                to: k,
+                payload: Probe::Ping {
+                    id,
+                    key: AuthKey {
+                        generation: g,
+                        term: t,
+                        holder: k,
+                    },
+                    t1_us: now_us,
+                }
+                .encode(),
+            });
+            if let Some(b) = self.blocked.get_mut(&k) {
+                b.0 = now_us + self.cfg.block_ms * 1000;
+            }
+        }
         // clock probes
         if let Some(k) = self.est.key() {
             if now_us >= self.next_probe_us {
@@ -1418,8 +1517,10 @@ impl Cowatch {
             let quiet = self
                 .est
                 .last_sample_us()
-                .map_or(now_us - self.probe_since_us, |t| now_us.saturating_sub(t));
-            if now_us - self.probe_since_us > 8_000_000 && quiet > 6_000_000 {
+                .map_or(now_us.saturating_sub(self.probe_since_us), |t| {
+                    now_us.saturating_sub(t)
+                });
+            if now_us.saturating_sub(self.probe_since_us) > 8_000_000 && quiet > 6_000_000 {
                 self.probe_since_us = now_us;
                 self.block(k.holder, now_us);
                 self.reevaluate(now_us, out);
@@ -1525,7 +1626,7 @@ impl Cowatch {
         let current = (tpos - p.position_s).abs();
         if current > self.cfg.persist_drift_s {
             let since = *self.drift_over_since_us.get_or_insert(now_us);
-            if now_us - since >= self.cfg.persist_after_ms * 1000 {
+            if now_us.saturating_sub(since) >= self.cfg.persist_after_ms * 1000 {
                 force = true;
             }
         } else {

@@ -442,3 +442,106 @@ fn steering_inside_the_gap_after_the_coordinator_is_gone() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------
+// Found by the independent review of 728753d
+// ---------------------------------------------------------------------------------
+
+/// The old coordinator's side keeps being used during a partition, so its record runs ahead;
+/// after the heal it must follow the new coordinator and its own controls must work.
+#[test]
+fn a_partition_with_the_old_coordinator_busy_heals_to_one_timeline() {
+    for seed in SEEDS {
+        let mut w = World::new(seed, 4, net(10, 30));
+        start_all(&mut w, &[0, 1, 2, 3], 3600.0);
+        w.command(1, url("https://example.test/a.mp4"));
+        w.run_until(8_000, |w| w.all_playing(&[0, 1, 2, 3]));
+        w.run(5_000);
+        w.sim.partition(&[&[0, 3], &[1, 2]]);
+        w.run(30_000); // the other side elects its own coordinator
+                       // Node 0 stays coordinator on its side and is used a lot meanwhile.
+        w.command(0, UserCommand::SeekTo(2000.0));
+        w.run(500);
+        for _ in 0..3 {
+            w.command(0, UserCommand::Pause);
+            w.run(500);
+            w.command(0, UserCommand::Play);
+            w.run(500);
+        }
+        w.run(5_000);
+        w.sim.heal();
+        w.run(60_000);
+        let live = [0, 1, 2, 3];
+        println!(
+            "seed {seed}: after heal revs {:?} pos {:?}",
+            live.map(|i| w.n(i).m.view(0).rev),
+            live.map(|i| w.n(i).p.pos as i64)
+        );
+        w.command(0, UserCommand::Pause);
+        let ok = w.run_until(15_000, |w| w.all_paused(&live) && w.skew(&live) < 0.3);
+        assert!(
+            ok.is_some(),
+            "seed {seed}: node 0's pause did not reach everyone; skew {}",
+            w.skew(&live)
+        );
+        w.command(0, UserCommand::SeekTo(77.0));
+        let ok = w.run_until(15_000, |w| {
+            live.iter().all(|&i| (w.n(i).p.pos - 77.0).abs() < 1.0)
+        });
+        assert!(
+            ok.is_some(),
+            "seed {seed}: node 0's seek did not reach everyone"
+        );
+    }
+}
+
+/// A guest restarts its player process (request ids start again) and its controls still work.
+#[test]
+fn a_guest_whose_player_restarted_can_still_steer() {
+    for seed in SEEDS {
+        let mut w = World::new(seed, 3, net(10, 30));
+        start_all(&mut w, &[0, 1, 2], 3600.0);
+        w.command(1, url("https://example.test/a.mp4"));
+        settle(&mut w, &[0, 1, 2]);
+        for k in 0..6 {
+            w.command(2, UserCommand::SeekTo(100.0 + k as f64));
+            w.run(1_000);
+        }
+        w.nodes[2] = None;
+        w.start(2, 3600.0, 0.0, 3_000_000, 0.0);
+        settle(&mut w, &[0, 1, 2]);
+        w.command(2, UserCommand::Pause);
+        let ok = w.run_until(10_000, |w| w.all_paused(&[0, 1, 2]));
+        assert!(
+            ok.is_some(),
+            "seed {seed}: the restarted guest's pause was dropped"
+        );
+    }
+}
+
+/// The coordinator's player is gone; a minute later (past the first block window) a guest
+/// still gets control.
+#[test]
+fn control_survives_a_dead_coordinator_player_past_the_block_window() {
+    for seed in SEEDS {
+        let mut w = World::new(seed, 3, net(10, 30));
+        start_all(&mut w, &[0, 1, 2], 3600.0);
+        w.command(1, url("https://example.test/a.mp4"));
+        settle(&mut w, &[0, 1, 2]);
+        w.crash_player(0);
+        w.run(60_000);
+        w.command(2, UserCommand::Pause);
+        let ok = w.run_until(10_000, |w| w.all_paused(&[1, 2]));
+        assert!(
+            ok.is_some(),
+            "seed {seed}: no control 60 s after the coordinator's player died"
+        );
+        assert!(
+            w.n(2)
+                .notices
+                .iter()
+                .all(|(_, n)| *n != Notice::ControlUnavailable),
+            "seed {seed}"
+        );
+    }
+}
