@@ -327,6 +327,14 @@ impl Client {
         Ok(req)
     }
 
+    /// Send any request built from a fresh request id; the reply arrives as a `Reply`
+    /// event carrying the returned id (invite, revoke, leave, ...).
+    pub fn request(&self, make: impl FnOnce(u64) -> Request) -> Result<u64> {
+        let req = self.inner.req();
+        self.inner.send_locked(&make(req))?;
+        Ok(req)
+    }
+
     /// Send any request built from a fresh request id and block for its reply.
     pub fn call(
         &self,
