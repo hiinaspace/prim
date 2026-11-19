@@ -242,7 +242,7 @@ async fn roster_chat_voice_and_non_members() {
         .unwrap();
     a.win.wait_until(5, "lease released in status", || !a.win.lock().voice_lease_held()).await.unwrap();
 
-    // The lease expires when the client is frozen; the supervisor relaunches it.
+    // The lease expires when the client is frozen; the client reconnects itself.
     let mut voice = Voice::new(&a.socket);
     voice.start(false);
     b.win.wait_until(10, "voice back", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
@@ -252,17 +252,18 @@ async fn roster_chat_voice_and_non_members() {
     unsafe { libc::kill(pids[0], libc::SIGSTOP) };
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     unsafe { libc::kill(pids[0], libc::SIGCONT) };
-    let mut relaunched = false;
-    for _ in 0..100 {
+    // Round VC: a lost lease no longer ends the client. It reconnects inside the same
+    // process (same pid, same incarnation), so nothing is relaunched.
+    for _ in 0..30 {
         voice.tick();
-        let now = supervise::find_procs("voice", "rt-socket", &a.socket);
-        if matches!(voice.sup.state, ProcState::Running) && now.len() == 1 && now[0] != pids[0] {
-            relaunched = true;
-            break;
-        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(relaunched, "voice was not relaunched after lease expiry: {:?}", voice.sup.state);
+    let now = supervise::find_procs("voice", "rt-socket", &a.socket);
+    assert!(
+        matches!(voice.sup.state, ProcState::Running) && now == pids,
+        "voice should have reconnected in place after lease expiry: {:?} {now:?} vs {pids:?}",
+        voice.sup.state
+    );
     b.win.wait_until(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     voice.stop();
 
