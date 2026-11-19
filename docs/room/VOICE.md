@@ -173,8 +173,9 @@ Threads; the device callbacks only copy between preallocated ring buffers:
   stream, pushes to the sender's `voice_core::PlayoutReceiver` (see "Receiver" below)
   with both the daemon's arrival stamp and its own read time. Stores the newest
   `Listener`.
-- **mixer:** paced by the output ring's fill (two 10 ms blocks ahead). Per block,
-  per active sender: pull 480 samples from the receiver, render with `prim_hrtf::Renderer`
+- **mixer:** paced by the output ring's fill (two 10 ms blocks ahead; more when the
+  device pulls more at once, see "Ring depth" below). Per block, per sender that is not
+  idle (see "Idle peers and stage timing"): pull 480 samples from the receiver, render with `prim_hrtf::Renderer`
   from the sender's seat relative to the listener pose, gain
   `prim_hrtf::voice_gain(distance) × level_match`, sum. `level_match` is −4.7 dB:
   prim-hrtf runs that much louder than the Godot/Steam Audio path at equal gain
@@ -228,6 +229,43 @@ own (every time is a `u64` of microseconds the caller passes).
   same codec; `voice_core::opus_version()` is asserted in a unit test and printed as
   `opus_version` in the stats JSON.
 
+### Idle peers and stage timing
+
+Between talkspurts a receiver is idle (`is_idle()`), and the mixer stops rendering that peer
+(`IdleGate` in `mixer.rs`): *Render* while it has audio, *Tail* for `ceil((interp_len-1)/480)`
+more blocks of silent input so the HRTF's convolution tail leaves the filter, then *Park*
+(history and gain reset by `reset_source`) and *Skip*. prim-hrtf's CIPIC filters are 200 taps and
+`interp_len()` is a power of two (256), so the tail is one block; the unit test
+`skipping_an_idle_peer_does_not_truncate_the_hrtf_tail` renders a noise burst with and without the skip; the
+tail energy matches within 0.1 dB (identical to float noise: the tail block carries the whole residue).
+A receiver that wakes (a new onset) leaves Skip on its first non-idle block. `--test-no-idle-skip`
+turns the skip off for A/B runs only.
+
+Per-stage histograms (microseconds, per block over all senders) are in the stats JSON under
+`histograms`: `mixer_block_us`, `mixer_lock_us` (taking the per-peer lock), `mixer_pull_us`
+(receiver pull incl. decode and level control), `mixer_hrtf_us`, `mixer_sum_us`. A `mixer`
+object counts `peer_blocks_rendered`, `_tail` and `_skipped`. Per peer, `blocks_skipped`.
+The receiver's concealment is real, not a proxy: `concealed_samples`, `late`, `reordered_accepted`,
+`duplicate`, `local_late`, `dtx_refreshes` come from `PlayoutReceiver::stats()`.
+
+### Ring depth
+
+The device callback records the largest burst it was asked for (callbacks less than 2 ms apart
+add up: ALSA delivers a 1024 quantum as 2 x 512) and the mixer keeps
+`ceil(1.25 x burst / 480)` blocks rendered ahead, between 2 and 8. A fixed two blocks (960
+frames) underran every other pull at quantum 1024 (1126 underruns in 38 s on the R0 build, 0 now).
+Quantum 512 keeps R0's depth; 1024 keeps 3 blocks. Stats: `mixer.out_burst_frames`,
+`mixer.ring_ahead_frames`. The standing playout latency is `floor(target/20)+2` slots: about
+20 ms more than R0's NetEq at the same target.
+
+### Test faults and exit
+
+`prim voice` knobs for the harness, never set in normal use: `--test-drop-burst N,M` (drop M
+of every N packets), `--test-reorder K,D` (hold every Kth packet back D packets),
+`--test-no-idle-skip`, and R0's `--test-drop-every`. They act on the talker after encoding, so
+the receiver sees real network faults. A clean exit flushes held packets and sends the END
+marker, so receivers go idle at once instead of concealing for 120 ms.
+
 ### Seeded-fault proof
 
 The loss, ordering, DTX, wrap and drift oracles live in `voice-core/tests/`. Each was run
@@ -272,3 +310,30 @@ Run on a Linux desktop with real PipeWire devices; histograms land in a CACHEDIR
    ±500 ppm talkers).
 5. Stale-buffer disposal: each incarnation of a talker sends a distinct tone; after a
    restart the listener's output contains none of the old tone.
+6. **Loss** (`loss`): a steady 440 Hz tone, recorded from the private null sink's monitor, with
+   the talker dropping every 50th, every 20th, and 2 of every 50 packets (2 %, 5 %, 4 %).
+   Pass: exact sample accounting (`out + accelerate - preemptive == slots x 960`), receiver
+   concealment within 0.35 points of the scripted rate, recorded duration equal to the receiver's
+   output, and a continuous tone: max sample step at most 4x the tone's own, no run of near-silent
+   samples longer than 24 (0.5 ms). A lossless run is the yardstick (L0). Opus PLC does not keep a
+   pure tone's phase, so the phase hop and amplitude dip are reported, not asserted.
+7. **Ordering** (`reorder`): swapped neighbours are accepted and counted `reordered_accepted`
+   with no concealment and a continuous tone. A packet held 0.8 s is counted `late`, concealed
+   once, never played, and `late + reordered_accepted` equals what the talker held (+-2). The
+   late run's continuity is reported only (the estimator raises the target after a 0.8 s late
+   packet, and the tone is time-stretched to build the buffer).
+8. **Drift** (`drift`): two talkers at +-500 ppm with `--no-dtx`, 90 s: the target stays flat,
+   no concealment, no late, no output underruns.
+9. **Quantum 1024** (`quantum`): the oracle-1 load (7 talkers) with `clock.force-quantum 1024`
+   and the listener at `PIPEWIRE_LATENCY=1024/48000`; the setting is restored afterwards.
+   Pass: 0 underruns after warm-up, `mixer.out_burst_frames >= 1000` and the ring kept above it.
+
+Run one with `uv run --no-project python tools/r0/oracles.py loss|reorder|drift|quantum`, all with
+`all`. `--listener-prim OLD` runs only the listener from another build (the harness's own
+failing-on-old proof); `--godot DIR` points at the r2a-4 inputs when `~/code/prim-hrtf` is gone.
+The oracles measure; they assume a quiet host. `L0` fails and says so when the clean recording
+itself has a hole, which is what a loaded host does to the recorder.
+
+Not built here: the Godot GDExtension (`gdext`) and `voice-mesh-bench` do not compile against the
+current `voice-core` API (they still use the removed `VoiceReceiver` and `PacketArrival`, see `gdext/src/stream.rs`). Nothing in `prim` depends
+on them.

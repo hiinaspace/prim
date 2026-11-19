@@ -22,6 +22,7 @@ RATE = 48000
 SEATS = [-150, -100, -50, 0, 50, 100, 150]
 SKEWS = [0, 500, -500, 0, 250, -250, 0]
 CLIP_ORDER = [0, 1, 2, 3, 0, 1, 2]  # per-talker clip index (default i % 4)
+LISTENER_EXTRA = []  # extra voice args for the listener (the idle A/B turns the skip off)
 LISTENER_PRIM = None  # --listener-prim: run only the listener (node L) with another build (old-receiver proofs)
 LISTENER_ENV = {}  # extra environment for the listener's ALSA stream (the quantum scenario)
 DROP_EVERY = 0  # --drop-every: test-only packet-loss fault on the talkers (proves oracle 1b can fail)
@@ -604,7 +605,7 @@ class Cluster:
         env = self.listener_env() if device else None
         for n in quiet:  # nothing audible may reach the listener while its links are proven
             n.daemon.sig(signal.SIGSTOP)
-        L.start_voice("device" if device else "none", output, extra=["--stats-tone"] + ex, env=env)
+        L.start_voice("device" if device else "none", output, extra=["--stats-tone"] + ex + list(LISTENER_EXTRA), env=env)
         if device:
             time.sleep(0.5)
             if not L.voice.alive():
@@ -917,7 +918,7 @@ def speech_specs(clips, tone_idx=()):
 
 
 # ---------------------------------------------------------------- scenario: baseline / bulk / listener
-def run_load(args, res, audio, scen, bulk, dur, tone_idx=(6,)):
+def run_load(args, res, audio, scen, bulk, dur, tone_idx=(6,), idle_ok=False):
     run = os.path.join(res.run, scen)
     os.makedirs(run, exist_ok=True)
     cl = mk_cluster(run, args, audio, name=scen)
@@ -1055,7 +1056,9 @@ def run_load(args, res, audio, scen, bulk, dur, tone_idx=(6,)):
         f_t, l_t = m(10, 10 + w, "target_delay_ms"), m(span - w, span, "target_delay_ms")
         f_b, l_b = m(10, 10 + w, "buffer_ms"), m(span - w, span, "buffer_ms")
         drift[t.name] = {"target_first": f_t, "target_last": l_t, "buffer_first": f_b, "buffer_last": l_b, "window_s": w}
-        if None in (f_t, l_t, f_b, l_b) or l_t > f_t + 15 or l_b > f_b + 15:
+        if None in (f_t, l_t, f_b, l_b):
+            ok = ok and idle_ok  # a talker that is silent in the window has no buffer to measure
+        elif l_t > f_t + 15 or (not idle_ok and l_b > f_b + 15):  # buffer comparisons need continuous talk
             ok = False
     res.oracle(scen, "1e", "receiver target/buffer delay of +-500 ppm talkers does not trend up", ok, drift)
     return cl, hist_rows, v, counters, counters_daemon
@@ -1704,7 +1707,8 @@ def scen_scenes(args, res, audio):
         run = os.path.join(res.run, "scenes-run", name)
         os.makedirs(run, exist_ok=True)
         # pad every clip to a common loop period so a looped capture plays each exactly once per period
-        clips = [read_mono_wav(v["wav"]) for v in voices]
+        # plan.json holds the absolute path from the machine that rendered it
+        clips = [read_mono_wav(v["wav"] if os.path.exists(v["wav"]) else os.path.join(args.godot, "inputs", os.path.basename(v["wav"]))) for v in voices]
         period = max(len(c) for c in clips) + 2 * RATE
         padded = []
         for i, c in enumerate(clips):
@@ -1904,8 +1908,10 @@ def clean_ref(args, res, audio):
         n = tone_numbers(tr)
         res.oracle("loss", "L0", "lossless tone: every slot plays, none concealed, continuous (yardstick for the loss runs)",
                    bool(tr["flowing"]) and CLEAN_REF["m"] is not None and "max_step" in CLEAN_REF["m"] and n["plc"] == 0 and (n["late"] or 0) == 0
-                   and n["out"] + n["accel"] - n["preempt"] == n["slots"] * 960 and tr["nonfinite"]["after_start"] == 0,
-                   "slots %s, output %s (+accel %s, -preempt %s), plc %s, late %s; %s" % (n["slots"], n["out"], n["accel"], n["preempt"], n["plc"], n["late"], CLEAN_REF["m"]))
+                   and n["out"] + n["accel"] - n["preempt"] == n["slots"] * 960 and tr["nonfinite"]["after_start"] == 0
+                   and CLEAN_REF["m"].get("max_step", 9) <= 1.5 * lossless_step(CLEAN_REF["m"]) and CLEAN_REF["m"].get("max_silent_run", 9e9) <= SILENT_RUN_MAX,
+                   "slots %s, output %s (+accel %s, -preempt %s), plc %s, late %s; %s; %s. A failure here with no listener underrun means the host disturbed the recording (host load), not the receiver: rerun on a quiet host" %
+                   (n["slots"], n["out"], n["accel"], n["preempt"], n["plc"], n["late"], CLEAN_REF["m"], health(tr)))
     return CLEAN_REF["m"]
 
 
@@ -1922,22 +1928,30 @@ CONCEAL_TOL_PCT = 0.35    # concealed_pct vs the scripted rate, in percentage po
 SPAN_TOL_S = 0.020        # recorded tone duration vs the receiver's output samples
 
 
+def lossless_step(ref):
+    """Largest sample step of the pure tone at the amplitude the lossless run measured (2 pi f A / fs,
+    +10 % for the 440 Hz peak landing between samples). Computed, not read from the clean recording, so
+    a glitch in one recording (a starved recorder on a loaded host) cannot move every other oracle's
+    yardstick; L0 asserts the clean recording agrees with it."""
+    return 1.1 * 2 * math.pi * TONE_HZ / RATE * ref["ref_amp"]
+
+
 def continuous(a, ref):
-    return (a is not None and ref is not None and "max_step" in a and "max_step" in ref
-            and a["max_step"] <= STEP_RATIO_MAX * ref["max_step"] and a["max_silent_run"] <= SILENT_RUN_MAX)
+    return (a is not None and ref is not None and "max_step" in a and "ref_amp" in ref
+            and a["max_step"] <= STEP_RATIO_MAX * lossless_step(ref) and a["max_silent_run"] <= SILENT_RUN_MAX)
 
 
 def health(tr):
     """Listener-side facts that tell a glitch in the code from one in the recording path."""
     h = tr["v"]["histograms"]
-    return "listener underruns %s total, callback gap max %s us, mixer block max %s us" % (
-        tr["v"]["underruns"], h["callback_gap_us"]["max"], h["mixer_block_us"]["max"])
+    return "listener underruns %s total, callback gap max %s us, mixer block max %s us, host load1 %.1f" % (
+        tr["v"]["underruns"], h["callback_gap_us"]["max"], h["mixer_block_us"]["max"], os.getloadavg()[0])
 
 
 def cont_detail(a, ref):
     g = lambda d, k: None if not d or d.get(k) is None else round(d[k], 4)
     return ("max step %s (at %s s) vs lossless %s, longest near-silent run %s samples (lossless %s); info: amp dip min %s, phase hop jump %s rad (lossless %s)" %
-            (g(a, "max_step"), g(a, "max_step_at_s"), g(ref, "max_step"), a and a.get("max_silent_run"), ref and ref.get("max_silent_run"),
+            (g(a, "max_step"), g(a, "max_step_at_s"), None if not ref else round(lossless_step(ref), 4), a and a.get("max_silent_run"), ref and ref.get("max_silent_run"),
              g(a, "amp_min_ratio"), g(a, "phase_hop_jump_rad"), g(ref, "phase_hop_jump_rad")))
 
 
@@ -2103,10 +2117,81 @@ def scen_quantum(args, res, audio):
                 "plc_pct": {k: round(d["concealed_active_pct"], 3) for k, d in res.data[scen].items() if isinstance(d, dict) and "accepted" in d}})
 
 
+def paused_clips(args, res):
+    """Seven looping WAVs where the talkers take turns: talker i speaks its clip in window i % 3 of a
+    three-window cycle and is silent in the others (about one third of the time, at most three at once)."""
+    clips = [read_mono_wav(c) for c in args.clips]
+    win = max(len(c) for c in clips) + RATE // 2
+    outd = os.path.join(res.run, "paused-clips")
+    os.makedirs(outd, exist_ok=True)
+    paths = []
+    for i in range(7):
+        c = clips[CLIP_ORDER[i] % len(clips)]
+        w = array.array("h", [0] * (3 * win))
+        o = (i % 3) * win
+        w[o:o + len(c)] = c
+        pth = os.path.join(outd, "talker%d.wav" % i)
+        f = wave.open(pth, "wb")
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(RATE)
+        f.writeframes(w.tobytes())
+        f.close()
+        paths.append(pth)
+    return paths
+
+
+def scen_idle(args, res, audio):
+    """Silent peers: speech with pauses (talkers take turns), idle skip on and off, then the
+    continuous-talk case (all seven always speaking) with the skip on."""
+    global CLIP_ORDER
+    scen = "idle"
+    out = {}
+    saved_clips, saved_order = args.clips, CLIP_ORDER
+    try:
+        args.clips = paused_clips(args, res)
+        CLIP_ORDER = list(range(7))
+        for label, extra in (("skip", []), ("noskip", ["--test-no-idle-skip"])):
+            LISTENER_EXTRA[:] = extra
+            try:
+                cl, rows, v, c, _ = run_load(args, res, audio, scen + "-" + label, False, 60 * args.scale, idle_ok=True)
+            finally:
+                LISTENER_EXTRA[:] = []
+            out[label] = idle_row(res, scen + "-" + label, v)
+    finally:
+        args.clips, CLIP_ORDER = saved_clips, saved_order
+    cl, rows, v, c, _ = run_load(args, res, audio, scen + "-continuous", False, 60 * args.scale)
+    out["continuous"] = idle_row(res, scen + "-continuous", v)
+    a, b, k = out["skip"], out["noskip"], out["continuous"]
+    res.data[scen] = out
+    tot = lambda r: (r["skipped"] or 0) + (r["rendered"] or 0) + (r["tail"] or 0)
+    share = (a["skipped"] or 0) / max(1, tot(a))
+    kshare = (k["skipped"] or 0) / max(1, tot(k))
+    f = lambda x: None if x is None else round(x, 2)
+    res.oracle(scen, "idle-skip", "speech with pauses: >= 30 % of peer-blocks are skipped, none with the skip off, the skip lowers the listener's CPU and mixer block p99, no underruns",
+               share >= 0.3 and not b["skipped"] and a["cpu_pct"] is not None and b["cpu_pct"] is not None and a["cpu_pct"] < b["cpu_pct"]
+               and a["underruns"] == 0 and b["underruns"] == 0,
+               "skip on: cpu %s %% of a core, skipped %.0f %% of %d peer-blocks, block p99 %s us, p99.9 %s us, max %s us, underruns %s; skip off: cpu %s %%, block p99 %s us, p99.9 %s us, max %s us, underruns %s" %
+               (f(a["cpu_pct"]), 100 * share, tot(a), a["stages"]["block"]["p99"], a["stages"]["block"]["p99_9"], a["stages"]["block"]["max"], a["underruns"],
+                f(b["cpu_pct"]), b["stages"]["block"]["p99"], b["stages"]["block"]["p99_9"], b["stages"]["block"]["max"], b["underruns"]))
+    res.oracle(scen, "idle-continuous", "continuous talk (7 talkers always speaking): little is skipped and nothing underruns (info: the skip gives nothing here)",
+               k["underruns"] == 0,
+               "skipped %.1f %% of %d peer-blocks, cpu %s %% of a core, block p99 %s us, p99.9 %s us, max %s us, underruns %s" %
+               (100 * kshare, tot(k), f(k["cpu_pct"]), k["stages"]["block"]["p99"], k["stages"]["block"]["p99_9"], k["stages"]["block"]["max"], k["underruns"]))
+
+
+def idle_row(res, name, v):
+    d = res.data[name]
+    mx = v.get("mixer") or {}
+    return {"cpu_pct": d.get("listener_cpu_pct_of_core"), "stages": d["mixer"]["stages_us_per_block"],
+            "rendered": mx.get("peer_blocks_rendered"), "tail": mx.get("peer_blocks_tail"), "skipped": mx.get("peer_blocks_skipped"),
+            "underruns": v["underruns"], "listener_age_us": hist_row(v["histograms"]["listener_age_us"])}
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "all"])
+    ap.add_argument("scenario", choices=["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "idle", "all"])
     ap.add_argument("--prim", default=os.path.join(ROOT, "target/release/prim"))
     ap.add_argument("--out", default=os.path.join(ROOT, ".local/r0-runs"))
     ap.add_argument("--scale", type=float, default=1.0, help="scale the long durations (debug)")
@@ -2143,7 +2228,7 @@ def main():
     env = environment(args.prim)
     env["default_audio_before"] = audio.default_before
     log("run dir", run)
-    todo = ["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum"] if args.scenario == "all" else [args.scenario]
+    todo = ["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "idle"] if args.scenario == "all" else [args.scenario]
     base = bulk = None
     try:
         for s in todo:
@@ -2170,6 +2255,8 @@ def main():
                     scen_drift(args, res, audio)
                 elif s == "quantum":
                     scen_quantum(args, res, audio)
+                elif s == "idle":
+                    scen_idle(args, res, audio)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
