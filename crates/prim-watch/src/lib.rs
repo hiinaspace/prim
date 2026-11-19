@@ -330,7 +330,15 @@ pub fn run(args: &dyn Flags) -> Result<ExitCode> {
         .value("ipc")
         .map(PathBuf::from)
         .unwrap_or_else(|| socket.with_file_name(format!("mpv-{}.sock", std::process::id())));
-    let source = args.positional().first().cloned().filter(|s| !s.trim().is_empty());
+    let source = args.positional().first().cloned().filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            // A relative file path means a different file on every member; make it absolute.
+            if !s.contains("://") && std::path::Path::new(&s).exists() {
+                std::fs::canonicalize(&s).map(|p| p.to_string_lossy().into_owned()).unwrap_or(s)
+            } else {
+                s
+            }
+        });
     let verbose = std::env::var_os("PRIM_WATCH_DEBUG").is_some();
 
     // SAFETY: the handler only stores to an atomic.
