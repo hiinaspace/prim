@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::transport::{Conn, Transport};
-use crate::wire::{self, b64, Event, ReplyJson, Request};
+use crate::wire::{self, b64, Event, ReplyJson, Request, VoiceStatus};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
@@ -57,6 +57,40 @@ pub struct Client {
     rx: Receiver<ClientEvent>,
     worker: Option<JoinHandle<()>>,
 }
+
+/// Why a voice request failed.
+#[derive(Debug)]
+pub enum VoiceError {
+    /// No voice client holds the lease (nothing was changed or remembered).
+    NotRunning,
+    /// The voice client did not acknowledge within 1 s.
+    NoAck,
+    /// The request changed nothing.
+    BadRequest,
+    /// The daemon connection failed.
+    Io(Error),
+    Other(String),
+}
+
+impl From<Error> for VoiceError {
+    fn from(e: Error) -> Self {
+        VoiceError::Io(e)
+    }
+}
+
+impl std::fmt::Display for VoiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VoiceError::NotRunning => write!(f, "voice not running"),
+            VoiceError::NoAck => write!(f, "voice did not acknowledge (no ack)"),
+            VoiceError::BadRequest => write!(f, "nothing to change"),
+            VoiceError::Io(e) => write!(f, "{e}"),
+            VoiceError::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::error::Error for VoiceError {}
 
 fn not_connected() -> Error {
     Error::new(ErrorKind::NotConnected, "not connected to the room daemon")
@@ -358,6 +392,49 @@ impl Client {
                 ErrorKind::ConnectionAborted,
                 "daemon connection lost while waiting",
             )),
+        }
+    }
+
+    /// Set the voice client's mic / deafen / tray_live and wait for its report. `mic:
+    /// Some(true)` is a live microphone (unmute), `Some(false)` mutes; `deaf: Some(true)`
+    /// deafens. `None` leaves a field alone. Returns what the voice client reported after
+    /// applying the change, so the caller shows that and not what it asked for. Blocks for
+    /// the daemon's reply (the daemon waits at most 1 s for the client).
+    pub fn voice_control(
+        &self,
+        mic: Option<bool>,
+        deaf: Option<bool>,
+        tray_live: Option<bool>,
+    ) -> std::result::Result<VoiceStatus, VoiceError> {
+        self.voice_call(
+            |req| Request::VoiceControl {
+                req,
+                mic,
+                deaf,
+                tray_live,
+            },
+        )
+    }
+
+    /// The voice client's last reported state (`voice_running` false: no client holds the
+    /// lease). Read it after reconnecting to learn what voice is doing.
+    pub fn voice_status(&self) -> std::result::Result<VoiceStatus, VoiceError> {
+        self.voice_call(|req| Request::VoiceStatus { req })
+    }
+
+    fn voice_call(
+        &self,
+        make: impl FnOnce(u64) -> Request,
+    ) -> std::result::Result<VoiceStatus, VoiceError> {
+        match self.call(make, Duration::from_millis(2500))? {
+            ReplyJson::Voice { voice } => Ok(voice),
+            ReplyJson::Error { code } => Err(match code.as_str() {
+                "voice_not_running" => VoiceError::NotRunning,
+                "voice_no_ack" => VoiceError::NoAck,
+                "bad_request" => VoiceError::BadRequest,
+                _ => VoiceError::Other(code),
+            }),
+            other => Err(VoiceError::Other(format!("unexpected reply {other:?}"))),
         }
     }
 

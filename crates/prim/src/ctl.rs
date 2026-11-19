@@ -23,6 +23,11 @@ prim ctl [--socket PATH] <subcommand>
   listen CHANNEL [--count N] [--timeout SECS]      register the channel, print messages
   chat send TEXT...                    post a line to the room chat (channel 100; see docs/room/WINDOW.md)
   chat tail [--count N] [--timeout SECS]  print chat lines as they arrive (nothing from before you started)
+  voice mute|unmute|deafen|undeafen|tray-live|no-tray|status
+                                       change or read the running voice client without restarting it;
+                                       prints its own report as JSON (mic, muted, deaf, listening,
+                                       tray_live, incarnation, voice_running, tracking_held). Fails
+                                       with: voice not running, or: no ack, instead of remembering
 ";
 
 pub async fn run(args: Vec<String>) -> Result<ExitCode> {
@@ -36,6 +41,9 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("PRIM_SOCKET").map(PathBuf::from))
         .unwrap_or_else(local::default_socket_path);
+    if args.positional[0] == "voice" {
+        return voice(&socket, &args).await;
+    }
     if args.positional[0] == "chat" {
         return chat(&socket, &args).await;
     }
@@ -336,6 +344,89 @@ fn parse_duration_ms(s: &str) -> Result<u64> {
     Ok(n * mult)
 }
 
+/// What a `prim ctl voice <sub>` word asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VoiceOp {
+    Status,
+    Control {
+        mic: Option<bool>,
+        deaf: Option<bool>,
+        tray_live: Option<bool>,
+    },
+}
+
+/// `mute`, `unmute`, `deafen`, `undeafen`, `tray-live`, `no-tray`, `status`. `mic: true` is a
+/// live microphone.
+pub fn parse_voice_op(p: &[String]) -> Result<VoiceOp, String> {
+    let ctl = |mic, deaf, tray_live| VoiceOp::Control {
+        mic,
+        deaf,
+        tray_live,
+    };
+    if p.len() > 2 {
+        return Err(format!("voice: unexpected {:?}", p[2]));
+    }
+    match p.get(1).map(String::as_str) {
+        Some("status") => Ok(VoiceOp::Status),
+        Some("mute") => Ok(ctl(Some(false), None, None)),
+        Some("unmute") => Ok(ctl(Some(true), None, None)),
+        Some("deafen") => Ok(ctl(None, Some(true), None)),
+        Some("undeafen") => Ok(ctl(None, Some(false), None)),
+        Some("tray-live") => Ok(ctl(None, None, Some(true))),
+        Some("no-tray") => Ok(ctl(None, None, Some(false))),
+        Some(other) => Err(format!(
+            "voice: unknown subcommand {other:?} (mute, unmute, deafen, undeafen, tray-live, no-tray, status)"
+        )),
+        None => Err("voice: missing subcommand (mute, unmute, deafen, undeafen, tray-live, no-tray, status)".into()),
+    }
+}
+
+async fn voice(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
+    let op = match parse_voice_op(&args.positional) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("prim ctl: {e}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let mut c = Client::connect(socket)
+        .await
+        .with_context(|| format!("connecting to {}", socket.display()))?;
+    let r = c
+        .call(|req| match op {
+            VoiceOp::Status => Request::VoiceStatus { req },
+            VoiceOp::Control {
+                mic,
+                deaf,
+                tray_live,
+            } => Request::VoiceControl {
+                req,
+                mic,
+                deaf,
+                tray_live,
+            },
+        })
+        .await?;
+    match r {
+        ReplyJson::Voice { voice } => {
+            println!("{}", serde_json::to_string(&voice)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        ReplyJson::Error { code } => {
+            eprintln!(
+                "prim ctl: {}",
+                match code.as_str() {
+                    "voice_not_running" => "voice not running",
+                    "voice_no_ack" => "voice did not acknowledge (no ack)",
+                    other => other,
+                }
+            );
+            Ok(ExitCode::FAILURE)
+        }
+        other => reply_result(other),
+    }
+}
+
 fn reply_result(r: ReplyJson) -> Result<ExitCode> {
     match r {
         ReplyJson::Ok => {
@@ -532,5 +623,38 @@ async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
             Ok(ExitCode::FAILURE)
         }
         _ => bail!("chat: use `chat send TEXT` or `chat tail`"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn voice_words_map_to_requests() {
+        use VoiceOp::*;
+        let c = |mic, deaf, tray_live| Control {
+            mic,
+            deaf,
+            tray_live,
+        };
+        assert_eq!(parse_voice_op(&p(&["voice", "status"])), Ok(Status));
+        assert_eq!(parse_voice_op(&p(&["voice", "mute"])), Ok(c(Some(false), None, None)));
+        assert_eq!(parse_voice_op(&p(&["voice", "unmute"])), Ok(c(Some(true), None, None)));
+        assert_eq!(parse_voice_op(&p(&["voice", "deafen"])), Ok(c(None, Some(true), None)));
+        assert_eq!(parse_voice_op(&p(&["voice", "undeafen"])), Ok(c(None, Some(false), None)));
+        assert_eq!(parse_voice_op(&p(&["voice", "tray-live"])), Ok(c(None, None, Some(true))));
+        assert_eq!(parse_voice_op(&p(&["voice", "no-tray"])), Ok(c(None, None, Some(false))));
+    }
+
+    #[test]
+    fn bad_voice_arguments_are_refused_before_any_connection() {
+        assert!(parse_voice_op(&p(&["voice"])).is_err());
+        assert!(parse_voice_op(&p(&["voice", "silence"])).is_err());
+        assert!(parse_voice_op(&p(&["voice", "mute", "now"])).is_err());
     }
 }

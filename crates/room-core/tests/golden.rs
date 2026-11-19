@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use room_core::frame::{caps, AckStatus, Datagram, Frame, Hello, Reason, Target};
 use room_core::grants::GrantSet;
 use room_core::record::{build, Kind, Record};
-use room_core::rt::{peer_flags, Pose, Role, RtMsg, RT_PROTO};
+use room_core::rt::{peer_flags, report_bits, Pose, Role, RtMsg, RT_PROTO};
 use room_core::staterec::{Class, Lifetime, Presence, Scope, StateRecord, Version};
 use room_core::token::InviteToken;
 use room_core::voice::{
@@ -361,12 +361,52 @@ fn vectors() -> BTreeMap<String, String> {
                 incarnation: 0x8badf00d,
             },
         ),
+        (
+            "rt.set_state",
+            RtMsg::SetState {
+                flags: voice_state::LISTENING,
+                incarnation: 0x8badf00d,
+            },
+        ),
+        (
+            "rt.voice_report",
+            RtMsg::VoiceReport {
+                ack: 0x0102_0304,
+                state: report_bits::MUTED | report_bits::TRAY_LIVE,
+            },
+        ),
+        (
+            "rt.voice_control",
+            RtMsg::VoiceControl {
+                req: 0x0102_0304,
+                mic: Some(false),
+                deaf: None,
+                tray_live: Some(true),
+            },
+        ),
+        (
+            "rt.tracking_lease",
+            RtMsg::TrackingLease { held: true },
+        ),
     ] {
         put(name, &m.encode());
+    }
+    // Negative vectors for the control kinds: each must fail the strict decoder.
+    for (name, bytes) in RT_NEGATIVES {
+        put(name, bytes);
     }
     v.insert("token".into(), token_text);
     v
 }
+
+/// `VoiceControl` with req 0; with an unknown tri-state; `VoiceReport` with an unknown bit;
+/// `TrackingLease` with held = 2.
+const RT_NEGATIVES: &[(&str, &[u8])] = &[
+    ("rtbad.control_req_0", &[0x87, 0, 0, 0, 0, 1, 0, 0]),
+    ("rtbad.control_tristate_3", &[0x87, 1, 0, 0, 0, 3, 0, 0]),
+    ("rtbad.report_bit_3", &[0x06, 1, 0, 0, 0, 0x08]),
+    ("rtbad.tracking_held_2", &[0x88, 2]),
+];
 
 fn voice_env() -> VoiceEnvelope {
     VoiceEnvelope {
@@ -512,6 +552,9 @@ fn golden_vectors_decode() {
     for (k, v) in want.iter().filter(|(k, _)| k.starts_with("rt.")) {
         let b = unhex(v);
         assert_eq!(RtMsg::decode(&b).unwrap().encode(), b, "{k}");
+    }
+    for (name, _) in RT_NEGATIVES {
+        assert!(RtMsg::decode(&unhex(&want[*name])).is_err(), "{name} accepted");
     }
     let vs = unhex(&want["voice.state"]);
     assert_eq!(VoiceState::decode(&vs).unwrap().encode(), vs);

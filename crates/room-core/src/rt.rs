@@ -43,8 +43,22 @@ pub mod refuse {
 pub mod revoke {
     /// A newer session took the lease over.
     pub const TAKEOVER: u8 = 1;
-    /// Nothing arrived within the lease TTL.
+    /// Nothing arrived within the lease TTL. Not fatal to a voice client: it reconnects.
     pub const EXPIRED: u8 = 2;
+    /// The daemon ended the lease for a reason the client must not retry (reserved; nothing
+    /// sends it yet). Fatal to a voice client, like `TAKEOVER`, and so is any unknown code.
+    pub const POLICY: u8 = 3;
+}
+
+/// Bits of `RtMsg::VoiceReport::state`: what the voice client is doing, in its own words.
+pub mod report_bits {
+    /// The microphone is muted by the user (the capture stream may still run).
+    pub const MUTED: u8 = 1 << 0;
+    /// Playback is deafened.
+    pub const DEAF: u8 = 1 << 1;
+    /// The supervisor said a tracking-lease loss is not a reason to mute.
+    pub const TRAY_LIVE: u8 = 1 << 2;
+    pub const ALL: u8 = MUTED | DEAF | TRAY_LIVE;
 }
 
 pub mod peer_flags {
@@ -89,6 +103,15 @@ pub enum RtMsg {
         flags: u8,
         incarnation: u32,
     },
+    /// Voice client -> daemon: the client's own mic / deaf / tray_live state after it
+    /// applied a `VoiceControl` (or changed by itself), sent right after the `SetState`
+    /// that carries the wire flags. `ack` is the `req` of the `VoiceControl` it answers,
+    /// 0 when unsolicited. The daemon keeps the last one for `voice-status`.
+    VoiceReport {
+        ack: u32,
+        /// `report_bits`.
+        state: u8,
+    },
     // daemon -> client
     Welcome {
         proto: u16,
@@ -119,6 +142,38 @@ pub enum RtMsg {
     Revoked {
         reason: u8,
     },
+    /// Daemon -> voice client: change mic / deaf / tray_live. `None` leaves a field as
+    /// it is. `req` is nonzero and is echoed in the `VoiceReport` that answers.
+    VoiceControl {
+        req: u32,
+        /// `Some(true)`: microphone live (unmuted).
+        mic: Option<bool>,
+        /// `Some(true)`: deafened.
+        deaf: Option<bool>,
+        tray_live: Option<bool>,
+    },
+    /// Daemon -> voice client: whether a `tracking_source` lease is held now. Sent when
+    /// the voice lease starts and on every change.
+    TrackingLease {
+        held: bool,
+    },
+}
+
+fn tri(v: Option<bool>) -> u8 {
+    match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+fn untri(b: u8) -> Result<Option<bool>, DecodeError> {
+    match b {
+        0 => Ok(None),
+        1 => Ok(Some(false)),
+        2 => Ok(Some(true)),
+        _ => Err(DecodeError::Field("tri-state")),
+    }
 }
 
 fn put_pose(w: &mut Writer, p: &Pose) {
@@ -177,6 +232,9 @@ impl RtMsg {
             RtMsg::SetState { flags, incarnation } => {
                 w.u8(0x05).u8(*flags).u32(*incarnation);
             }
+            RtMsg::VoiceReport { ack, state } => {
+                w.u8(0x06).u32(*ack).u8(*state);
+            }
             RtMsg::Welcome {
                 proto,
                 self_key,
@@ -222,6 +280,21 @@ impl RtMsg {
             RtMsg::Revoked { reason } => {
                 w.u8(0x86).u8(*reason);
             }
+            RtMsg::VoiceControl {
+                req,
+                mic,
+                deaf,
+                tray_live,
+            } => {
+                w.u8(0x87)
+                    .u32(*req)
+                    .u8(tri(*mic))
+                    .u8(tri(*deaf))
+                    .u8(tri(*tray_live));
+            }
+            RtMsg::TrackingLease { held } => {
+                w.u8(0x88).u8(*held as u8);
+            }
         }
         w.finish()
     }
@@ -262,6 +335,14 @@ impl RtMsg {
                 flags: r.u8()?,
                 incarnation: r.u32()?,
             },
+            0x06 => {
+                let ack = r.u32()?;
+                let state = r.u8()?;
+                if state & !report_bits::ALL != 0 {
+                    return Err(DecodeError::Field("voice report bits"));
+                }
+                RtMsg::VoiceReport { ack, state }
+            }
             0x81 => RtMsg::Welcome {
                 proto: r.u16()?,
                 self_key: Key(r.array()?),
@@ -286,6 +367,25 @@ impl RtMsg {
                 incarnation: r.u32()?,
             },
             0x86 => RtMsg::Revoked { reason: r.u8()? },
+            0x87 => {
+                let req = r.u32()?;
+                if req == 0 {
+                    return Err(DecodeError::Field("voice control req"));
+                }
+                RtMsg::VoiceControl {
+                    req,
+                    mic: untri(r.u8()?)?,
+                    deaf: untri(r.u8()?)?,
+                    tray_live: untri(r.u8()?)?,
+                }
+            }
+            0x88 => RtMsg::TrackingLease {
+                held: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(DecodeError::Field("held")),
+                },
+            },
             k => return Err(DecodeError::Kind(k)),
         };
         r.end()?;
@@ -359,6 +459,17 @@ mod tests {
                 incarnation: 5,
             },
             RtMsg::Revoked { reason: 2 },
+            RtMsg::VoiceReport {
+                ack: 7,
+                state: report_bits::MUTED | report_bits::TRAY_LIVE,
+            },
+            RtMsg::VoiceControl {
+                req: 9,
+                mic: Some(false),
+                deaf: None,
+                tray_live: Some(true),
+            },
+            RtMsg::TrackingLease { held: true },
         ] {
             let b = m.encode();
             assert_eq!(RtMsg::decode(&b).unwrap(), m);
@@ -366,5 +477,36 @@ mod tests {
             t.push(0);
             assert!(RtMsg::decode(&t).is_err());
         }
+    }
+
+    #[test]
+    fn control_messages_are_strict() {
+        // unknown tri-state, req 0, unknown report bits, held other than 0/1
+        for bad in [
+            vec![0x87, 1, 0, 0, 0, 3, 0, 0],
+            vec![0x87, 0, 0, 0, 0, 1, 0, 0],
+            vec![0x87, 1, 0, 0, 0, 0, 0, 9],
+            vec![0x06, 0, 0, 0, 0, 8],
+            vec![0x88, 2],
+            vec![0x88],
+            vec![0x87, 1, 0, 0, 0, 1, 1],
+        ] {
+            assert!(RtMsg::decode(&bad).is_err(), "{bad:?}");
+        }
+        // old kinds are untouched: 0x05 still carries exactly flags + incarnation
+        let m = RtMsg::SetState {
+            flags: 3,
+            incarnation: 4,
+        };
+        assert_eq!(m.encode(), vec![0x05, 3, 4, 0, 0, 0]);
+        // the three tri-state values and their wire bytes
+        let b = RtMsg::VoiceControl {
+            req: 1,
+            mic: Some(true),
+            deaf: Some(false),
+            tray_live: None,
+        }
+        .encode();
+        assert_eq!(b, vec![0x87, 1, 0, 0, 0, 2, 1, 0]);
     }
 }

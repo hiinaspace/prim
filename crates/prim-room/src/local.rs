@@ -28,6 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::driver::{ClientMsg, DriverHandle, RouteInfo};
+use crate::rt::RtShared;
 
 pub const MAX_MESSAGE: usize = 1 << 20;
 /// Updates written per drain.
@@ -137,6 +138,23 @@ pub enum Request {
     Leave {
         req: u64,
     },
+    /// Change the voice client's state and wait for its acknowledging report (the voice
+    /// client owns the truth; the reply is what it reported). `mic: true` = microphone
+    /// live, `deaf: true` = deafened. Fields left out are unchanged. Errors:
+    /// `voice_not_running`, `voice_no_ack` (1 s), `bad_request` (nothing to change).
+    VoiceControl {
+        req: u64,
+        #[serde(default)]
+        mic: Option<bool>,
+        #[serde(default)]
+        deaf: Option<bool>,
+        #[serde(default)]
+        tray_live: Option<bool>,
+    },
+    /// The voice client's last reported state (never a request to it).
+    VoiceStatus {
+        req: u64,
+    },
     /// Pull pending updates of a subscription now (the daemon also pushes them).
     Drain {
         sub: u32,
@@ -157,6 +175,7 @@ pub enum ReplyJson {
     Sending { msg_id: u64, targets: Vec<String> },
     Status { status: StatusJson },
     Invite { token: String },
+    Voice { voice: crate::rt::VoiceStatusJson },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -309,7 +328,7 @@ fn key_from_hex(s: &str) -> Result<Key, String> {
 // ---- conversions ------------------------------------------------------------------
 
 impl Request {
-    /// `Ok(None)` for `Drain`, which isn't a core command.
+    /// `Ok(None)` for `Drain`, `VoiceControl` and `VoiceStatus`, which aren't core commands.
     pub fn to_command(&self, now_unix_ms: u64) -> Result<Option<LocalCommand>, String> {
         Ok(Some(match self {
             Request::Subscribe { req, sub, pattern } => LocalCommand::Subscribe {
@@ -414,7 +433,9 @@ impl Request {
             Request::Close { req } => LocalCommand::Close { req: *req },
             Request::Reopen { req } => LocalCommand::Reopen { req: *req },
             Request::Leave { req } => LocalCommand::Leave { req: *req },
-            Request::Drain { .. } => return Ok(None),
+            Request::Drain { .. } | Request::VoiceControl { .. } | Request::VoiceStatus { .. } => {
+                return Ok(None)
+            }
         }))
     }
 }
@@ -689,13 +710,14 @@ pub async fn bind(path: &Path) -> std::io::Result<UnixListener> {
 }
 
 /// Accept clients until the task is aborted.
-pub async fn serve(listener: UnixListener, handle: DriverHandle) {
+pub async fn serve(listener: UnixListener, handle: DriverHandle, rt: Option<RtShared>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let handle = handle.clone();
+                let rt = rt.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = client_task(stream, handle).await {
+                    if let Err(e) = client_task(stream, handle, rt).await {
                         tracing::debug!("local client ended: {e}");
                     }
                 });
@@ -708,7 +730,11 @@ pub async fn serve(listener: UnixListener, handle: DriverHandle) {
     }
 }
 
-async fn client_task(stream: UnixStream, handle: DriverHandle) -> std::io::Result<()> {
+async fn client_task(
+    stream: UnixStream,
+    handle: DriverHandle,
+    rt: Option<RtShared>,
+) -> std::io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let (client, mut events) = handle.attach();
     // Requests are read in their own task so a long socket write never splits a message.
@@ -722,7 +748,7 @@ async fn client_task(stream: UnixStream, handle: DriverHandle) -> std::io::Resul
             }
         }
     });
-    let result = client_loop(&mut wr, &handle, client, &mut events, &mut req_rx).await;
+    let result = client_loop(&mut wr, &handle, &rt, client, &mut events, &mut req_rx).await;
     reader.abort();
     handle.detach(client);
     result
@@ -736,6 +762,7 @@ enum Input {
 async fn client_loop(
     wr: &mut tokio::net::unix::OwnedWriteHalf,
     handle: &DriverHandle,
+    rt: &Option<RtShared>,
     client: u64,
     events: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
     reqs: &mut tokio::sync::mpsc::Receiver<std::io::Result<Option<Vec<u8>>>>,
@@ -788,7 +815,7 @@ async fn client_loop(
             Input::Request(None) | Input::Request(Some(Ok(None))) => return Ok(()),
             Input::Request(Some(Err(e))) => return Err(e),
             Input::Request(Some(Ok(Some(body)))) => {
-                handle_request(&body, handle, client, wr).await?
+                handle_request(&body, handle, rt, client, wr).await?
             }
         }
     }
@@ -804,6 +831,7 @@ fn unix_ms() -> u64 {
 async fn handle_request(
     body: &[u8],
     handle: &DriverHandle,
+    rt: &Option<RtShared>,
     client: u64,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
 ) -> std::io::Result<()> {
@@ -819,6 +847,10 @@ async fn handle_request(
             .await
         }
     };
+    if let Request::VoiceControl { req: id, .. } | Request::VoiceStatus { req: id } = &req {
+        let reply = voice_reply(&req, rt).await;
+        return write_msg(wr, &Event::Reply { req: *id, reply }).await;
+    }
     match req.to_command(unix_ms()) {
         Ok(Some(cmd)) => handle.local(client, cmd),
         Ok(None) => {
@@ -834,6 +866,35 @@ async fn handle_request(
         Err(message) => write_msg(wr, &Event::Error { message }).await?,
     }
     Ok(())
+}
+
+/// Answer `VoiceControl` / `VoiceStatus` from the realtime lane. A control request waits
+/// (at most `VOICE_ACK_TIMEOUT`) for the voice client's report, on this connection's task.
+async fn voice_reply(req: &Request, rt: &Option<RtShared>) -> ReplyJson {
+    let err = |code: &str| ReplyJson::Error { code: code.into() };
+    let Some(rt) = rt else {
+        return err("voice_not_running");
+    };
+    match req {
+        Request::VoiceStatus { .. } => ReplyJson::Voice {
+            voice: rt.voice_status(),
+        },
+        Request::VoiceControl {
+            mic,
+            deaf,
+            tray_live,
+            ..
+        } => {
+            if mic.is_none() && deaf.is_none() && tray_live.is_none() {
+                return err("bad_request");
+            }
+            match rt.voice_control(*mic, *deaf, *tray_live).await {
+                Ok(voice) => ReplyJson::Voice { voice },
+                Err(code) => err(code),
+            }
+        }
+        _ => err("bad_request"),
+    }
 }
 
 // ---- client -----------------------------------------------------------------------

@@ -195,7 +195,7 @@ impl Daemon {
                 let listener = local::bind(path)
                     .await
                     .with_context(|| path.display().to_string())?;
-                Some(tokio::spawn(local::serve(listener, handle.clone())))
+                Some(tokio::spawn(local::serve(listener, handle.clone(), rt_shared.clone())))
             }
             None => None,
         };
