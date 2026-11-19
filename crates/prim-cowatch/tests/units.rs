@@ -967,3 +967,44 @@ fn request_ids_are_seeded_from_the_start_time() {
     assert!(ids(5_000) < ids(65_000));
     assert!(ids(1_800_000_000_000) != ids(1_800_000_060_000));
 }
+
+/// A live twin with the same key (written after we started) is not a predecessor: no
+/// restating over it, so two twins cannot flip the room back and forth forever.
+#[test]
+fn a_live_twins_record_is_not_restated_over() {
+    let mut a = fresh_coordinator();
+    a.handle(0, Event::Synced);
+    a.handle(10_000, load_cmd("https://x.test/b"));
+    let acts = a.handle(20_000, room_rec(A, &intent(9, 30, 5 * S)));
+    assert!(writes(&acts).is_empty());
+}
+
+/// The predecessor's record is in the other scope than the one we wrote: still restated.
+#[test]
+fn a_predecessors_record_in_the_other_scope_is_restated_over() {
+    let mut a = fresh_coordinator();
+    a.handle(0, Event::Synced);
+    a.handle(10_000, load_cmd("https://x.test/b"));
+    let acts = a.handle(
+        20_000,
+        Event::Playback { room: false, writer: k(A), value: intent(9, 30, 0).encode() },
+    );
+    let w = writes(&acts);
+    assert_eq!(w.len(), 1);
+    assert_eq!(Intent::decode(&w[0].2).unwrap().source, b"https://x.test/b".to_vec());
+}
+
+/// Before the first snapshots the player is not told to load what the previous run left.
+#[test]
+fn the_player_is_not_driven_before_synced() {
+    let mut cfg = Config::new(k(A), 50);
+    cfg.faults = Faults::default();
+    let (mut a, _) = Cowatch::new(cfg, 0);
+    a.handle(0, coord(0, A));
+    let acts = a.handle(10_000, room_rec(A, &intent(7, 30, 0)));
+    assert!(load_sources(&acts).is_empty());
+    let acts = a.handle(20_000, load_cmd("https://x.test/b"));
+    assert!(load_sources(&acts).is_empty());
+    let acts = a.handle(30_000, Event::Synced);
+    assert_eq!(load_sources(&acts), vec![b"https://x.test/b".to_vec()]);
+}

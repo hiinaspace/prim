@@ -656,26 +656,30 @@ impl Cowatch {
             // ex-coordinator whose partition-time record is now void). Only our own
             // echo is ordered against our latest.
             if let Some((w, old)) = &self.room_rec {
-                if *w == me && writer == me {
-                    if old.rev > i.rev {
-                        return false;
-                    }
-                    displaced = i.rev > self.last_written_rev;
+                if *w == me && writer == me && old.rev > i.rev {
+                    return false;
                 }
             }
+            displaced = writer == me && self.is_predecessor(&i);
             self.room_rec = Some((writer, i));
         } else {
             if let Some(old) = self.acting.get(&writer) {
-                if writer == me {
-                    if old.rev > i.rev {
-                        return false;
-                    }
-                    displaced = i.rev > self.last_written_rev;
+                if writer == me && old.rev > i.rev {
+                    return false;
                 }
             }
+            displaced = writer == me && self.is_predecessor(&i);
             self.acting.insert(writer, i);
         }
         displaced
+    }
+
+    /// A record by our own key that an earlier run left: a revision this process never
+    /// wrote, stamped (on the host's clock, shared by restarts) before this process began.
+    /// A live twin with the same key writes after we started, so two twins never restate
+    /// each other's records forever.
+    fn is_predecessor(&self, i: &Intent) -> bool {
+        i.rev > self.last_written_rev && self.last_own.is_some() && i.ref_us <= self.started_us
     }
 
     /// A predecessor run of this member key left a record above everything this process
@@ -686,12 +690,8 @@ impl Cowatch {
             return;
         };
         let Some(a) = self.auth else { return };
-        let want = if a.mode == Mode::Coordinator {
-            WriteScope::Room
-        } else {
-            WriteScope::Member
-        };
-        if a.key.holder != self.cfg.me || want != scope {
+        let _ = scope;
+        if a.key.holder != self.cfg.me {
             return;
         }
         let elapsed = now_us.saturating_sub(last.ref_us) as f64 / 1e6;
@@ -1131,7 +1131,7 @@ impl Cowatch {
 
     fn enqueue(&mut self, now_us: u64, body: Body, not_before_us: Option<u64>) {
         let req_id = self.next_req;
-        self.next_req += 1;
+        self.next_req = self.next_req.saturating_add(1);
         let deadline = now_us + self.cfg.request_ttl_ms * 1000;
         match &mut self.pending {
             Some(p) => {
@@ -1619,7 +1619,11 @@ impl Cowatch {
                 self.load_player(now_us, start, out);
             }
         }
-        self.drive(now_us, out);
+        // Before the first snapshots our view of the room is not the room: loading what the
+        // previous run left would only be replaced (and, in a host, mistaken for a request).
+        if self.synced {
+            self.drive(now_us, out);
+        }
     }
 
     fn drive(&mut self, now_us: u64, out: &mut Vec<Action>) {

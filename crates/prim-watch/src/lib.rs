@@ -470,6 +470,11 @@ pub fn run(args: &dyn Flags) -> Result<ExitCode> {
             std::thread::sleep(Duration::from_millis(5));
         }
     };
+    // Retract the capability record so a restart under the same key is not outranked by it.
+    let acts = host.cw.stop();
+    let mut q = vec![];
+    host.exec(acts, &mut q);
+    std::thread::sleep(Duration::from_millis(150));
     host.player.mpv.quit();
     result?;
     Ok(ExitCode::SUCCESS)

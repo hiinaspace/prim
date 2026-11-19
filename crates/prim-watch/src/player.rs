@@ -40,6 +40,9 @@ pub struct Player {
     last_pos: f64,
     /// What we last told mpv to load, or the person loaded in mpv itself.
     cur_src: Option<String>,
+    /// Sources we loaded recently: mpv's `path` events for them can arrive late and out of
+    /// step with a newer load, and are not the person's.
+    own_srcs: VecDeque<(String, Instant)>,
     /// The person loaded something in mpv; until the room's `Load` for it comes back (or
     /// this passes) the player reports "loading", so the machine does not seek the new
     /// file to the old place.
@@ -72,6 +75,7 @@ impl Player {
             duration: 0.0,
             last_pos: 0.0,
             cur_src: None,
+            own_srcs: VecDeque::new(),
             user_load_until: None,
         }
     }
@@ -91,6 +95,7 @@ impl Player {
                 let src = String::from_utf8_lossy(source).into_owned();
                 self.token = *token;
                 self.cur_src = Some(src.clone());
+                self.own_srcs.push_back((src.clone(), Instant::now()));
                 self.user_load_until = None;
                 self.has_src = true;
                 self.load_pending = true;
@@ -147,6 +152,7 @@ impl Player {
     pub fn poll(&mut self) -> (Vec<UserCommand>, bool) {
         let now = Instant::now();
         self.own_seeks.retain(|t| now.duration_since(*t) < EXPECT_TTL);
+        self.own_srcs.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(15));
         self.expect_pause.retain(|(_, t)| now.duration_since(*t) < EXPECT_TTL);
         let mut cmds = vec![];
         let mut gone = false;
@@ -218,7 +224,7 @@ impl Player {
                         // A different file than the one we loaded: the person loaded it in
                         // mpv (drag and drop, `loadfile`). It is the room's now.
                         if let Some(p) = data.as_str().filter(|p| !p.is_empty()) {
-                            if self.cur_src.as_deref() != Some(p) {
+                            if self.cur_src.as_deref() != Some(p) && !self.own_srcs.iter().any(|(s, _)| s == p) {
                                 let src = normalize_source(p);
                                 self.cur_src = Some(p.to_string());
                                 self.user_load_until = Some(now + Duration::from_secs(5));
