@@ -481,8 +481,9 @@ impl PrimClient {
     #[func]
     fn voice_control(&mut self, mic: i64, deaf: i64, tray_live: i64) -> i64 {
         let tri = |v: i64| (v >= 0).then_some(v != 0);
-        self.client
+        self.room
             .as_ref()
+            .map(|r| r.client())
             .and_then(|c| {
                 c.request(|req| prim_client::wire::Request::VoiceControl {
                     req,
@@ -499,8 +500,9 @@ impl PrimClient {
     /// Call it after (re)connecting: voice keeps its state across Godot restarts.
     #[func]
     fn voice_status(&mut self) -> i64 {
-        self.client
+        self.room
             .as_ref()
+            .map(|r| r.client())
             .and_then(|c| {
                 c.request(|req| prim_client::wire::Request::VoiceStatus { req })
                     .ok()
