@@ -8,5 +8,11 @@
 
 use crate::Control;
 
+/// True once a tray icon is showing. T1 flips this when the icon is up (and back when it
+/// goes); it is reported as `tray_live` in the session status.
+pub fn live() -> bool {
+    false
+}
+
 /// Called once by `prim session` after the control socket is up. No tray yet.
 pub fn start(_control: Control) {}

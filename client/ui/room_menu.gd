@@ -146,7 +146,7 @@ func setup(s) -> void:
 	_room_box.add_child(leave_button)
 	quit_button = Button.new()
 	quit_button.text = "Quit Prim (ends the room session and voice)"
-	quit_button.pressed.connect(func(): session.quit_prim())
+	quit_button.pressed.connect(func(): session.leave_and_quit())
 	root.add_child(quit_button)
 	session.changed.connect(refresh)
 	refresh()

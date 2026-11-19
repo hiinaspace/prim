@@ -148,6 +148,7 @@ fn status_of(s: &State) -> SessionStatus {
         error: s.room.error().to_string(),
         room_socket: s.room_socket.display().to_string(),
         voice: s.voice.view(),
+        tray_live: tray::live(),
     }
 }
 

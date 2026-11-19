@@ -85,6 +85,7 @@ func _go() -> void:
 		"attach": await _attach()
 		"reattach1": await _reattach1()
 		"reattach2": await _reattach2()
+		"closer": await _closer()
 		"host": await _host()
 		"guest": await _guest()
 		"forged", "forgedsig", "replay", "expired": await _intruder()
@@ -155,6 +156,15 @@ func _reattach2() -> void:
 	_check("reattach2: talking to the running session", session.session_ready, {})
 	_drop("reattach2.json", {"key": session.me, "name": session.display_name(), "voice": session.voice,
 		"members": session.members.size()})
+
+
+## Window-close request, as the X button sends it (tools/test-session-survive.py).
+func _closer() -> void:
+	await _wait(func(): return session.phase == "in_room" and not session.voice.is_empty(), 20.0)
+	await get_tree().create_timer(1.5).timeout # a session status poll with tray_live
+	_drop("closer.json", {"tray_live": session.tray_live})
+	session.on_close_request()
+	await get_tree().create_timer(30.0).timeout
 
 
 func _host() -> void:

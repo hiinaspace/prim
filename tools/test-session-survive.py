@@ -184,8 +184,26 @@ try:
           after["voice"]["pid"] == before["voice"]["pid"] and after["voice"]["starts"] == before["voice"]["starts"], {"before": before["voice"], "after": after["voice"]})
     check("relaunch: same voice incarnation", after["incarnation"] == before["incarnation"] and bool(after["incarnation"]), {"before": before["incarnation"], "after": after["incarnation"]})
     check("relaunch: both members still in the room", after["members"] == before["members"], after["members"])
-    if g2 is not None:
-        g2.wait(timeout=60) if g2.poll() is not None else None
+    if g2 is not None and g2.poll() is None:
+        g2.terminate()
+    # Window close with no tray (tray_live is false until round T1): leave + quit, so no
+    # live microphone is left with nothing visible. With the override it keeps everything.
+    for keep in ("1", ""):
+        (OUT / "closer.json").unlink(missing_ok=True)
+        gc = start_godot("closer", f"closer{keep}.log", {"PRIM_CLOSE_KEEPS_SESSION": keep})
+        got = wait_file(OUT / "closer.json", 60, gc)
+        time.sleep(6.0)
+        s = jctl(sock_a, "session", "status")
+        up = "pid" in s
+        if keep:
+            check("window close with PRIM_CLOSE_KEEPS_SESSION=1: session, room and voice keep running",
+                  up and s.get("room") == "up" and (s.get("voice") or {}).get("running"), s.get("room"))
+            gc.terminate()
+        else:
+            check("tray_live is false and window close leaves the room and quits everything",
+                  got is not None and got["tray_live"] is False and not up, {"tray_live": got and got["tray_live"], "session_up": up})
+            check("no voice process is left after a close with no tray",
+                  not any(pid_alive(p) for p in [before["voice"]["pid"]]), before["voice"]["pid"])
 except SystemExit:
     pass
 finally:

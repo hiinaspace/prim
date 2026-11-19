@@ -87,6 +87,11 @@ pub struct SessionStatus {
     pub error: String,
     pub room_socket: String,
     pub voice: VoiceState,
+    /// A tray icon is live in the session process (round T1; always false until then).
+    /// When false, a front end that closes must leave and quit rather than leave a live
+    /// microphone with nothing visible.
+    #[serde(default)]
+    pub tray_live: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

@@ -10,7 +10,9 @@ extends Node
 ##
 ## phase: connecting -> choose (no room; see `error`) | pending (starting, or joining
 ##        and nobody has answered yet) | in_room | removed (the room removed me)
-## Closing Godot leaves the session, the room and voice running; `quit_prim()` ends them.
+## Closing the window leaves the session running only when a tray is live (`tray_live`) or
+## PRIM_CLOSE_KEEPS_SESSION=1; otherwise it leaves the room and quits. Killing Godot never
+## touches the session. `quit_prim()` ends everything.
 
 signal changed
 
@@ -36,6 +38,7 @@ var removed_members: Array = [] # keys the daemon told us were removed
 var starting_kind := ""
 var voice := {} # last session voice state: running, wanted, mic, deaf, state, detail, pid, starts
 var session_ready := false
+var tray_live := false # the session has a tray icon (round T1); false until then
 var _t := 0.0
 var _poll := 0.0
 var _session_poll := 0.0
@@ -134,9 +137,26 @@ func send_chat(text: String) -> void:
 	client.chat_send(text)
 
 
-## Close Godot and leave the session, room and voice running (what the window's X does).
+## Close Godot, leaving the session, room and voice running (what the window's X does
+## when a tray is live, or when PRIM_CLOSE_KEEPS_SESSION=1 / --keep-session is given).
 func close_window() -> void:
 	get_tree().quit()
+
+
+## The window's close request. With no tray there would be a live microphone and nothing
+## visible, so close means leave the room and stop everything; with a tray (or the
+## override) it only closes Godot.
+func on_close_request() -> void:
+	if tray_live or OS.get_environment("PRIM_CLOSE_KEEPS_SESSION") == "1" \
+			or "--keep-session" in OS.get_cmdline_user_args():
+		close_window()
+	else:
+		leave_and_quit()
+
+
+## Leave the room (so friends see it), then stop the session, room daemon and voice.
+func leave_and_quit() -> void:
+	_request("leave", "", [], func(_d): quit_prim())
 
 
 ## Stop everything (voice, the room daemon, the session), then close Godot.
@@ -153,8 +173,7 @@ func quit_session(done := Callable()) -> void:
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
-		# Closing the window is not leaving: the session keeps the room and voice.
-		close_window()
+		on_close_request()
 
 
 # ---- internals -------------------------------------------------------------------
@@ -189,6 +208,7 @@ func _apply_session(d: Dictionary) -> void:
 	if not d.get("ok", false):
 		return
 	voice = d.get("voice", {})
+	tray_live = d.get("tray_live", false)
 	_session_room = d.get("room", "none")
 	attached = d.get("kind", "") == "attached"
 	if _session_room == "failed" and error == "":

@@ -33,6 +33,9 @@ Godot / prim ctl / prim ui / tray     (clients; any may come and go)
   `status.join` (ROOM.md). The session never gives up by itself; `cancel` does.
 - **Voice** starts muted and hearing when a room comes up. "Voice on" while another program
   holds the lease takes it over.
+- **`tray_live`** in the status is false until T1. A front end that is asked to close while it is
+  false must leave the room and quit (no live microphone with nothing visible); Godot does
+  this, unless `PRIM_CLOSE_KEEPS_SESSION=1` or `--keep-session` is given.
 - **Tray**: `crates/prim-session/src/tray.rs` is the place (a stub); it gets a `Control`.
 - **Test mode**: `PRIM_SESSION_VOICE_TEST=1` gives voice a tone source and a null sink.
 
