@@ -20,6 +20,7 @@ anyhow = "1"
 prim-room = { path = "../prim-room" }
 prim-ui = { path = "../prim-ui", default-features = false }
 prim-voice = { path = "../prim-voice" }
+prim-watch = { path = "../prim-watch" }
 room-core = { path = "../room-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
