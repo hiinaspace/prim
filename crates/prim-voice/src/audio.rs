@@ -693,7 +693,7 @@ pub fn run_meter(f: &dyn Flags) -> Result<()> {
 }
 
 /// The record side of the test, then through the real send path (same Opus encoder, 16 kbps,
-/// DTX), then the real receive path (NetEq), to the selected speakers. Prints JSON lines
+/// DTX), then the real receive path (PlayoutReceiver), to the selected speakers. Prints JSON lines
 /// for the window: recording progress, playing, done (with sizes), or an error.
 pub fn run_test(f: &dyn Flags) -> Result<()> {
     use voice_core::{PacketObservation, PlayoutReceiver, VoiceEncoder, VoiceEncoderConfig};

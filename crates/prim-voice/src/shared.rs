@@ -31,6 +31,54 @@ pub fn blocks_ahead(burst: usize) -> usize {
     (burst * 5 / 4).div_ceil(BLOCK).clamp(BLOCKS_AHEAD, BLOCKS_AHEAD_MAX)
 }
 
+/// Largest output pull (frames) seen in the last 5 to 10 seconds. A plain running maximum only
+/// ever rises: one stall that makes the device ask for a big burst once would keep the ring
+/// deep, and so the playout latency high, for the rest of the process.
+#[derive(Debug, Default)]
+pub struct BurstWindow {
+    epoch_start_us: u64,
+    current: usize,
+    previous: usize,
+}
+
+impl BurstWindow {
+    pub const EPOCH_US: u64 = 5_000_000;
+
+    /// Record a pull of `burst` frames at `now_us`; returns the maximum over the current and the
+    /// previous 5 s epoch.
+    pub fn record(&mut self, now_us: u64, burst: usize) -> usize {
+        let elapsed = now_us.saturating_sub(self.epoch_start_us);
+        if self.epoch_start_us == 0 || elapsed >= 2 * Self::EPOCH_US {
+            self.previous = 0;
+            self.current = 0;
+            self.epoch_start_us = now_us;
+        } else if elapsed >= Self::EPOCH_US {
+            self.previous = self.current;
+            self.current = 0;
+            self.epoch_start_us += Self::EPOCH_US;
+        }
+        self.current = self.current.max(burst);
+        self.current.max(self.previous)
+    }
+}
+
+#[cfg(test)]
+mod burst_tests {
+    use super::*;
+
+    #[test]
+    fn a_burst_ages_out_of_the_window() {
+        let mut w = BurstWindow::default();
+        let s = 1_000_000;
+        assert_eq!(w.record(s, 480), 480);
+        assert_eq!(w.record(2 * s, 2048), 2048, "a one-off big pull counts at once");
+        assert_eq!(w.record(7 * s, 480), 2048, "...and still for the next epoch");
+        assert_eq!(w.record(13 * s, 480), 480, "...but not for ever");
+        // Left alone for a long time: back to what the device asks for now.
+        assert_eq!(w.record(100 * s, 512), 512);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitReason {
     /// Asked to stop (signal, `stop()`).

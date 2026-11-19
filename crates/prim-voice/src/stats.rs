@@ -62,6 +62,8 @@ pub fn snapshot(sh: &Shared) -> Value {
                     "plc_samples": s.plc_samples,
                     "fec_samples": s.fec_samples,
                     "silence_samples": s.silence_samples,
+                    "lost_unconcealed_samples": s.lost_unconcealed_samples,
+                    "fade_samples": s.fade_samples,
                     "idle_samples": s.idle_samples,
                     "concealed_pct": s.concealed_pct(),
                     "packets_in": s.packets_in,
@@ -80,6 +82,9 @@ pub fn snapshot(sh: &Shared) -> Value {
                     "removed_samples_for_acceleration": s.accelerate_samples,
                     "inserted_samples_for_deceleration": s.preemptive_samples,
                     "talkspurts": s.talkspurts,
+                    // Old NetEq name, kept because the oracles read it: it now carries
+                    // `target_resets`, the times the receiver's whole stream state was reset
+                    // (a new incarnation). A talkspurt or a DTX refresh never resets it.
                     "talkspurt_flushes": s.target_resets,
                     "target_resets": s.target_resets,
                     "dtx_refreshes": s.dtx_refreshes,

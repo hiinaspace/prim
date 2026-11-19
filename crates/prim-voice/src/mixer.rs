@@ -1,5 +1,5 @@
 //! The mixer: paced by the output ring (two 10 ms blocks ahead). Per block, per active
-//! sender: 480 samples from NetEq, rendered by prim-hrtf at the sender's seat relative
+//! sender: 480 samples from the playout receiver, rendered by prim-hrtf at the sender's seat relative
 //! to the newest listener pose, summed.
 
 use std::sync::atomic::Ordering;
@@ -36,7 +36,7 @@ pub fn source_gain(distance: f32) -> f32 {
     voice_gain(distance, DEFAULT_PERCENT, DEFAULT_NEAR_M, DEFAULT_FAR_M) * level_match()
 }
 
-/// Seconds without a packet before a sender is released (NetEq reset, slot freed).
+/// Seconds without a packet before a sender is released (receiver reset, slot freed).
 const IDLE_US: u64 = 3_000_000;
 const TONE_HISTORY: usize = 3600;
 

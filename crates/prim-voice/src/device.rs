@@ -72,6 +72,9 @@ fn open_output(sh: &Arc<Shared>) -> Result<cpal::Stream> {
     let cb = sh.clone();
     let mut last_us = 0u64;
     let mut burst = 0usize;
+    let mut window = crate::shared::BurstWindow::default();
+    // A reopened device is a different device: forget what the old one asked for.
+    sh.out_burst.store(0, Ordering::Relaxed);
     let stream = dev
         .build_output_stream(
             cfg,
@@ -84,7 +87,7 @@ fn open_output(sh: &Arc<Shared>) -> Result<cpal::Stream> {
                 // Callbacks less than 2 ms apart are one pull split in two (a 1024 quantum through
                 // ALSA arrives as 2 x 512): the mixer must keep the sum rendered ahead.
                 burst = if now - last_us < 2_000 && last_us != 0 { burst + data.len() / 2 } else { data.len() / 2 };
-                cb.out_burst.fetch_max(burst, Ordering::Relaxed);
+                cb.out_burst.store(window.record(now, burst), Ordering::Relaxed);
                 last_us = now;
                 let got = ring.pop(data);
                 if got < data.len() {

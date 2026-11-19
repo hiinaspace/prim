@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Unlicense AND Apache-2.0"
 publish = false
-description = "The prim voice client: realtime socket to prim-room, Opus send path, NetEq receive path, HRTF mixer"
+description = "The prim voice client: realtime socket to prim-room, Opus send path, timeline playout receive path, HRTF mixer"
 
 [features]
 default = ["device"]

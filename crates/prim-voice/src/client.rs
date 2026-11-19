@@ -160,7 +160,7 @@ impl Client {
         self.sh.stats.counter(name)
     }
 
-    /// Test and probe access: one peer's NetEq statistics.
+    /// Test and probe access: one peer's playout receiver statistics.
     pub fn peer_receiver_stats(
         &self,
         key: &room_core::ids::Key,

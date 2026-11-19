@@ -59,7 +59,7 @@ options:
   --seat-index N=DEG    same, by index among the other members sorted by key
   --stats PATH          write JSON stats every second and at exit
   --stats-tone          per output second, the energy at each tone:auto frequency seen (in --stats)
-  --min-delay-ms N      NetEq minimum delay (default 20, voice-core's)
+  --min-delay-ms N      playout minimum delay (default 20, voice-core's)
   --no-dtx              send silence instead of using Opus DTX
   --test-drop-every N   TEST ONLY (harness oracle fault): drop every Nth outgoing media packet
   --test-drop-burst N,M TEST ONLY: of every N media packets drop M consecutive ones
@@ -100,10 +100,10 @@ pub enum OutputSpec {
     Capture(OutputBuffer),
 }
 
-/// How a packet's arrival time is given to NetEq.
+/// How a packet's arrival time is given to the playout receiver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArrivalPolicy {
-    /// The daemon's `received_at_mono_us` stamp (R0 design: NetEq sees network jitter only).
+    /// The daemon's `received_at_mono_us` stamp (R0 design: the receiver sees network jitter only).
     Stamp,
     /// The time this process read the message; for measuring what the stamp buys.
     ReadTime,
@@ -120,7 +120,7 @@ pub struct Config {
     pub stats_tone: bool,
     pub dtx: bool,
     pub arrival: ArrivalPolicy,
-    /// NetEq minimum delay (None: voice-core's default of 20 ms).
+    /// playout minimum delay (None: voice-core's default of 20 ms).
     pub min_delay_ms: Option<u32>,
     /// Tests: fix the incarnation instead of drawing one.
     pub incarnation: Option<u32>,

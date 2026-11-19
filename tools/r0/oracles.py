@@ -1960,7 +1960,7 @@ STEP_RATIO_MAX = 4.0      # max sample step of a faulted run vs the lossless run
 SILENT_RUN_MAX = 48       # samples under 1 % of the tone's amplitude in a row (1 ms). A concealed slot cross-fades two
 #                           tones of unrelated phase and can null for 0.5-0.6 ms (seen: 26, 31); a dropout is 10-100x longer
 CONCEAL_TOL_PCT = 0.35    # concealed_pct vs the scripted rate, in percentage points
-SPAN_TOL_S = 0.080        # recorded tone duration vs the receiver's output samples: the ring (up to 3 blocks, 30 ms) and the sink's quantum still hold audio when the recorder stops, so the recording is 24-48 ms shorter
+SPAN_TOL_S = 0.080        # recorded tone duration vs the receiver's output samples: the ring (up to 3 blocks, 30 ms) and the sink's quantum still hold audio when the recorder stops, so the recording is 24-48 ms shorter. One-sided: only a shortfall is tolerated
 
 
 def lossless_step(ref):
@@ -2006,8 +2006,8 @@ def loss_oracle(args, res, audio, label, extra, scripted_pct, scen="loss"):
     res.oracle(scen, sid + "-count", "%s: samples out = slots x 960 (no slot vanishes or appears)" % label, exact and n["slots"] > 0,
                "talker slots %d (sent %d + dropped %d - markers %d), receiver output %d + accelerate %d - preemptive %d = %d, want %d" %
                (n["slots"], n["sent"]["packets"], dropped, n["markers"], n["out"], n["accel"], n["preempt"], n["out"] + n["accel"] - n["preempt"], n["slots"] * 960))
-    res.oracle(scen, sid + "-duration", "%s: the recorded tone lasts as long as the receiver's output, which is the input plus its logged stretch (%.0f ms)" % (label, SPAN_TOL_S * 1000),
-               a is not None and abs(a["span_s"] - span_exp) <= SPAN_TOL_S,
+    res.oracle(scen, sid + "-duration", "%s: the recorded tone is at most %.0f ms shorter than the receiver's output (the input plus its logged stretch); a longer recording would be a bug, so only a shortfall is tolerated" % (label, SPAN_TOL_S * 1000),
+               a is not None and a["span_s"] >= span_exp - SPAN_TOL_S,
                "recorded %.3f s, receiver output %.3f s (input %d slots = %.3f s, stretch +%d -%d samples)" % (a["span_s"] if a else -1, span_exp, n["slots"], n["slots"] * 0.02, n["preempt"], n["accel"]))
     res.oracle(scen, sid + "-concealed", "%s: concealed %% = scripted %.1f %% within %.2f pt; one concealed slot per lost packet" % (label, scripted_pct, CONCEAL_TOL_PCT),
                abs(pct - scripted_pct) <= CONCEAL_TOL_PCT and n["plc"] == dropped * 960,
@@ -2056,15 +2056,17 @@ def scen_reorder(args, res, audio):
     # plc_samples is counted after level control, so a stretched concealed slot is not exactly 960
     near = n["late"] is not None and abs(n["plc"] - n["late"] * 960) <= 0.1 * n["late"] * 960
     ok = (held > 20 and n["late"] is not None and held - 2 <= n["late"] + (n["reord"] or 0) <= held and near and n["dup"] == 0)
-    # Continuity is reported, not asserted: a packet 0.8 s late is evidence the buffer was too shallow,
-    # so the estimator (by design) raises the target from ~20 ms toward its 250 ms cap, and the buffer
-    # builds by PreemptiveExpand time-stretching, which splices a pure tone (max step up to ~14x,
-    # a 36-sample near-silent run). A single steady tone also cannot show old audio played after new;
-    # that is proven by the exact counters here (late, one concealed slot each, no extra slot played)
-    # and by the chirp ordering test in voice-core.
-    res.oracle(scen, "ord-late", "a packet 0.8 s late is counted late and never played: late + reordered_accepted = held (+-2 at the end), one concealed slot per late packet (+-10 %), no duplicate (continuity of the stretched tone is reported only)",
-               ok, "talker held %d; receiver late %s, reordered_accepted %s, duplicate %s, plc %s (late x 960 = %s); %s" %
-               (held, n["late"], n["reord"], n["dup"], n["plc"], None if n["late"] is None else n["late"] * 960, cont_detail(a, ref)))
+    # A packet 0.8 s late is beyond anything the buffer could cover (2x max_delay_ms): the estimator
+    # ignores it, so the target stays put, nothing is stretched or skipped, and the tone must stay
+    # continuous. (Packets inside the range, 0.3 s late, do raise the target and build the buffer by
+    # Preemptive Expand, which is continuous too; voice-core/tests/review_fixes.rs covers that.)
+    # A single steady tone cannot show old audio played after new; the exact counters here (late, one
+    # concealed slot each, no extra slot played) and the chirp ordering test in voice-core do.
+    skipped = n["r"].get("skipped_samples")
+    ok = ok and skipped == 0 and cont
+    res.oracle(scen, "ord-late", "a packet 0.8 s late is counted late and never played: late + reordered_accepted = held (+-2 at the end), one concealed slot per late packet (+-10 %), no duplicate, nothing skipped (skipped_samples = 0) and the tone continuous (step <= %.1fx lossless)" % STEP_RATIO_MAX,
+               ok, "talker held %d; receiver late %s, reordered_accepted %s, duplicate %s, plc %s (late x 960 = %s), skipped_samples %s; %s" %
+               (held, n["late"], n["reord"], n["dup"], n["plc"], None if n["late"] is None else n["late"] * 960, skipped, cont_detail(a, ref)))
 
 
 def scen_drift(args, res, audio):

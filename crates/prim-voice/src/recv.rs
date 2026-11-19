@@ -1,5 +1,5 @@
 //! The rt reader: decodes daemon messages, fences voice by incarnation per sender and
-//! feeds each sender's NetEq with the daemon's arrival stamp.
+//! feeds each sender's playout receiver with the daemon's arrival stamp.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
