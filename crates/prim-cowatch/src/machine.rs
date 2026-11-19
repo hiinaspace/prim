@@ -122,6 +122,13 @@ pub enum Event {
     },
     /// The `member/*/cowatch` subscription restarted.
     CapsReset,
+    /// The first snapshot of all three subscriptions (`room/playback`,
+    /// `member/*/playback`, `member/*/cowatch`) has been delivered. Until then user
+    /// commands are held: this process may be the restart of an earlier one with the same
+    /// member key, whose records are still in the room and are not in our view yet. Send
+    /// it once per process, after the last `SnapshotDone`. A host that never sends it
+    /// has its commands released after [`Config::sync_wait_ms`].
+    Synced,
     Message {
         from: Key,
         payload: Vec<u8>,
@@ -241,6 +248,8 @@ pub struct Config {
     pub early_eof_slack_s: f64,
     pub reload_backoff_ms: Vec<u64>,
     pub request_ttl_ms: u64,
+    /// How long user commands wait for [`Event::Synced`].
+    pub sync_wait_ms: u64,
     pub probe_interval_ms: u64,
     pub correct_interval_ms: u64,
     pub block_ms: u64,
@@ -259,6 +268,7 @@ impl Config {
             early_eof_slack_s: 3.0,
             reload_backoff_ms: vec![500, 1_000, 2_000, 4_000, 8_000, 16_000],
             request_ttl_ms: 30_000,
+            sync_wait_ms: 3_000,
             probe_interval_ms: 1_000,
             correct_interval_ms: 250,
             block_ms: 30_000,
@@ -381,6 +391,13 @@ pub struct Cowatch {
     now_us: u64,
     probe_since_us: u64,
     adopt_since: Option<u64>,
+    started_us: u64,
+    synced: bool,
+    /// Commands from the person that arrived before [`Event::Synced`].
+    held: Vec<UserCommand>,
+    /// The latest record this process wrote, to restate it if a predecessor's record
+    /// (same writer key, higher revision) overwrites it in our view.
+    last_own: Option<(WriteScope, Intent)>,
 }
 
 fn is_live_url(s: &[u8]) -> bool {
@@ -417,7 +434,11 @@ impl Cowatch {
             auth: None,
             carry: None,
             pending: None,
-            next_req: 1,
+            // Request ids must not repeat across restarts of the same member key: the
+            // authority dedupes by (sender, id). Seed from the start time (10 ms units);
+            // an id that still lands behind the authority's is answered `Stale` and
+            // re-sent above it.
+            next_req: ((cfg.since_ms / 10) as u32 & 0x7fff_ffff).max(1),
             next_token: 1,
             in_flight: BTreeMap::new(),
             writes: BTreeMap::new(),
@@ -450,6 +471,10 @@ impl Cowatch {
             now_us,
             probe_since_us: now_us,
             adopt_since: None,
+            started_us: now_us,
+            synced: false,
+            held: Vec::new(),
+            last_own: None,
             cfg,
         };
         let mut out = Vec::new();
@@ -513,7 +538,12 @@ impl Cowatch {
         let mut out = Vec::new();
         self.now_us = now_us;
         match ev {
-            Event::Tick => {}
+            Event::Tick => {
+                if !self.synced && now_us.saturating_sub(self.started_us) >= self.cfg.sync_wait_ms * 1000 {
+                    self.release_held(now_us, &mut out);
+                }
+            }
+            Event::Synced => self.release_held(now_us, &mut out),
             Event::Coordinator(c) => {
                 self.coord = c;
                 self.reevaluate(now_us, &mut out);
@@ -560,8 +590,11 @@ impl Cowatch {
                 value,
             } => {
                 if let Ok(i) = Intent::decode(&value) {
-                    self.store_intent(room, writer, i);
+                    let predecessor = self.store_intent(room, writer, i);
                     self.reevaluate(now_us, &mut out);
+                    if predecessor {
+                        self.restate_own(now_us, &mut out);
+                    }
                 }
             }
             Event::PlaybackRemoved { room, writer } => {
@@ -593,7 +626,13 @@ impl Cowatch {
             }
             Event::WriteResult { token, ok } => self.on_write_result(now_us, token, ok, &mut out),
             Event::Player(r) => self.on_player(now_us, r, &mut out),
-            Event::Command(c) => self.on_command(now_us, c, &mut out),
+            Event::Command(c) => {
+                if self.synced {
+                    self.on_command(now_us, c, &mut out);
+                } else if self.held.len() < 32 {
+                    self.held.push(c);
+                }
+            }
         }
         self.run(now_us, &mut out);
         out
@@ -601,30 +640,76 @@ impl Cowatch {
 
     // ----- record store ------------------------------------------------------
 
-    fn store_intent(&mut self, room: bool, writer: Key, i: Intent) {
+    /// Returns true when the record is by our own key with a revision this process never
+    /// wrote (an earlier run's, still in the room) and it displaced a record we wrote.
+    fn store_intent(&mut self, room: bool, writer: Key, i: Intent) -> bool {
         // A revision this high can only be hostile or corrupt; it would freeze the room.
         if i.rev >= 0x8000_0000 {
-            return;
+            return false;
         }
         self.ghost = None;
+        let me = self.cfg.me;
+        let mut displaced = false;
         if room {
             // The daemon only delivers room records valid for their epoch, so a foreign
             // writer's record replaces ours whatever its revision (we may be an
             // ex-coordinator whose partition-time record is now void). Only our own
             // echo is ordered against our latest.
             if let Some((w, old)) = &self.room_rec {
-                if *w == self.cfg.me && writer == self.cfg.me && old.rev > i.rev {
-                    return;
+                if *w == me && writer == me && old.rev > i.rev {
+                    return false;
                 }
             }
+            displaced = writer == me && self.is_predecessor(&i);
             self.room_rec = Some((writer, i));
         } else {
             if let Some(old) = self.acting.get(&writer) {
-                if writer == self.cfg.me && old.rev > i.rev {
-                    return;
+                if writer == me && old.rev > i.rev {
+                    return false;
                 }
             }
+            displaced = writer == me && self.is_predecessor(&i);
             self.acting.insert(writer, i);
+        }
+        displaced
+    }
+
+    /// A record by our own key that an earlier run left: a revision this process never
+    /// wrote, stamped (on the host's clock, shared by restarts) before this process began.
+    /// A live twin with the same key writes after we started, so two twins never restate
+    /// each other's records forever.
+    fn is_predecessor(&self, i: &Intent) -> bool {
+        i.rev > self.last_written_rev && self.last_own.is_some() && i.ref_us <= self.started_us
+    }
+
+    /// A predecessor run of this member key left a record above everything this process
+    /// has written, and it replaced ours in our view. What the person did here is newer
+    /// than that record: write it again above it, continuing its timeline.
+    fn restate_own(&mut self, now_us: u64, out: &mut Vec<Action>) {
+        let Some((scope, last)) = self.last_own.clone() else {
+            return;
+        };
+        let Some(a) = self.auth else { return };
+        let _ = scope;
+        if a.key.holder != self.cfg.me {
+            return;
+        }
+        let elapsed = now_us.saturating_sub(last.ref_us) as f64 / 1e6;
+        let mut pos = last.position_ms as f64 / 1000.0;
+        if !last.paused {
+            pos += elapsed * last.rate_milli as f64 / 1000.0;
+        }
+        let paused = last.paused;
+        self.write_intent(now_us, a.mode, last, pos, paused, None, out);
+    }
+
+    fn release_held(&mut self, now_us: u64, out: &mut Vec<Action>) {
+        if self.synced {
+            return;
+        }
+        self.synced = true;
+        for c in std::mem::take(&mut self.held) {
+            self.on_command(now_us, c, out);
         }
     }
 
@@ -863,6 +948,7 @@ impl Cowatch {
             self.acting.get(&me).cloned().map(|i| (me, i))
         };
         let value = intent.encode();
+        self.last_own = Some((scope, intent.clone()));
         if scope == WriteScope::Room {
             self.room_rec = Some((me, intent));
         } else {
@@ -1045,7 +1131,7 @@ impl Cowatch {
 
     fn enqueue(&mut self, now_us: u64, body: Body, not_before_us: Option<u64>) {
         let req_id = self.next_req;
-        self.next_req += 1;
+        self.next_req = self.next_req.saturating_add(1);
         let deadline = now_us + self.cfg.request_ttl_ms * 1000;
         match &mut self.pending {
             Some(p) => {
@@ -1533,7 +1619,11 @@ impl Cowatch {
                 self.load_player(now_us, start, out);
             }
         }
-        self.drive(now_us, out);
+        // Before the first snapshots our view of the room is not the room: loading what the
+        // previous run left would only be replaced (and, in a host, mistaken for a request).
+        if self.synced {
+            self.drive(now_us, out);
+        }
     }
 
     fn drive(&mut self, now_us: u64, out: &mut Vec<Action>) {

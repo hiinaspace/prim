@@ -38,11 +38,20 @@ pub struct Player {
     expect_start_seek: bool,
     duration: f64,
     last_pos: f64,
+    /// What we last told mpv to load, or the person loaded in mpv itself.
+    cur_src: Option<String>,
+    /// Sources we loaded recently: mpv's `path` events for them can arrive late and out of
+    /// step with a newer load, and are not the person's.
+    own_srcs: VecDeque<(String, Instant)>,
+    /// The person loaded something in mpv; until the room's `Load` for it comes back (or
+    /// this passes) the player reports "loading", so the machine does not seek the new
+    /// file to the old place.
+    user_load_until: Option<Instant>,
 }
 
 impl Player {
     pub fn new(mut mpv: Mpv) -> Player {
-        for (i, p) in ["pause", "eof-reached", "seeking", "paused-for-cache", "duration"]
+        for (i, p) in ["pause", "eof-reached", "seeking", "paused-for-cache", "duration", "path"]
             .iter()
             .enumerate()
         {
@@ -65,6 +74,9 @@ impl Player {
             expect_start_seek: false,
             duration: 0.0,
             last_pos: 0.0,
+            cur_src: None,
+            own_srcs: VecDeque::new(),
+            user_load_until: None,
         }
     }
 
@@ -82,6 +94,9 @@ impl Player {
             } => {
                 let src = String::from_utf8_lossy(source).into_owned();
                 self.token = *token;
+                self.cur_src = Some(src.clone());
+                self.own_srcs.push_back((src.clone(), Instant::now()));
+                self.user_load_until = None;
                 self.has_src = true;
                 self.load_pending = true;
                 self.errored = false;
@@ -137,6 +152,7 @@ impl Player {
     pub fn poll(&mut self) -> (Vec<UserCommand>, bool) {
         let now = Instant::now();
         self.own_seeks.retain(|t| now.duration_since(*t) < EXPECT_TTL);
+        self.own_srcs.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(15));
         self.expect_pause.retain(|(_, t)| now.duration_since(*t) < EXPECT_TTL);
         let mut cmds = vec![];
         let mut gone = false;
@@ -204,6 +220,20 @@ impl Player {
                     "seeking" => self.seeking_prop = data.as_bool().unwrap_or(false),
                     "paused-for-cache" => self.buffering = data.as_bool().unwrap_or(false),
                     "duration" => self.duration = data.as_f64().unwrap_or(0.0),
+                    "path" => {
+                        // A different file than the one we loaded: the person loaded it in
+                        // mpv (drag and drop, `loadfile`). It is the room's now.
+                        if let Some(p) = data.as_str().filter(|p| !p.is_empty()) {
+                            if self.cur_src.as_deref() != Some(p) && !self.own_srcs.iter().any(|(s, _)| s == p) {
+                                let src = normalize_source(p);
+                                self.cur_src = Some(p.to_string());
+                                self.user_load_until = Some(now + Duration::from_secs(5));
+                                self.eof = false;
+                                self.errored = false;
+                                cmds.push(UserCommand::Load { kind: kind_of(&src), source: src.into_bytes() });
+                            }
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -230,7 +260,10 @@ impl Player {
                 self.last_pos = t;
             }
         }
-        let state = if self.load_pending {
+        if self.user_load_until.is_some_and(|t| Instant::now() >= t) {
+            self.user_load_until = None;
+        }
+        let state = if self.load_pending || self.user_load_until.is_some() {
             PlayerState::Loading
         } else if self.errored {
             PlayerState::Error
@@ -247,7 +280,7 @@ impl Player {
             token: self.token,
             state,
             position_s: self.last_pos,
-            duration_s: if self.load_pending { 0.0 } else { self.duration },
+            duration_s: if self.load_pending || self.user_load_until.is_some() { 0.0 } else { self.duration },
             paused: self.pause,
         }
     }
@@ -261,3 +294,12 @@ pub fn kind_of(source: &str) -> SourceKind {
     }
 }
 
+
+/// A relative file path means a different file on every member; make it absolute.
+pub fn normalize_source(s: &str) -> String {
+    if !s.contains("://") && std::path::Path::new(s).exists() {
+        std::fs::canonicalize(s).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| s.to_string())
+    } else {
+        s.to_string()
+    }
+}

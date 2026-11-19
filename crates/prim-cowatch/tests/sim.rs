@@ -545,3 +545,61 @@ fn control_survives_a_dead_coordinator_player_past_the_block_window() {
         );
     }
 }
+
+/// `prim watch` restarted for a new URL: the new process (same member key, fresh machine,
+/// empty memory) is told to `Load` straight after construction, before the daemon's
+/// snapshot of the previous run's records reaches it. Whatever role it has, the URL just
+/// entered is what everyone ends up playing, and it stays that way.
+fn restart_with(seed: u64, who: usize, drop_coordinator_player: bool) {
+    let mut w = World::new(seed, 3, net(10, 30));
+    let idxs: Vec<usize> = (0..3).filter(|i| !(drop_coordinator_player && *i == 0)).collect();
+    if drop_coordinator_player {
+        // The coordinator runs no player: member 1 acts, so a restart of 1 is an acting-leader restart.
+        start_all(&mut w, &[1, 2], 3600.0);
+    } else {
+        start_all(&mut w, &[0, 1, 2], 3600.0);
+    }
+    w.command(who, url("https://example.test/a.mp4"));
+    // Several revisions behind us, so a stale record of the old run outranks a fresh one.
+    for k in 0..4 {
+        settle(&mut w, &idxs);
+        w.command(who, UserCommand::SeekTo(30.0 + k as f64));
+        w.run(500);
+    }
+    settle(&mut w, &idxs);
+    w.nodes[who] = None;
+    w.early_cmd = Some(url("https://example.test/b.mp4"));
+    w.start(who, 3600.0, 0.0, 3_000_000, 0.0);
+    for secs in [2u64, 5, 15] {
+        w.run(secs * 1000);
+        for &i in &idxs {
+            let n = w.n(i);
+            assert!(
+                n.p.has_src && n.p.src == b"https://example.test/b.mp4",
+                "seed {seed} who {who}: after {secs}s node {i} plays {:?}",
+                String::from_utf8_lossy(&n.p.src)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_restarted_coordinator_watcher_plays_the_url_it_was_just_given() {
+    for seed in SEEDS {
+        restart_with(seed, 0, false);
+    }
+}
+
+#[test]
+fn a_restarted_guest_watcher_plays_the_url_it_was_just_given() {
+    for seed in SEEDS {
+        restart_with(seed, 2, false);
+    }
+}
+
+#[test]
+fn a_restarted_acting_leader_plays_the_url_it_was_just_given() {
+    for seed in SEEDS {
+        restart_with(seed, 1, true);
+    }
+}
