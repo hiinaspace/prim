@@ -14,10 +14,14 @@ A as the friend. Then:
      rt.sent keeps growing (the stream never stopped)
   4. start Godot again (role reattach2): same member id, same name, same mute state
   5. assert voice again unchanged (no restart on adoption)
+  6. toggle deafen and mic through the session (`prim ctl session ...`): the voice process,
+     start count and incarnation must stay the same (VC: changes happen in place)
 
 Faults, each of which must turn the run red (--fault NAME):
-  restart-on-attach   the relaunched client re-applies its state (a deafen toggle), which
-                      restarts voice: step 5 must catch the new incarnation
+  restart-on-attach   the relaunched client cycles voice off and on at startup, which
+                      starts a new voice process: step 5 must catch the new incarnation
+                      (a mute/deafen toggle no longer restarts voice since round VC, so it
+                      cannot be the fault; step 6 below is its positive check)
   quit-on-close       the first client ends the session when it dies (simulated by
                       `prim ctl session quit` at the moment of the kill): step 3 must catch it
 
@@ -194,6 +198,16 @@ try:
           after["voice"]["pid"] == before["voice"]["pid"] and after["voice"]["starts"] == before["voice"]["starts"], {"before": before["voice"], "after": after["voice"]})
     check("relaunch: same voice incarnation", after["incarnation"] == before["incarnation"] and bool(after["incarnation"]), {"before": before["incarnation"], "after": after["incarnation"]})
     check("relaunch: both members still in the room", after["members"] == before["members"], after["members"])
+    # Step 6: toggles never restart voice.
+    for op in (("deafen", "on"), ("deafen", "off"), ("mic", "off"), ("mic", "on")):
+        ctl(sock_a, "session", *op)
+        time.sleep(0.5)
+    time.sleep(1.5)
+    tog = snapshot()
+    check("toggles: mic/deafen changes kept the same voice process, start count and incarnation",
+          tog["voice"]["pid"] == before["voice"]["pid"] and tog["voice"]["starts"] == before["voice"]["starts"]
+          and tog["incarnation"] == before["incarnation"] and bool(tog["incarnation"]), {"before": before, "after": tog})
+    check("toggles: mic is on again and deafen is off", tog["voice"]["mic"] and not tog["voice"]["deaf"], tog["voice"])
     if g2 is not None and g2.poll() is None:
         g2.terminate()
     # Window close with no tray (tray_live is false until round T1): leave + quit, so no

@@ -10,8 +10,8 @@
 //! - Everything it spawns gets its own process group and outlives it: quitting Godot or
 //!   even killing the session leaves the room and voice running, and a new session
 //!   adopts both (it finds the daemon on `room.sock` and the voice client in `/proc`).
-//! - Mic and deafen are restart-based for now: [`Control::set_voice_state`] is the one
-//!   function round VC replaces with an IPC call to the voice client.
+//! - Mic and deafen are requests to the running voice client ([`Control::set_voice_state`],
+//!   round VC): nothing restarts, the incarnation stays. Voice starts only when absent.
 
 mod daemon;
 mod procs;
@@ -116,18 +116,39 @@ impl Control {
         Ok(status_of(&s))
     }
 
-    /// The one place mic and deafen change. Today a change replaces the voice client
-    /// (`--takeover`); round VC makes it a request to the running client instead.
+    /// The one place mic and deafen change: a request to the running voice client, which
+    /// changes in place (no restart, same incarnation). Only a missing client is started.
     pub fn set_voice_state(&self, mic: Option<bool>, deaf: Option<bool>) -> Result<SessionStatus, String> {
-        let mut s = self.lock();
-        let (m, d) = (mic.unwrap_or(s.voice.mic), deaf.unwrap_or(s.voice.deaf));
-        if mic == Some(true) || deaf.is_some() {
-            s.voice.wanted = true;
+        let (sock, remote) = {
+            let mut s = self.lock();
+            let (m, d) = (mic.unwrap_or(s.voice.mic), deaf.unwrap_or(s.voice.deaf));
+            if mic == Some(true) || deaf.is_some() {
+                s.voice.wanted = true;
+            }
+            let room_up = s.room.phase() == "up";
+            let sock = s.room_socket.clone();
+            let remote = s.voice.want(m, d, room_up, &sock);
+            (sock, remote)
+        };
+        if remote {
+            // Outside the lock: the voice client may take up to a second to acknowledge.
+            let r = voice::control(&sock, mic, deaf);
+            let mut s = self.lock();
+            match r {
+                Ok(st) => s.voice.learn(&st),
+                Err(prim_client::client::VoiceError::NotRunning) => {
+                    let room_up = s.room.phase() == "up";
+                    let (m, d) = (s.voice.mic, s.voice.deaf);
+                    if s.voice.running_unleased() {
+                        s.voice.note_not_running();
+                    } else {
+                        s.voice.restart_missing(m, d, room_up, &sock);
+                    }
+                }
+                Err(e) => return Err(format!("voice: {e}")),
+            }
         }
-        let room_up = s.room.phase() == "up";
-        let sock = s.room_socket.clone();
-        s.voice.set_state(m, d, room_up, &sock);
-        Ok(status_of(&s))
+        Ok(status_of(&self.lock()))
     }
 
     pub fn quit(&self) -> SessionStatus {

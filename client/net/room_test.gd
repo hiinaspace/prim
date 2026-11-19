@@ -144,10 +144,11 @@ func _reattach2() -> void:
 	var want_me := OS.get_environment("ROOM_TEST_EXPECT_ME")
 	var want_name := OS.get_environment("ROOM_TEST_EXPECT_NAME")
 	if fault == "restart-on-attach":
-		# What a client that re-applied its own state on startup would do.
-		session.set_deafen(true)
+		# What a client that cycled voice off and on at startup would do (a mute or deafen
+		# toggle no longer restarts voice, so this is the restart that still can happen).
+		session.set_voice(false)
 		await get_tree().create_timer(1.0).timeout
-		session.set_deafen(false)
+		session.set_voice(true)
 		await get_tree().create_timer(3.0).timeout
 	await get_tree().create_timer(2.0).timeout # let a session status poll land
 	_check("reattach2: same member id", session.me == want_me and want_me != "", {"me": session.me, "want": want_me})

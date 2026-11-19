@@ -12,7 +12,7 @@ Godot / prim ctl / prim ui / tray     (clients; any may come and go)
         |  session.sock  (one JSON request, one reply per connection)
    prim session           supervisor: single instance, own process group
      |-- prim room        daemon, one room (room.sock, rt.sock)
-     `-- prim voice       kept running, relaunched on lease loss
+     `-- prim voice       kept running; reconnects itself on lease loss
 ```
 
 - **Sockets** sit beside `room.sock` (`$PRIM_SOCKET`, else `$XDG_RUNTIME_DIR/prim/`):
@@ -20,13 +20,19 @@ Godot / prim ctl / prim ui / tray     (clients; any may come and go)
 - **Single instance**: a second `prim session` finds the first and exits; every client
   calls `ensure` (start one if none answers, else use it). The children are spawned in their
   own process group, so a session that is killed leaves them running, and the next session
-  **adopts** the live daemon and the live voice client (mic/deafen are read from its argv)
+  **adopts** the live daemon and the live voice client (mic/deafen are read from its `voice_status` report)
   without restarting either.
 - **Requests** (`{"op": ...}`): `status`, `create{name,args}`, `join{token,args}`,
   `resume{room,args}`, `leave`, `cancel`, `voice{on}`, `set_mic{on}`, `set_deafen{on}`,
   `quit`. The control surface is "set mic on/off, set deafen on/off, read the state":
-  today a change replaces the voice client with `--takeover` (one function,
-  `Control::set_voice_state`); round VC changes its body to a request to the running client.
+  a change is a `voice_control(mic, deaf, tray_live)` request to the running voice client
+  (one function, `Control::set_voice_state`): nothing restarts, the incarnation stays, peers'
+  receivers do not reset. Voice is started once (`--start-muted`, `--start-deaf`, `--tray-live`
+  as needed) and restarted only when `voice_status`/`voice_control` says `NotRunning`;
+  `voice_reconnecting` means wait and retry. Exit 4 (takeover or policy) is not fought: the
+  state becomes `busy` until the person turns voice on again (which takes the lease over).
+  The voice client mutes itself if Godot's tracking lease goes away and `tray_live` is false;
+  the session reads that back (about once a second) so `status.voice.mic` is what voice does.
 - **Status**: `{pid, room: none|starting|up|failed, kind: found|join|resume|attached,
   error, voice: {running, wanted, mic, deaf, state, detail, pid, starts}}`.
 - **Joining**: `join` returns once the daemon is up; whether the room answers is read from

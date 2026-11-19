@@ -12,7 +12,6 @@ use std::time::Duration;
 use prim_room::daemon::{Daemon, DaemonOpts, Start};
 use prim_room::local::{Client, ReplyJson, Request};
 use prim_room::transport::iroh::{IrohConfig, IrohTransport, PeerAddrs, RelaySetting};
-use prim_client::chat::Clients;
 use prim_client::room::{send_chat_once, Cmd, Delivery, Handle, Model, Presence, RoomOpts};
 use prim_client::session::{SessionClient, SessionRequest};
 use prim_client::transport::UnixTransport;
@@ -266,15 +265,43 @@ async fn roster_chat_voice_and_non_members() {
     call(SessionRequest::Voice { on: true });
     b.win.wait_until_a(10, "alice listening, mic muted", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     a.win.wait_until_a(5, "lease visible in status", || a.win.lock().voice_lease_held()).await.unwrap();
+    let first = call(SessionRequest::Status);
+    let holder0 = a.win.lock().voice_holder().expect("voice lease holder");
+    let (vpid, vstarts) = (first.voice.pid.expect("voice pid"), first.voice.starts);
+    // Round VC: mic and deafen are requests to the running client. Every toggle below must
+    // keep the same process and the same start count, and the peer's indicator must follow.
+    let same = |what: &str, st: &prim_client::session::SessionStatus| {
+        assert!(
+            st.voice.running && st.voice.pid == Some(vpid) && st.voice.starts == vstarts,
+            "{what}: voice was restarted: {:?}",
+            st.voice
+        );
+    };
     let st = call(SessionRequest::SetMic { on: true });
     assert!(st.voice.mic && !st.voice.deaf);
+    same("mic on", &st);
     b.win.wait_until_a(10, "alice mic live", || voice_of(&b.win, "alice") == Some((true, true))).await.unwrap();
-    // Deafen is carried by the window's own `clients` key.
-    a.win.send(Cmd::SetClients(Clients { deaf: true, ..Default::default() }));
-    b.win.wait_for_a(5, "alice deafened", |m| m.members().iter().any(|r| r.name == "alice" && r.clients.deaf)).await.unwrap();
-    // Muting again replaces the client; the indicator must follow (live -> muted).
-    call(SessionRequest::SetMic { on: false });
+    let st = call(SessionRequest::SetDeafen { on: true });
+    assert!(st.voice.deaf && st.voice.mic, "{:?}", st.voice);
+    same("deafen on", &st);
+    b.win.wait_until_a(10, "alice deafened (not listening, mic live)", || voice_of(&b.win, "alice") == Some((false, true))).await.unwrap();
+    let st = call(SessionRequest::SetDeafen { on: false });
+    assert!(!st.voice.deaf && st.voice.mic, "{:?}", st.voice);
+    same("deafen off", &st);
+    b.win.wait_until_a(10, "alice hearing again", || voice_of(&b.win, "alice") == Some((true, true))).await.unwrap();
+    let st = call(SessionRequest::SetMic { on: false });
+    assert!(!st.voice.mic);
+    same("mic off", &st);
     b.win.wait_until_a(10, "alice muted again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    for on in [true, false] {
+        let st = call(SessionRequest::SetMic { on });
+        same("mic toggle", &st);
+        b.win.wait_until_a(10, "alice indicator follows", || voice_of(&b.win, "alice") == Some((true, on))).await.unwrap();
+    }
+    // The room key must show one incarnation throughout (peers' receivers never reset).
+    let now = call(SessionRequest::Status);
+    same("after all toggles", &now);
+    assert_eq!(a.win.lock().voice_holder(), Some(holder0), "voice session/incarnation changed across toggles");
     call(SessionRequest::Voice { on: false });
     b.win
         .wait_until_a(10, "alice voice cleared", || voice_of(&b.win, "alice").is_none_or(|(l, m)| !l && !m))
