@@ -452,7 +452,7 @@ pub async fn attach(socket: &Path, opts: AttachOpts) -> std::io::Result<Handle> 
                                 // Before a member's profile arrives there is only a key to show.
                                 let named = name != short(&key);
                                 let line = match what.as_str() {
-                                    "joined" => Some(format!("{name} joined the room")),
+                                    "joined" if named => Some(format!("{name} joined the room")),
                                     "online" if named => Some(format!("{name} is online")),
                                     "offline" => Some(format!("{name} went offline")),
                                     "unresponsive" => Some(format!("{name} stopped responding")),

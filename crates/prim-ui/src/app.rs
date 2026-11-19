@@ -595,9 +595,9 @@ impl App {
                     let (mic_icon, mic_label, mic_hint) = if !voice_on {
                         (Icon::MicOff, "Mic", "Turn voice on first")
                     } else if mic_live {
-                        (Icon::Mic, "Mic live", "Others can hear you. Click to mute.")
+                        (Icon::Mic, "Mute mic", "Your microphone is live: others can hear you. Click to mute.")
                     } else {
-                        (Icon::MicOff, "Mic muted", "Others cannot hear you. Click to talk.")
+                        (Icon::MicOff, "Unmute mic", "You are muted: others cannot hear you. Click to talk.")
                     };
                     if tool_button(
                         ui,
@@ -616,7 +616,7 @@ impl App {
                     if tool_button(
                         ui,
                         if deaf { Icon::HeadphonesOff } else { Icon::Headphones },
-                        if deaf { "Deafened" } else { "Deafen" },
+                        if deaf { "Undeafen" } else { "Deafen" },
                         deaf.then_some(RED),
                         voice_on,
                         if voice_on { "Silence the room for yourself" } else { "Turn voice on first" },
@@ -639,7 +639,7 @@ impl App {
                         self.confirm = Some(Confirm::Leave);
                     }
                     if s.am_keyholder && s.lifecycle == "open" {
-                        if tool_button(ui, Icon::Door, "Close room", None, true, "End the room for everyone (opener only)").clicked() {
+                        if tool_button(ui, Icon::Door, "Close for everyone", None, true, "End the room for everyone (opener only). Leave just removes you.").clicked() {
                             self.confirm = Some(Confirm::Close);
                         }
                     }
@@ -670,7 +670,7 @@ impl App {
             .show(root, |ui| {
                 ui.horizontal(|ui| {
                     let (dot, text) = match s.lifecycle.as_str() {
-                        "open" => (GREEN, format!("In room {}", &s.room[..8.min(s.room.len())])),
+                        "open" => (GREEN, format!("In room {}", &s.room[..6.min(s.room.len())])),
                         "closed" => (AMBER, "This room was closed by its opener".to_string()),
                         _ => (RED, "Not in a room".to_string()),
                     };
@@ -776,8 +776,7 @@ impl App {
                 ui.label(text).on_hover_text(format!("member {}", m.key));
                 if m.is_me {
                     pill(ui, "you", ACCENT);
-                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                    icons::paint(ui.painter(), r, Icon::Pencil, if resp.hovered() { TEXT } else { DIM });
+                    let resp = ui.add(egui::Label::new(RichText::new("rename").size(11.0).color(DIM).underline()).sense(Sense::click()));
                     if resp.on_hover_text("Change your name").clicked() {
                         self.editing_name = Some(m.name.clone());
                     }
