@@ -32,11 +32,20 @@ pub const VALUED_FLAGS: &[&str] = &[
     "arrival",
     "min-delay-ms",
     "test-drop-every",
+    "input-device",
+    "output-device",
+    "gain-db",
+    "volume",
+    "levels",
+    "seconds",
 ];
 
 pub const HELP: &str = "\
 prim voice [options]            the voice client (one per daemon)
 prim voice track [options]      send head poses as the tracking source
+prim voice devices              list microphones and speakers (JSON, opens nothing)
+prim voice meter --levels PATH  publish the microphone level without joining a room
+prim voice test [--seconds N]   record, send through Opus, play back through the receive path
 
 options:
   --rt-socket PATH      realtime socket (default $XDG_RUNTIME_DIR/prim/rt.sock)
@@ -51,6 +60,11 @@ options:
   --min-delay-ms N      NetEq minimum delay (default 20, voice-core's)
   --no-dtx              send silence instead of using Opus DTX
   --test-drop-every N   TEST ONLY (harness oracle fault): drop every Nth outgoing media packet
+  --input-device ID     microphone to use instead of the saved choice or the system default
+  --output-device ID    speakers, likewise
+  --gain-db N           microphone gain before the encoder and the meter
+  --volume X            output volume (1.0 = unchanged)
+  --levels PATH         publish the live mic level here (for the room window)
   --duration SECS       exit after this long (default: run until SIGINT/SIGTERM)
   SIGUSR1               reopen the audio devices on the current default
 
@@ -108,6 +122,8 @@ pub struct Config {
     /// Test-only fault for the R0 oracle harness: drop every Nth outgoing media packet
     /// (non-empty payload) before it reaches the daemon. Never set in product use.
     pub test_drop_every: Option<u64>,
+    /// Per-computer audio settings, gain and meter (None in library tests).
+    pub audio: Option<Arc<crate::audio::Audio>>,
 }
 
 impl Default for Config {
@@ -125,11 +141,12 @@ impl Default for Config {
             min_delay_ms: None,
             incarnation: None,
             test_drop_every: None,
+            audio: None,
         }
     }
 }
 
-fn parse_capture(s: &str) -> Result<CaptureSpec> {
+pub(crate) fn parse_capture(s: &str) -> Result<CaptureSpec> {
     Ok(match s {
         "none" => CaptureSpec::None,
         "device" => CaptureSpec::Device,

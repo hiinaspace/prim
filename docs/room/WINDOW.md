@@ -49,6 +49,31 @@ Chat is an ordinary app message channel. Nothing in the daemon knows about it.
 | `member/<id>/profile` | each member, persistent | `{"v":1,"name":"..."}`, name at most 32 bytes. Defaults to the machine's hostname the first time. Other clients (the 3D room, round C1) should write and read the same key. |
 | `member/<id>/clients` | each member, presence-bound | `{"v":1,"godot":bool,"player":bool,"deaf":bool}`: which of the member's programs run, beyond `member/<id>/voice` (CONTRACTS.md section 6), which says listening and mic. `deaf` exists because the voice key has no such bit. |
 
+## Audio settings (round GW2)
+
+The **Audio** button (top bar) and **Audio settings** (Voice chat row) open a panel: pick the
+microphone and speakers (or "System default"), a live mic meter (RMS bar, peak tick, CLIP
+mark), input gain, output volume, and **Test microphone**: record 5 s, then play it back
+through the speakers after gain, Opus (16 kbps, DTX) and the receive path (NetEq).
+
+- Settings are per computer, in `$XDG_CONFIG_HOME/prim/audio.json` (`PRIM_AUDIO_SETTINGS`
+  overrides), read by `prim voice` itself, so every way of starting voice uses them. Gain and
+  volume changes apply to a running voice within 0.5 s; a device change restarts voice, as mute does.
+- A saved device that is not connected falls back to the system default and says so in the
+  panel and in the voice log; the choice is kept and returns when the device does.
+- Nothing is sent to other members and `rt.sock` is unchanged. The window never opens a
+  device: `prim voice devices` lists, `prim voice meter` publishes the level (a 32-byte file,
+  rewritten ~30 Hz) while the panel is open and voice is off, `prim voice test` runs the
+  loopback (JSON progress lines on stdout), and a running `prim voice --levels PATH`
+  publishes the level itself. Helpers die with the window; voice does not.
+- Differs from what a friend hears: no spatialisation, no network delay, jitter or loss, and
+  your own mic is monitored locally.
+- Where processing would go: `Audio::condition_input` in `crates/prim-voice/src/audio.rs`
+  (after gain, before the meter and the encoder).
+- Test hooks: `PRIM_UI_DEMO=audio` / `audiotest`, `PRIM_UI_AUDIO_DEVICES=<json>` (fixed list),
+  `PRIM_UI_AUDIO_TONE=<hz>` (the private tone source; 0 is silence), with `PRIM_UI_VOICE_TEST=1`.
+  `crates/prim-ui/tools/audio-shots.py` takes the five screenshots.
+
 ## Advanced view
 
 A read-only tree of what this daemon knows: room (lifecycle, generation, coordinator

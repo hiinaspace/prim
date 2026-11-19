@@ -128,6 +128,9 @@ pub fn spawn_synthetic(
                 while produced < due {
                     let n = ((due - produced) as usize).min(buf.len());
                     gen.fill(&mut buf[..n]);
+                    if let Some(a) = &sh.cfg.audio {
+                        a.condition_input(&mut buf[..n]);
+                    }
                     // A full ring means the encoder fell behind; the samples are lost,
                     // as a device's overrun would lose them.
                     sh.cap_ring.push(&buf[..n]);

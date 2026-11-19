@@ -68,6 +68,9 @@ pub fn spawn_pacer(sh: Arc<Shared>) -> Result<std::thread::JoinHandle<()>> {
                         buf[got..want].fill(0.0);
                         sh.stats.underruns.fetch_add(1, Ordering::Relaxed);
                     }
+                    if let Some(a) = &sh.cfg.audio {
+                        a.condition_output(&mut buf[..want]);
+                    }
                     write(&mut sink, &buf[..want]);
                     consumed += frames as u64;
                 }

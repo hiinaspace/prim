@@ -45,6 +45,16 @@ pub fn rt_socket_path(socket: &Path) -> PathBuf {
     socket.with_file_name("rt.sock")
 }
 
+/// Where `prim voice` publishes the live microphone level while it is running.
+pub fn voice_levels_path(socket: &Path) -> PathBuf {
+    socket.with_file_name("voice.levels")
+}
+
+/// Where the settings panel's own meter (`prim voice meter`) publishes it when voice is off.
+pub fn meter_levels_path(socket: &Path) -> PathBuf {
+    socket.with_file_name("meter.levels")
+}
+
 pub fn daemon_alive(socket: &Path) -> bool {
     UnixStream::connect(socket).is_ok()
 }
@@ -71,7 +81,7 @@ fn last_log_line(name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn command(args: &[String], log: &str) -> Result<Command> {
+pub(crate) fn command(args: &[String], log: &str) -> Result<Command> {
     let mut c = Command::new(exe());
     c.args(args)
         .stdin(Stdio::null())
@@ -356,12 +366,18 @@ impl Voice {
             (true, false) => "device",
         };
         let output = if self.deaf || self.test { "null" } else { "device" };
+        a.push(format!("--levels={}", voice_levels_path(&self.socket).display()));
         a.push(format!("--capture={capture}"));
         a.push(format!("--output={output}"));
         if takeover {
             a.push("--takeover".into());
         }
         a
+    }
+
+    /// Tone microphone and null speakers instead of real devices.
+    pub fn test_mode(&self) -> bool {
+        self.test
     }
 
     pub fn start(&mut self, takeover: bool) {

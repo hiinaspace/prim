@@ -4,6 +4,7 @@
 //! `prim ctl chat` and the tests), [`chat`] (the chat channel and the app state keys),
 //! [`supervise`] (starting the daemon, voice and other clients) and [`app`] (egui).
 
+pub mod audio;
 pub mod chat;
 pub mod client;
 pub mod supervise;

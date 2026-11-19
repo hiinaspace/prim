@@ -57,11 +57,12 @@ fn error_callback(sh: &Arc<Shared>) -> impl FnMut(cpal::Error) + Send + 'static 
 #[cfg(feature = "device")]
 fn open_output(sh: &Arc<Shared>) -> Result<cpal::Stream> {
     use anyhow::Context;
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, StreamTrait};
 
-    let dev = cpal::default_host()
-        .default_output_device()
-        .context("no default output device")?;
+    let (dev, missing) = crate::audio::dev::pick(false, &sh.cfg.audio.as_ref().and_then(|a| a.output.clone()))?;
+    if let Some(n) = missing {
+        eprintln!("prim voice: saved speakers {n:?} are not connected; using the system default");
+    }
     let cfg = cpal::StreamConfig {
         channels: 2,
         sample_rate: crate::shared::SAMPLE_RATE,
@@ -87,6 +88,9 @@ fn open_output(sh: &Arc<Shared>) -> Result<cpal::Stream> {
                         cb.stats.underruns.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                if let Some(a) = &cb.cfg.audio {
+                    a.condition_output(data);
+                }
                 for s in data.iter_mut() {
                     *s = s.clamp(-1.0, 1.0);
                 }
@@ -102,12 +106,13 @@ fn open_output(sh: &Arc<Shared>) -> Result<cpal::Stream> {
 #[cfg(feature = "device")]
 fn open_input(sh: &Arc<Shared>) -> Result<cpal::Stream> {
     use anyhow::Context;
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::traits::{DeviceTrait, StreamTrait};
     use cpal::SampleFormat;
 
-    let dev = cpal::default_host()
-        .default_input_device()
-        .context("no default input device")?;
+    let (dev, missing) = crate::audio::dev::pick(true, &sh.cfg.audio.as_ref().and_then(|a| a.input.clone()))?;
+    if let Some(n) = missing {
+        eprintln!("prim voice: saved microphone {n:?} is not connected; using the system default");
+    }
     let sc = dev.default_input_config().context("input config")?;
     let (fmt, channels, rate) = (sc.sample_format(), sc.channels() as usize, sc.sample_rate());
     let cfg: cpal::StreamConfig = sc.into();
@@ -155,6 +160,9 @@ where
                         acc += s.to_sample::<f32>();
                     }
                     mono[i] = acc / channels as f32;
+                }
+                if let Some(a) = &cb.cfg.audio {
+                    a.condition_input(&mut mono[..frames]);
                 }
                 // A full ring drops samples, as an overrun would.
                 ring.push(&mono[..frames]);
