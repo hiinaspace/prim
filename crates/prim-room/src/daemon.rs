@@ -67,6 +67,8 @@ pub struct Daemon {
     /// The voice lane's shared half (statistics); `None` without `rt_socket`.
     pub rt: Option<RtShared>,
     rt_lane: Option<RtLane>,
+    /// Notified when a local client sends `Shutdown`; `prim room` exits when it fires.
+    pub quit: std::sync::Arc<tokio::sync::Notify>,
     task: JoinHandle<()>,
     api_task: Option<JoinHandle<()>>,
 }
@@ -190,12 +192,13 @@ impl Daemon {
             ),
             _ => None,
         };
+        let quit = std::sync::Arc::new(tokio::sync::Notify::new());
         let api_task = match &opts.socket {
             Some(path) => {
                 let listener = local::bind(path)
                     .await
                     .with_context(|| path.display().to_string())?;
-                Some(tokio::spawn(local::serve(listener, handle.clone())))
+                Some(tokio::spawn(local::serve(listener, handle.clone(), quit.clone())))
             }
             None => None,
         };
@@ -208,6 +211,7 @@ impl Daemon {
             incarnation,
             rt: rt_shared,
             rt_lane,
+            quit,
             task,
             api_task,
         })

@@ -137,6 +137,10 @@ pub enum Request {
     Leave {
         req: u64,
     },
+    /// Stop this daemon: it replies `Ok`, saves state and exits (additive, ROOM.md).
+    Shutdown {
+        req: u64,
+    },
     /// Pull pending updates of a subscription now (the daemon also pushes them).
     Drain {
         sub: u32,
@@ -223,6 +227,16 @@ pub struct RouteJson {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StatusJson {
+    /// "none", "pending" (dialing the inviter) or "refused" (see `join_refused`).
+    #[serde(default)]
+    pub join: String,
+    /// Why a peer refused our join: `not_member`, `invite_invalid`, `closed`, `revoked`,
+    /// `wrong_room`, `version` or `unsupported`.
+    #[serde(default)]
+    pub join_refused: Option<String>,
+    /// The room's name (`found --meta`), when it is text.
+    #[serde(default)]
+    pub name: Option<String>,
     pub room: Option<String>,
     pub me: String,
     /// "dead", "open" or "closed".
@@ -414,7 +428,7 @@ impl Request {
             Request::Close { req } => LocalCommand::Close { req: *req },
             Request::Reopen { req } => LocalCommand::Reopen { req: *req },
             Request::Leave { req } => LocalCommand::Leave { req: *req },
-            Request::Drain { .. } => return Ok(None),
+            Request::Drain { .. } | Request::Shutdown { .. } => return Ok(None),
         }))
     }
 }
@@ -530,6 +544,17 @@ pub fn event_json(msg: &ClientMsg) -> Option<Event> {
                     };
                     ReplyJson::Status {
                         status: StatusJson {
+                            join: match &s.join {
+                                room_core::api::JoinState::None => "none",
+                                room_core::api::JoinState::Pending => "pending",
+                                room_core::api::JoinState::Refused(_) => "refused",
+                            }
+                            .into(),
+                            join_refused: match &s.join {
+                                room_core::api::JoinState::Refused(w) => Some((*w).to_string()),
+                                _ => None,
+                            },
+                            name: s.name.clone(),
                             room: s.room.map(|r| r.hex()),
                             me: s.me.hex(),
                             lifecycle: lifecycle.into(),
@@ -689,13 +714,18 @@ pub async fn bind(path: &Path) -> std::io::Result<UnixListener> {
 }
 
 /// Accept clients until the task is aborted.
-pub async fn serve(listener: UnixListener, handle: DriverHandle) {
+pub async fn serve(
+    listener: UnixListener,
+    handle: DriverHandle,
+    quit: std::sync::Arc<tokio::sync::Notify>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let handle = handle.clone();
+                let quit = quit.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = client_task(stream, handle).await {
+                    if let Err(e) = client_task(stream, handle, quit).await {
                         tracing::debug!("local client ended: {e}");
                     }
                 });
@@ -708,7 +738,11 @@ pub async fn serve(listener: UnixListener, handle: DriverHandle) {
     }
 }
 
-async fn client_task(stream: UnixStream, handle: DriverHandle) -> std::io::Result<()> {
+async fn client_task(
+    stream: UnixStream,
+    handle: DriverHandle,
+    quit: std::sync::Arc<tokio::sync::Notify>,
+) -> std::io::Result<()> {
     let (mut rd, mut wr) = stream.into_split();
     let (client, mut events) = handle.attach();
     // Requests are read in their own task so a long socket write never splits a message.
@@ -722,7 +756,7 @@ async fn client_task(stream: UnixStream, handle: DriverHandle) -> std::io::Resul
             }
         }
     });
-    let result = client_loop(&mut wr, &handle, client, &mut events, &mut req_rx).await;
+    let result = client_loop(&mut wr, &handle, client, &mut events, &mut req_rx, &quit).await;
     reader.abort();
     handle.detach(client);
     result
@@ -739,6 +773,7 @@ async fn client_loop(
     client: u64,
     events: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
     reqs: &mut tokio::sync::mpsc::Receiver<std::io::Result<Option<Vec<u8>>>>,
+    quit: &std::sync::Arc<tokio::sync::Notify>,
 ) -> std::io::Result<()> {
     use tokio::sync::mpsc::error::TryRecvError;
     // Subscriptions the core said are ready and that we haven't drained yet.
@@ -788,7 +823,7 @@ async fn client_loop(
             Input::Request(None) | Input::Request(Some(Ok(None))) => return Ok(()),
             Input::Request(Some(Err(e))) => return Err(e),
             Input::Request(Some(Ok(Some(body)))) => {
-                handle_request(&body, handle, client, wr).await?
+                handle_request(&body, handle, client, wr, quit).await?
             }
         }
     }
@@ -806,6 +841,7 @@ async fn handle_request(
     handle: &DriverHandle,
     client: u64,
     wr: &mut tokio::net::unix::OwnedWriteHalf,
+    quit: &std::sync::Arc<tokio::sync::Notify>,
 ) -> std::io::Result<()> {
     let req: Request = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -822,6 +858,18 @@ async fn handle_request(
     match req.to_command(unix_ms()) {
         Ok(Some(cmd)) => handle.local(client, cmd),
         Ok(None) => {
+            if let Request::Shutdown { req } = req {
+                write_msg(
+                    wr,
+                    &Event::Reply {
+                        req,
+                        reply: ReplyJson::Ok,
+                    },
+                )
+                .await?;
+                quit.notify_one();
+                return Ok(());
+            }
             if let Request::Drain { sub, max } = req {
                 let updates = handle.drain(client, sub, max.clamp(1, 1024)).await;
                 let ev = Event::Updates {
