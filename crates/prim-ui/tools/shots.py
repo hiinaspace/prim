@@ -85,6 +85,15 @@ def start_daemon(n, mode, token=None, peer=None):
 def ctl(n, *a):
     return sh([PRIM, "ctl", f"--socket={n['sock']}", *a], env={**os.environ, **n["env"]}).strip()
 
+def chat(n, text):
+    # The receiving window may still be attaching; retry until it has registered the channel.
+    for _ in range(10):
+        r = subprocess.run([PRIM, "ctl", f"--socket={n['sock']}", "chat", "send", text],
+                           env={**os.environ, **n["env"]}, capture_output=True, text=True)
+        if r.returncode == 0: return
+        time.sleep(1)
+    sys.exit("chat send kept failing: " + r.stderr)
+
 def status(n): return json.loads(ctl(n, "status", "--json"))
 
 def set_name(n, name):
@@ -157,11 +166,11 @@ try:
     # 5. chat (ben has no window here, so a `chat tail` registers the channel for it)
     spawn([PRIM, "ctl", f"--socket={b['sock']}", "chat", "tail", "--timeout", "90"], b["env"], b["dir"] / "tail.log")
     time.sleep(1)
-    ctl(b, "chat", "send", "hey, can you hear me?")
+    chat(b, "hey, can you hear me?")
     time.sleep(0.4)
-    print(sh([PRIM, "ctl", f"--socket={a['sock']}", "chat", "send", "test"], env={**os.environ, **a["env"]}) if False else subprocess.run([PRIM, "ctl", f"--socket={a['sock']}", "chat", "send", "test"], env={**os.environ, **a["env"]}, capture_output=True, text=True))
+    chat(a, "test")
     time.sleep(0.4)
-    ctl(b, "chat", "send", "yes! the voice dot went green on my side")
+    chat(b, "yes! the voice dot went green on my side")
     shot("5-chat", 1.5)
     close_window(w)
 
