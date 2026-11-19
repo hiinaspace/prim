@@ -531,6 +531,36 @@ fn coordinator_daemon_without_player() {
     wait_for(15.0, "c at 30", || c.pos().is_some_and(|(p, _)| (p - 30.0).abs() < 0.3));
 }
 
+/// The coordinator's player quits and is started again (same daemon, so the same coordinator
+/// term) with the same file: the room must come back together, not stay split.
+#[test]
+fn coordinator_watcher_restart_rejoins() {
+    need_tools!();
+    let dir = testdir();
+    let media = clip(dir.path(), "t60.mp4", 60);
+    let ds = room(dir.path(), 2);
+    let src = media.to_str().unwrap();
+    let mut a = watch(dir.path(), &ds[0], "a", Some(src), &[]);
+    let mut b = watch(dir.path(), &ds[1], "b", None, &[]);
+    wait_for(60.0, "a and b playing", || {
+        a.pos().is_some_and(|(_, p)| !p) && b.pos().is_some_and(|(_, p)| !p)
+    });
+    settle(20.0, "together", &mut a, &mut b, 0.3);
+    // The old watcher must have been up a while: its clock origin is what goes stale.
+    std::thread::sleep(Duration::from_secs(8));
+    drop(a);
+    std::thread::sleep(Duration::from_secs(1));
+    let mut a2 = watch(dir.path(), &ds[0], "a2", Some(src), &[]);
+    wait_for(30.0, "restarted a playing", || a2.pos().is_some_and(|(_, p)| !p));
+    let t = wait_for(3.0, "restarted a and b together again", || {
+        skew(&mut a2, &mut b).is_some_and(|s| s < 0.4)
+    });
+    eprintln!("restart: together again after {t:.1}s; a2 {:?} b {:?}", a2.pos(), b.pos());
+    std::thread::sleep(Duration::from_secs(3));
+    let s = skew(&mut a2, &mut b).unwrap();
+    assert!(s < 0.5, "still split {s:.2}s");
+}
+
 /// One YouTube URL through mpv's yt-dlp path. Network and yt-dlp needed:
 /// `PRIM_WATCH_YT=https://www.youtube.com/watch?v=... cargo test -p prim --test watch -- --ignored youtube`
 #[test]

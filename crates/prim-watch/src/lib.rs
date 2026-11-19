@@ -109,9 +109,19 @@ fn outcome(s: &str) -> SendOutcome {
     }
 }
 
+fn mono_us() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: plain syscall writing to a valid timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+}
+
 impl Host {
     fn now_us(&self) -> u64 {
-        self.start.elapsed().as_micros() as u64
+        // Host-wide monotonic clock, not time since this process started: a watcher restarted
+        // on the same daemon keeps the same clock identity in its peers' estimators, so its
+        // timestamps must stay in the same timebase.
+        mono_us()
     }
 
     /// Feed an event, carry out the actions, and feed what they cause, until quiet.
@@ -385,7 +395,7 @@ pub fn run(args: &dyn Flags) -> Result<ExitCode> {
     if std::env::var("PRIM_WATCH_FAULT").as_deref() == Ok("no_correction") {
         cfg.faults.no_correction = true;
     }
-    let (cw, boot) = Cowatch::new(cfg, 0);
+    let (cw, boot) = Cowatch::new(cfg, mono_us());
     let mut host = Host {
         client,
         cw,
