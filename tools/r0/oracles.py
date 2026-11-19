@@ -2234,6 +2234,8 @@ def idle_row(res, name, v):
 # script at time t is looked at in the recording near sample (t - t0) * 48000.
 VC_TOGGLES = 20
 VC_HALF = 0.5          # s per toggle state
+VC_MIC_TAIL = 0.20     # s; measured max 141 ms: the listener's playout buffer (~128 ms) plus fade and frame
+VC_DEAF_TAIL = 0.05    # s; measured max 28 ms (10 ms ramp, one block)
 VC_GUARD = 0.20        # s after a toggle before "silent" or "audible" is judged
 VC_FLAG_MS = 200       # a state change must reach the room within this
 VC_SILENT_DB = -60.0
@@ -2291,6 +2293,20 @@ def vc_amp(x, hz, t0, ta, tb):
     c = [math.cos(w * k) for k in range(n)]
     sn = [math.sin(w * k) for k in range(n)]
     return 2 * math.hypot(math.sumprod(seg, c), math.sumprod(seg, sn)) / n
+
+
+def vc_audible_tail(x, t0, ta, tb, floor=None):
+    """Seconds after `ta` at which the signal was last above the silence floor within
+    [ta, tb] (0.0 if it is silent from ta on)."""
+    floor = 10 ** (VC_SILENT_DB / 20.0) if floor is None else floor
+    i0, i1 = vc_i(ta, t0), vc_i(tb, t0)
+    seg = x[i0:i1]
+    last = -1
+    for k in range(len(seg) - 1, -1, -1):
+        if abs(seg[k]) > floor:
+            last = k
+            break
+    return (last + 1) / RATE
 
 
 def vc_max_step(x, t0, ta, tb):
@@ -2493,6 +2509,18 @@ def vc_mic_checks(o):
     rows.append(("vc-1a", "muted: the listener hears silence (< %d dB) after %d ms; live: the tone is back (>= 50 %% of the median level)" % (VC_SILENT_DB, VC_GUARD * 1000),
                  len(sil) >= 8 and quiet_worst < VC_SILENT_DB and ref > 0.01 and audible_min >= 0.5 * ref,
                  "%d muted windows, loudest %.1f dB; %d live windows, tone amp median %.4f, min %.4f" % (len(sil), quiet_worst, len(amps), ref, audible_min)))
+    # silence from the acknowledgement on: what the listener still hears after the mute was
+    # acknowledged is only what was already in flight (fade, one frame, the playout buffer)
+    tails = []
+    for k, (tc, ta, want) in enumerate(tg):
+        if want:
+            continue
+        t_next = tg[k + 1][0] if k + 1 < len(tg) else tc + VC_HALF
+        tails.append(vc_audible_tail(x, t0, ta, t_next))
+    worst_tail = max(tails, default=9.0)
+    rows.append(("vc-1f", "muted: nothing is audible at the listener later than %d ms after the acknowledgement (fade + frame + playout delay)" % (VC_MIC_TAIL * 1000),
+                 len(tails) >= 8 and worst_tail <= VC_MIC_TAIL,
+                 "%d mutes, audible tail after ack: max %.0f ms, median %.0f ms" % (len(tails), worst_tail * 1000, sorted(tails)[len(tails) // 2] * 1000 if tails else -1)))
     # clicks: biggest sample step anywhere after the first second vs the plain tone's own
     start = (o["toggles"][0][0] if tg else t0) - 0.2
     step = vc_max_step(x, t0, start, tg[-1][0] + 1.0) if tg else 0.0
@@ -2603,6 +2631,17 @@ def vc_deaf_checks(o):
     rows.append(("vc-2a", "deafened: the listener's output is silent (< %d dB) after %d ms; undeafened: the tone is back (>= 50 %% of the median)" % (VC_SILENT_DB, VC_GUARD * 1000),
                  len(sil) >= 8 and worst < VC_SILENT_DB and ref > 0.01 and min(amps, default=0) >= 0.5 * ref,
                  "%d deaf windows, loudest %.1f dB; %d hearing windows, tone amp median %.4f min %.4f" % (len(sil), worst, len(amps), ref, min(amps, default=0))))
+    # silent from the acknowledgement: the listener's own output, one block after the ack
+    tails = []
+    for k, (tc, ta, deaf, v) in enumerate(tg):
+        if not deaf:
+            continue
+        t_next = tg[k + 1][0] if k + 1 < len(tg) else tc + VC_HALF
+        tails.append(vc_audible_tail(x, t0, ta, t_next))
+    worst_tail = max(tails, default=9.0)
+    rows.append(("vc-2e", "deafened: the listener's own output is silent from the acknowledgement (at most %d ms of audible tail: the ramp and one block)" % (VC_DEAF_TAIL * 1000),
+                 len(tails) >= 8 and worst_tail <= VC_DEAF_TAIL,
+                 "%d deafens, audible tail after ack: max %.0f ms, median %.0f ms" % (len(tails), worst_tail * 1000, sorted(tails)[len(tails) // 2] * 1000 if tails else -1)))
     # deaf is deaf only for me: L's own stream reaches T1 without a gap, and is one stream
     xt, tt = o["xt"], o["t0_t"]
     seg_a, seg_b = tg[0][0] - 0.5, tg[-1][0] + 0.5
