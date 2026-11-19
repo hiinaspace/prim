@@ -2064,7 +2064,7 @@ def scen_reorder(args, res, audio):
     # concealed slot each, no extra slot played) and the chirp ordering test in voice-core do.
     skipped = n["r"].get("skipped_samples")
     ok = ok and skipped == 0 and cont
-    res.oracle(scen, "ord-late", "a packet 0.8 s late is counted late and never played: late + reordered_accepted = held (+-2 at the end), one concealed slot per late packet (+-10 %), no duplicate, nothing skipped (skipped_samples = 0) and the tone continuous (step <= %.1fx lossless)" % STEP_RATIO_MAX,
+    res.oracle(scen, "ord-late", "a packet 0.8 s late is counted late and never played: late + reordered_accepted = held (+-2 at the end), one concealed slot per late packet (+-10 %%), no duplicate, nothing skipped (skipped_samples = 0) and the tone continuous (step <= %.1fx lossless)" % STEP_RATIO_MAX,
                ok, "talker held %d; receiver late %s, reordered_accepted %s, duplicate %s, plc %s (late x 960 = %s), skipped_samples %s; %s" %
                (held, n["late"], n["reord"], n["dup"], n["plc"], None if n["late"] is None else n["late"] * 960, skipped, cont_detail(a, ref)))
 
