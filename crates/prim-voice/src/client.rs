@@ -7,14 +7,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use room_core::rt::Role;
-use room_core::voice::voice_state;
 use serde_json::Value;
 
 use crate::capture;
 use crate::clock::mono_us;
 use crate::config::{CaptureSpec, Config, OutputSpec};
+use crate::control::Control;
 use crate::ring::Ring;
-use crate::rtio::{handshake, RtConn};
+use crate::rtio::{handshake, Link, RtConn};
 use crate::seats::Seats;
 use crate::shared::{ExitReason, GenSync, Senders, Shared, Stats, SAMPLE_RATE};
 
@@ -41,17 +41,18 @@ impl Client {
             Some(i) => i,
             None => random_incarnation()?,
         };
-        let mut flags = voice_state::LISTENING;
-        if !matches!(cfg.capture, CaptureSpec::None) {
-            flags |= voice_state::MIC;
-        }
+        let ctl = Control::new(&cfg);
+        let flags = ctl.wire_flags(&cfg);
         let lease = handshake(&conn, Role::Voice, cfg.takeover, incarnation, flags)
             .map_err(anyhow::Error::new)
             .context("voice lease")?;
         let generator = capture::generator(&cfg.capture, incarnation)?;
         let seats = Seats::new(lease.self_key, cfg.seats.clone());
+        let (ctl_tx, ctl_rx) = std::sync::mpsc::channel();
         let sh = Arc::new(Shared {
-            conn,
+            link: Link::new(conn),
+            ctl,
+            ctl_tx: Mutex::new(ctl_tx),
             self_key: lease.self_key,
             incarnation,
             start_us: mono_us(),
@@ -106,6 +107,8 @@ impl Client {
         if let Some(g) = generator {
             threads.push(capture::spawn_synthetic(sh.clone(), g));
         }
+        threads.push(crate::control::spawn(sh.clone(), ctl_rx));
+        sh.send_cmd(crate::control::Cmd::Announce);
         threads.push(crate::send::spawn(sh.clone()));
         threads.push(crate::recv::spawn(sh.clone()));
         threads.push(crate::mixer::spawn(sh.clone()));

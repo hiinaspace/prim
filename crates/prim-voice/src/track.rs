@@ -15,6 +15,8 @@ pub struct TrackOpts {
     pub rate_hz: f64,
     pub sweep_deg_per_s: f64,
     pub takeover: bool,
+    /// Hold this yaw instead of sweeping.
+    pub fixed_yaw_deg: Option<f64>,
     pub duration: Option<Duration>,
 }
 
@@ -46,7 +48,9 @@ pub fn run_tracker(conn: &RtConn, o: &TrackOpts) -> Result<u64> {
         }
         sleep_until(next);
         let t = mono_us();
-        let yaw = o.sweep_deg_per_s * (t - t0) as f64 * 1e-6;
+        let yaw = o
+            .fixed_yaw_deg
+            .unwrap_or(o.sweep_deg_per_s * (t - t0) as f64 * 1e-6);
         let sent = conn.send(&RtMsg::PoseOut {
             source_mono_us: t,
             seq,

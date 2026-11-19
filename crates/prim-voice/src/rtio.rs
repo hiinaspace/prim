@@ -272,3 +272,45 @@ pub fn handshake(
         }
     }
 }
+
+/// The client's connection to the daemon, replaceable while the process runs: after a lost
+/// lease the reader connects again and swaps the new socket in. While the link is down,
+/// sends report `Full` (the caller counts a drop) and nothing is queued.
+pub struct Link {
+    cur: std::sync::Mutex<std::sync::Arc<RtConn>>,
+    up: std::sync::atomic::AtomicBool,
+}
+
+impl Link {
+    pub fn new(conn: RtConn) -> Link {
+        Link {
+            cur: std::sync::Mutex::new(std::sync::Arc::new(conn)),
+            up: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    pub fn get(&self) -> std::sync::Arc<RtConn> {
+        self.cur.lock().unwrap().clone()
+    }
+
+    /// Swap in a freshly handshaken connection and mark the link up.
+    pub fn replace(&self, conn: RtConn) {
+        *self.cur.lock().unwrap() = std::sync::Arc::new(conn);
+        self.set_up(true);
+    }
+
+    pub fn is_up(&self) -> bool {
+        self.up.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_up(&self, up: bool) {
+        self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn send(&self, m: &RtMsg) -> SendOutcome {
+        if !self.is_up() {
+            return SendOutcome::Full;
+        }
+        self.get().send(m)
+    }
+}

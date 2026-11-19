@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use room_core::ids::Key;
-use room_core::rt::{peer_flags, RtMsg};
+use room_core::rt::{peer_flags, Role, RtMsg};
 use room_core::voice::{voice_flags, Fence, VoiceEnvelope};
 use voice_core::{
     PacketFlags, PacketObservation, PlayoutConfig, PlayoutReceiver, PushOutcome, VoicePacket,
@@ -32,30 +32,57 @@ pub fn spawn(sh: Arc<Shared>) -> std::thread::JoinHandle<()> {
 }
 
 fn reader_loop(sh: &Shared) {
-    // Per rt session: set by the first packet judged matched, never cleared. A reconnect
-    // is a new session (a new reader), so the latch starts unset again.
+    // Per rt session: set by the first packet judged matched, never cleared within a session.
+    // A reconnect is a new session, so the latch starts unset again.
     let mut matched = false;
     while !sh.is_shutdown() {
-        match sh.conn.recv(Duration::from_millis(20)) {
+        if !sh.link.is_up() {
+            if !reconnect(sh) {
+                return;
+            }
+            matched = false;
+        }
+        let conn = sh.link.get();
+        let got = conn.recv(Duration::from_millis(20));
+        match got {
             Ok(Some(b)) => {
                 let read_us = mono_us();
                 match RtMsg::decode(&b) {
-                    Ok(m) => handle(sh, m, read_us, &mut matched),
+                    Ok(m) => {
+                        if let Flow::Reconnect = handle(sh, m, read_us, &mut matched) {
+                            sh.link.set_up(false);
+                            continue;
+                        }
+                    }
                     Err(_) => sh.stats.bump("drop_rt_decode"),
                 }
             }
             Ok(None) => {}
             Err(_) => {
+                if sh.cfg.rt_socket.is_some() {
+                    sh.link.set_up(false);
+                    continue;
+                }
                 sh.stop(ExitReason::SocketClosed);
                 return;
             }
         }
+        if sh.is_shutdown() {
+            return;
+        }
         // Keepalive when idle: any message renews the lease, so only send if we haven't.
         let now = mono_us();
         if now.saturating_sub(sh.last_send_us.load(Ordering::Relaxed)) >= KEEPALIVE_US {
-            if sh.conn.send(&RtMsg::Keepalive) == crate::rtio::SendOutcome::Closed {
-                sh.stop(ExitReason::SocketClosed);
-                return;
+            match conn.send(&RtMsg::Keepalive) {
+                crate::rtio::SendOutcome::Closed => {
+                    if sh.cfg.rt_socket.is_some() {
+                        sh.link.set_up(false);
+                        continue;
+                    }
+                    sh.stop(ExitReason::SocketClosed);
+                    return;
+                }
+                _ => {}
             }
             sh.last_send_us.store(now, Ordering::Relaxed);
             sh.stats.bump("keepalives");
@@ -63,7 +90,87 @@ fn reader_loop(sh: &Shared) {
     }
 }
 
-fn handle(sh: &Shared, m: RtMsg, read_us: u64, matched: &mut bool) {
+/// Reconnect backoff: 50 ms, doubling to 1 s.
+pub fn backoff_ms(attempt: u32) -> u64 {
+    (50u64 << attempt.min(5)).min(1000)
+}
+
+/// How long a reconnect keeps trying while the daemon says another client holds the role.
+pub const BUSY_RETRY_US: u64 = 3_000_000;
+
+/// Connect again with the same incarnation and the current state, and swap the new socket
+/// in. `false` when the client is stopping (fatal revoke, busy for too long, shutdown).
+fn reconnect(sh: &Shared) -> bool {
+    let Some(path) = sh.cfg.rt_socket.clone() else {
+        sh.stop(ExitReason::SocketClosed);
+        return false;
+    };
+    sh.stats.bump("reconnects");
+    let t0 = mono_us();
+    let mut busy_since: Option<u64> = None;
+    let mut attempt = 0u32;
+    loop {
+        if sh.is_shutdown() {
+            return false;
+        }
+        match crate::rtio::RtConn::connect(&path) {
+            Ok(c) => {
+                let flags = sh.ctl.wire_flags(&sh.cfg);
+                match crate::rtio::handshake(&c, Role::Voice, false, sh.incarnation, flags) {
+                    Ok(lease) => {
+                        if lease.self_key != sh.self_key {
+                            sh.stop(ExitReason::SocketClosed);
+                            return false;
+                        }
+                        sh.link.replace(c);
+                        sh.last_send_us.store(mono_us(), Ordering::Relaxed);
+                        sh.stats.add("reconnect_down_us", mono_us() - t0);
+                        sh.send_cmd(crate::control::Cmd::Announce);
+                        return true;
+                    }
+                    Err(crate::rtio::HandshakeError::Refused(r)) => {
+                        if r != room_core::rt::refuse::BUSY {
+                            sh.stop(ExitReason::Refused(r));
+                            return false;
+                        }
+                        let since = *busy_since.get_or_insert_with(mono_us);
+                        if mono_us() - since > BUSY_RETRY_US {
+                            sh.stop(ExitReason::Refused(r));
+                            return false;
+                        }
+                    }
+                    Err(crate::rtio::HandshakeError::Revoked(r)) => {
+                        if !reconnectable_revoke(r) {
+                            sh.stop(ExitReason::Revoked(r));
+                            return false;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(_) => {}
+        }
+        sh.stats.bump("reconnect_attempts");
+        let wait = backoff_ms(attempt);
+        attempt += 1;
+        let until = mono_us() + wait * 1000;
+        while mono_us() < until && !sh.is_shutdown() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// An expired lease is retried; a takeover, a policy revoke or a code we do not know is final.
+pub fn reconnectable_revoke(reason: u8) -> bool {
+    reason == room_core::rt::revoke::EXPIRED
+}
+
+enum Flow {
+    Continue,
+    Reconnect,
+}
+
+fn handle(sh: &Shared, m: RtMsg, read_us: u64, matched: &mut bool) -> Flow {
     match m {
         RtMsg::VoiceIn {
             from,
@@ -88,8 +195,48 @@ fn handle(sh: &Shared, m: RtMsg, read_us: u64, matched: &mut bool) {
                 sh.seats.lock().unwrap().add(key);
             }
         }
-        RtMsg::Revoked { reason } => sh.stop(ExitReason::Revoked(reason)),
+        RtMsg::VoiceControl {
+            req,
+            mic,
+            deaf,
+            tray_live,
+        } => sh.send_cmd(crate::control::Cmd::Apply {
+            req,
+            mic,
+            deaf,
+            tray_live,
+        }),
+        RtMsg::TrackingLease { held } => tracking_lease(sh, held),
+        RtMsg::Revoked { reason } => {
+            if sh.cfg.rt_socket.is_some() && reconnectable_revoke(reason) {
+                sh.stats.bump("revoked_expired");
+                return Flow::Reconnect;
+            }
+            sh.stop(ExitReason::Revoked(reason));
+        }
         _ => {}
+    }
+    Flow::Continue
+}
+
+/// The tracking lease changed hands. When it is released the head pose is gone: the listener
+/// falls back to the seat's origin pose. And unless the tray is the mute authority
+/// (`tray_live`), the microphone must not stay open with nobody watching it: mute.
+fn tracking_lease(sh: &Shared, held: bool) {
+    let was = sh.ctl.tracking_held.swap(held, Ordering::SeqCst);
+    if held || !was {
+        return;
+    }
+    *sh.listener.lock().unwrap() = None;
+    sh.stats.bump("listener_cleared");
+    if !sh.ctl.tray_live.load(Ordering::SeqCst) && sh.ctl.mic_live.load(Ordering::SeqCst) {
+        sh.stats.bump("tray_safety_mutes");
+        sh.send_cmd(crate::control::Cmd::Apply {
+            req: 0,
+            mic: Some(false),
+            deaf: None,
+            tray_live: None,
+        });
     }
 }
 

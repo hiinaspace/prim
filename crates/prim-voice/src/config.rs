@@ -40,6 +40,7 @@ pub const VALUED_FLAGS: &[&str] = &[
     "volume",
     "levels",
     "seconds",
+    "yaw",
 ];
 
 pub const HELP: &str = "\
@@ -65,6 +66,10 @@ options:
   --test-drop-burst N,M TEST ONLY: of every N media packets drop M consecutive ones
   --test-reorder N,K    TEST ONLY: hold every Nth media packet and send it after K more (K=1 swaps)
   --test-no-idle-skip   TEST ONLY: mixer renders silent peers too (A/B for the idle skip)
+  --test-no-fade        TEST ONLY: mute and unmute without the 10 ms fade (clicks)
+  --start-muted         start with the microphone muted (change it with `prim ctl voice`)
+  --start-deaf          start deafened (nothing is rendered; the outgoing stream is unaffected)
+  --tray-live           the tracking process is the mute authority: do not mute when it goes away
   --input-device ID     microphone to use instead of the saved choice or the system default
   --output-device ID    speakers, likewise
   --gain-db N           microphone gain before the encoder and the meter
@@ -76,6 +81,7 @@ options:
 track options:
   --rate HZ             pose rate (default 90)
   --sweep DEG_PER_S     yaw sweep speed (default 30)
+  --yaw DEG             hold this yaw instead of sweeping
 ";
 
 #[derive(Clone, Debug)]
@@ -133,6 +139,16 @@ pub struct Config {
     pub test_reorder: Option<(u64, u64)>,
     /// Test-only: the mixer pulls and renders idle peers too (the pre-skip behaviour).
     pub test_no_idle_skip: bool,
+    /// Test-only: mute and unmute without the fade.
+    pub test_no_fade: bool,
+    /// Start with the microphone muted / the output deafened.
+    pub start_muted: bool,
+    pub start_deaf: bool,
+    /// The tracking process (the tray) is the mute authority: losing it does not mute.
+    pub tray_live: bool,
+    /// The daemon's rt socket, so the reader can connect again after a lost lease.
+    /// None (library tests with a socket pair): a lost lease ends the client.
+    pub rt_socket: Option<PathBuf>,
     /// Per-computer audio settings, gain and meter (None in library tests).
     pub audio: Option<Arc<crate::audio::Audio>>,
 }
@@ -155,6 +171,11 @@ impl Default for Config {
             test_drop_burst: None,
             test_reorder: None,
             test_no_idle_skip: false,
+            test_no_fade: false,
+            start_muted: false,
+            start_deaf: false,
+            tray_live: false,
+            rt_socket: None,
             audio: None,
         }
     }
@@ -272,6 +293,10 @@ impl Config {
             c.test_reorder = Some(parse_pair("test-reorder", v)?);
         }
         c.test_no_idle_skip = f.has("test-no-idle-skip");
+        c.test_no_fade = f.has("test-no-fade");
+        c.start_muted = f.has("start-muted");
+        c.start_deaf = f.has("start-deaf");
+        c.tray_live = f.has("tray-live");
         if let Some(v) = f.value("min-delay-ms") {
             c.min_delay_ms = Some(v.parse().with_context(|| format!("--min-delay-ms {v:?}"))?);
         }
