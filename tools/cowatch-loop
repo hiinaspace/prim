@@ -197,22 +197,27 @@ def ctl_invite(prim: Path, sock: Path) -> str:
 
 
 def build(no_build: bool) -> None:
-    if no_build:
-        return
     t = time.time()
+    if no_build:
+        link_lib()
+        return
     cmd = ["cargo", "build", "--locked", "-q", "-p", "prim", "-p", "prim-client", "-p", "prim_native"]
     if not shutil.which("cargo"):
         cmd = ["nix", "develop", str(REPO), "--command", *cmd]
     r = subprocess.run(cmd + ["--target-dir", str(REPO / "target")], cwd=REPO)
     if r.returncode:
         sys.exit("cargo build failed")
+    link_lib()
+    print(f"build: {time.time() - t:.1f}s")
+
+
+def link_lib() -> None:
     lib = REPO / "target/debug/libprim_native.so"
     dst = REPO / "client/bin/linux/libprim_native.so"
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() or dst.exists():
         dst.unlink()
     dst.symlink_to(lib)
-    print(f"build: {time.time() - t:.1f}s")
 
 
 def find_godot(arg: str | None) -> str:
