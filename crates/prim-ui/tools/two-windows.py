@@ -44,7 +44,8 @@ def cleanup():
                     try: os.kill(int(pid), signal.SIGTERM)
                     except OSError: pass
     time.sleep(0.3)
-    shutil.rmtree(ROOT, ignore_errors=True)
+    if os.environ.get("KEEP"): print("kept", ROOT)
+    else: shutil.rmtree(ROOT, ignore_errors=True)
 
 (ROOT / "sway.conf").write_text("output HEADLESS-1 resolution 1600x760\ndefault_border none\n")
 senv = {"XDG_RUNTIME_DIR": str(RUN), "WLR_BACKENDS": "headless", "WLR_LIBINPUT_NO_DEVICES": "1", "WLR_RENDERER": "pixman"}
