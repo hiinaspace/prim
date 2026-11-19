@@ -63,6 +63,10 @@ pub struct Client {
 pub enum VoiceError {
     /// No voice client holds the lease (nothing was changed or remembered).
     NotRunning,
+    /// The voice client's lease ended moments ago (or while the request waited). It is
+    /// reconnecting in-process: the change may or may not have been applied. Wait and
+    /// retry or read `voice_status`; do not restart voice.
+    Reconnecting,
     /// The voice client did not acknowledge within 1 s.
     NoAck,
     /// The request changed nothing.
@@ -82,6 +86,7 @@ impl std::fmt::Display for VoiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VoiceError::NotRunning => write!(f, "voice not running"),
+            VoiceError::Reconnecting => write!(f, "voice is reconnecting (retry; do not restart)"),
             VoiceError::NoAck => write!(f, "voice did not acknowledge (no ack)"),
             VoiceError::BadRequest => write!(f, "nothing to change"),
             VoiceError::Io(e) => write!(f, "{e}"),
@@ -430,6 +435,7 @@ impl Client {
             ReplyJson::Voice { voice } => Ok(voice),
             ReplyJson::Error { code } => Err(match code.as_str() {
                 "voice_not_running" => VoiceError::NotRunning,
+                "voice_reconnecting" => VoiceError::Reconnecting,
                 "voice_no_ack" => VoiceError::NoAck,
                 "bad_request" => VoiceError::BadRequest,
                 _ => VoiceError::Other(code),

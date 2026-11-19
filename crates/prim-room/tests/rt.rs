@@ -930,3 +930,50 @@ async fn rt_delay_stays_small_while_the_core_is_flooded() {
     assert!(got as usize >= n as usize * 9 / 10, "{got} of {n} arrived");
     assert!(pct(0.99) < 5_000, "p99 {} us", pct(0.99));
 }
+
+/// A control issued while voice is between leases must not read as "voice is not running"
+/// (the caller would start a second voice): within the grace it is `voice_reconnecting`,
+/// including the request that was waiting when the link dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controls_during_a_voice_reconnect_are_not_reported_as_not_running() {
+    let fleet = Fleet::mem();
+    let (a, _b) = pair(&fleet).await;
+    let path = rt_path(&a).to_path_buf();
+    let rt = a.daemon.rt.as_ref().unwrap().clone();
+
+    // Voice never ran: plain "not running".
+    assert_eq!(
+        rt.voice_control(Some(false), None, None).await.unwrap_err(),
+        "voice_not_running"
+    );
+
+    let c1 = acquire(&path, Role::Voice, 11, LM).await;
+    let waiting = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.voice_control(Some(false), None, None).await })
+    };
+    wait_msg(&c1.sock, 2000, |m| matches!(m, RtMsg::VoiceControl { .. })).await;
+    // The link drops before the report: the request may have been applied.
+    drop(c1);
+    assert_eq!(waiting.await.unwrap().unwrap_err(), "voice_reconnecting");
+    // And a new one right after says the same.
+    assert_eq!(
+        rt.voice_control(Some(true), None, None).await.unwrap_err(),
+        "voice_reconnecting"
+    );
+    // The reconnected client takes controls again.
+    let c2 = acquire(&path, Role::Voice, 11, LM).await;
+    let again = {
+        let rt = rt.clone();
+        tokio::spawn(async move { rt.voice_control(Some(true), None, None).await })
+    };
+    let req = match wait_msg(&c2.sock, 2000, |m| matches!(m, RtMsg::VoiceControl { .. })).await {
+        RtMsg::VoiceControl { req, .. } => req,
+        _ => unreachable!(),
+    };
+    c2.sock
+        .send_msg(&RtMsg::VoiceReport { ack: req, state: 0 })
+        .await
+        .unwrap();
+    assert!(again.await.unwrap().is_ok());
+}

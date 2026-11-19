@@ -307,7 +307,7 @@ impl PrimClient {
     /// 1 / 0 / -1 (a lost tracking lease mutes the mic unless 1). The answer is a `reply`
     /// whose data is `{"kind": "voice", "voice": {mic, muted, deaf, listening, tray_live,
     /// incarnation, voice_running, ...}}`: what the voice process reported after applying
-    /// the change, or `{"kind": "error", "code": "voice_not_running" | "voice_no_ack"}`.
+    /// the change, or `{"kind": "error", "code": "voice_not_running" | "voice_reconnecting" | "voice_no_ack"}`.
     /// Show that, not what you asked for. Returns the request id (-1: not connected).
     #[func]
     fn voice_control(&mut self, mic: i64, deaf: i64, tray_live: i64) -> i64 {

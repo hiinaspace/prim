@@ -186,8 +186,13 @@ voice --SetState (peers)--> daemon       voice --VoiceReport{ack,state}--> daemo
 - **Local API** (`room.sock`, JSON): `voice_control {req, mic?, deaf?, tray_live?}` (`mic: true`
   = microphone live) and `voice_status {req}`. Both answer `{"kind":"voice","voice":{voice_running,
   session, incarnation, listening, mic, muted, deaf, tray_live, reported, tracking_held}}`;
-  errors are `voice_not_running`, `voice_no_ack` (no `VoiceReport` within 1 s) and `bad_request`
-  (nothing to change). A request with no voice client is **not remembered**.
+  errors are `voice_not_running`, `voice_reconnecting`, `voice_no_ack` (no `VoiceReport`
+  within 1 s) and `bad_request` (nothing to change). A request with no voice client is **not
+  remembered**. `voice_reconnecting` means a voice lease ended less than 4 s ago, or ended
+  while the request waited (so it may or may not have been applied): the process is
+  reconnecting in place. **Do not restart voice on it** (a second launch would be refused
+  BUSY or fight the first); wait a moment and repeat the command (controls are idempotent) or
+  read `voice_status`. Only `voice_not_running` after the grace means start voice.
 - **rt messages.** `VoiceControl{req u32 != 0, mic, deaf, tray_live}` (0x87, daemon to
   client; each field is one byte: 0 leave, 1 false, 2 true). `VoiceReport{ack u32, state u8}`
   (0x06, client to daemon; `state` bits: 1 muted, 2 deaf, 4 tray_live; `ack` is the request it

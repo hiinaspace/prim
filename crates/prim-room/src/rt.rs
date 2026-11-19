@@ -58,6 +58,10 @@ const RESERVOIR: usize = 32768;
 const HEARTBEAT: Duration = Duration::from_millis(10);
 /// How long a control request waits for the voice client's acknowledging report.
 pub const VOICE_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+/// After a voice lease ends, controls fail `voice_reconnecting` for this long: long enough
+/// for the client's backoff and a BUSY retry, short enough that a voice that really exited
+/// reads as `voice_not_running`.
+pub const VOICE_RECONNECT_GRACE: Duration = Duration::from_secs(4);
 
 /// A request from outside the lane thread.
 enum LaneCmd {
@@ -660,7 +664,9 @@ impl RtShared {
 
     /// Ask the voice client to change `mic` (`Some(true)` = live), `deaf` and `tray_live`,
     /// and wait for its acknowledging report. Errors: `"voice_not_running"` (no lease
-    /// holder, or it went away while waiting) and `"voice_no_ack"` (nothing within
+    /// holder, or it went away while waiting) `"voice_reconnecting"` (the holder was lost less than [`VOICE_RECONNECT_GRACE`] ago, or while
+    /// the request waited: it may or may not have been applied; retry, do not restart voice)
+    /// and `"voice_no_ack"` (nothing within
     /// [`VOICE_ACK_TIMEOUT`]). The change is not remembered if nobody is there to take it.
     pub async fn voice_control(
         &self,
@@ -680,7 +686,7 @@ impl RtShared {
             .map_err(|_| "voice_not_running")?;
         match tokio::time::timeout(VOICE_ACK_TIMEOUT, rx).await {
             Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("voice_not_running"),
+            Ok(Err(_)) => Err("voice_reconnecting"),
             Err(_) => Err("voice_no_ack"),
         }
     }
@@ -824,6 +830,9 @@ struct Core {
     ttl: Duration,
     next_session: u64,
     next_voice_req: u32,
+    /// When the last voice lease ended. Within [`VOICE_RECONNECT_GRACE`] of that, a control
+    /// request fails `voice_reconnecting` instead of `voice_not_running`.
+    voice_lost_at: Option<Instant>,
     voice: Option<Rc<Session>>,
     tracking: Option<Rc<Session>>,
     peers: BTreeMap<Key, PeerEntry>,
@@ -879,6 +888,7 @@ async fn lane_main(
         ttl: Duration::from_millis(opts.lease_ttl_ms as u64),
         next_session: 1,
         next_voice_req: 1,
+        voice_lost_at: None,
         voice: None,
         tracking: None,
         peers: BTreeMap::new(),
@@ -1122,7 +1132,14 @@ impl Core {
                 reply,
             } => {
                 let Some(v) = self.voice.clone().filter(|v| v.close_by.get().is_none()) else {
-                    let _ = reply.send(Err("voice_not_running"));
+                    let recent = self
+                        .voice_lost_at
+                        .is_some_and(|t| t.elapsed() < VOICE_RECONNECT_GRACE);
+                    let _ = reply.send(Err(if recent {
+                        "voice_reconnecting"
+                    } else {
+                        "voice_not_running"
+                    }));
                     return;
                 };
                 let req = self.next_voice_req;
@@ -1214,6 +1231,7 @@ impl Core {
         match role {
             Role::Voice => {
                 self.voice = Some(s.clone());
+                self.voice_lost_at = None;
                 self.shared.counters.depth.store(0, Ordering::Relaxed);
                 // Session fencing: nothing of an older stream survives.
                 self.fence_outbound(incarnation);
@@ -1241,8 +1259,12 @@ impl Core {
             *slot = None;
             if s.role == Role::Voice {
                 self.shared.counters.depth.store(0, Ordering::Relaxed);
-                // Nobody will answer the requests still waiting: they fail "not running".
-                s.waiters.borrow_mut().clear();
+                // The requests still waiting may or may not have been applied before the
+                // link dropped; the client announces its state when it reconnects.
+                self.voice_lost_at = Some(Instant::now());
+                for (_, w) in s.waiters.borrow_mut().drain() {
+                    let _ = w.send(Err("voice_reconnecting"));
+                }
                 self.write_voice_key(VoiceState {
                     flags: 0,
                     incarnation: 0,

@@ -417,6 +417,7 @@ async fn voice(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
                 "prim ctl: {}",
                 match code.as_str() {
                     "voice_not_running" => "voice not running",
+                    "voice_reconnecting" => "voice is reconnecting; retry in a moment (do not restart it)",
                     "voice_no_ack" => "voice did not acknowledge (no ack)",
                     other => other,
                 }

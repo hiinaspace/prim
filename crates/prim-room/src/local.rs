@@ -141,7 +141,7 @@ pub enum Request {
     /// Change the voice client's state and wait for its acknowledging report (the voice
     /// client owns the truth; the reply is what it reported). `mic: true` = microphone
     /// live, `deaf: true` = deafened. Fields left out are unchanged. Errors:
-    /// `voice_not_running`, `voice_no_ack` (1 s), `bad_request` (nothing to change).
+    /// `voice_not_running`, `voice_reconnecting` (retry, do not restart voice), `voice_no_ack` (1 s), `bad_request` (nothing to change).
     VoiceControl {
         req: u64,
         #[serde(default)]
