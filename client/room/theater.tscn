@@ -1,0 +1,135 @@
+[gd_scene format=3]
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_7d1c2"]
+sky_horizon_color = Color(0.66224277, 0.6717428, 0.6867428, 1)
+ground_horizon_color = Color(0.66224277, 0.6717428, 0.6867428, 1)
+
+[sub_resource type="Sky" id="Sky_kp4wa"]
+sky_material = SubResource("ProceduralSkyMaterial_7d1c2")
+
+[sub_resource type="Environment" id="Environment_sbaep"]
+background_mode = 2
+sky = SubResource("Sky_kp4wa")
+tonemap_mode = 2
+glow_enabled = true
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_7d1c2"]
+albedo_color = Color(0.09195144, 0.13902876, 0.020886086, 1)
+roughness = 0.11
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_kp4wa"]
+lightmap_size_hint = Vector2i(52, 52)
+material = SubResource("StandardMaterial3D_7d1c2")
+add_uv2 = true
+size = Vector2(20, 20)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_kp4wa"]
+albedo_color = Color(0.43493083, 0.43547007, 0.7017172, 1)
+roughness = 0.08
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_sbaep"]
+lightmap_size_hint = Vector2i(17, 19)
+material = SubResource("StandardMaterial3D_kp4wa")
+add_uv2 = true
+
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_k1670"]
+lightmap_size_hint = Vector2i(17, 14)
+add_uv2 = true
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_n5d2f"]
+emission_enabled = true
+emission = Color(0.38039216, 1, 0.49411765, 1)
+emission_energy_multiplier = 2.1
+
+[sub_resource type="QuadMesh" id="QuadMesh_k1670"]
+lightmap_size_hint = Vector2i(19, 12)
+add_uv2 = true
+size = Vector2(3.555, 2)
+
+[sub_resource type="StandardMaterial3D" id="ScreenMat"]
+shading_mode = 0
+albedo_color = Color(0.12, 0.14, 0.2, 1)
+
+[sub_resource type="BoxMesh" id="BoxMesh_sbaep"]
+size = Vector3(2.3688965, 1, 1)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_k1670"]
+albedo_color = Color(0.3203498, 0.3116398, 0.18043491, 1)
+roughness = 0.14
+
+[node name="Theater" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_sbaep")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.8566725, -0.44674844, 0.25793025, 2.7805946e-08, 0.49999994, 0.86602545, -0.5158607, -0.7419002, 0.4283362, 0, 0, 0)
+light_energy = 0.107
+light_indirect_energy = 0.47
+shadow_enabled = true
+
+[node name="Floor" type="MeshInstance3D" parent="."]
+mesh = SubResource("PlaneMesh_kp4wa")
+
+[node name="Pillar" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 0.5430664, 0)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar5" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 0.5430664, 0)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar8" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 0.5430664, -1.7946023)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar9" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 0.5430664, -1.7946023)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar2" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 0.5430664, 1.7519002)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar6" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 0.5430664, 1.7519002)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar3" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 0.5430664, 3.2316332)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar7" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 0.5430664, 3.2316332)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="Pillar4" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 0.5430664, 3.2316332)
+mesh = SubResource("CylinderMesh_sbaep")
+
+[node name="glowingcapsule" type="MeshInstance3D" parent="."]
+transform = Transform3D(1.244524, 0, 0, 0, 1.244524, 0, 0, 0, 1.244524, 0, 0.45664763, 3.7894435)
+gi_mode = 2
+mesh = SubResource("CapsuleMesh_k1670")
+surface_material_override/0 = SubResource("StandardMaterial3D_n5d2f")
+
+[node name="EmissiveScreen" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.1457692, -2)
+gi_mode = 2
+mesh = SubResource("QuadMesh_k1670")
+surface_material_override/0 = SubResource("ScreenMat")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.077257395, -0.3081106, -1.0656376)
+mesh = SubResource("BoxMesh_sbaep")
+surface_material_override/0 = SubResource("StandardMaterial3D_k1670")
+
+[node name="MeshInstance3D2" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.077257395, -0.3081106, 0.4848386)
+mesh = SubResource("BoxMesh_sbaep")
+surface_material_override/0 = SubResource("StandardMaterial3D_k1670")
+
+[node name="MeshInstance3D3" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.077257395, -0.13970459, 2.1117072)
+mesh = SubResource("BoxMesh_sbaep")
+surface_material_override/0 = SubResource("StandardMaterial3D_k1670")

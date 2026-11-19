@@ -10,11 +10,21 @@ description = "Multi-call binary: prim room (the daemon), prim ctl (its local cl
 name = "prim"
 path = "src/main.rs"
 
+[features]
+default = ["ui"]
+# `prim ui`, the room window (egui). Build with --no-default-features for a voice-only box.
+ui = ["prim-ui/gui"]
+
 [dependencies]
 anyhow = "1"
 prim-room = { path = "../prim-room" }
+prim-ui = { path = "../prim-ui", default-features = false }
 prim-voice = { path = "../prim-voice" }
 room-core = { path = "../room-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

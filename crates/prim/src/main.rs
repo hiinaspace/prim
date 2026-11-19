@@ -12,7 +12,9 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: prim room found|join <token>|resume <room-hex> [options]\n       \
          prim ctl [--socket PATH] <status|invite|grant|revoke|retire|close|reopen|leave|write|sub|send|listen> ...\n\
-         prim voice [track] [options]\n\
+         prim voice [track] [options]\n       \
+         prim ui                    the room window\n\
+         \n\
          run `prim room --help`, `prim ctl --help` or `prim voice --help` for the options"
     );
     ExitCode::from(2)
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
         "room" => rt.block_on(room::run(rest)),
         "ctl" => rt.block_on(ctl::run(rest)),
         "voice" => voice::run(rest),
+        "ui" => run_ui(rest),
         _ => return usage(),
     };
     match result {
@@ -62,6 +65,16 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(feature = "ui")]
+fn run_ui(args: Vec<String>) -> anyhow::Result<ExitCode> {
+    prim_ui::run(args)
+}
+
+#[cfg(not(feature = "ui"))]
+fn run_ui(_args: Vec<String>) -> anyhow::Result<ExitCode> {
+    anyhow::bail!("this build has no window (built without the `ui` feature)")
 }
 
 /// Tiny argument scanner shared by both subcommands: flags with values and booleans

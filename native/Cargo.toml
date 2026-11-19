@@ -16,6 +16,8 @@ libloading = "0.9"
 godot = { version = "0.5.5", features = ["api-4-7", "experimental-threads"] }
 godot_network_audio = { path = "../dependencies/godot-network-audio/gdext", default-features = false }
 iroh.workspace = true
+prim-client = { path = "../crates/prim-client" }
+prim-events = { path = "../crates/prim-events" }
 iroh-base.workspace = true
 pkarr = { version = "5", default-features = false, features = ["dht"] }
 serde = { version = "1", features = ["derive"] }

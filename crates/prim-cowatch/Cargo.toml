@@ -1,0 +1,12 @@
+[package]
+name = "prim-cowatch"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "Sans-IO shared-playback state machine: durable intent record, requests to the authority, clock probes, drift correction, early-EOF recovery"
+
+[dependencies]
+
+[dev-dependencies]
+room-core = { path = "../room-core" }
