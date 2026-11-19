@@ -2767,6 +2767,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "prim-cowatch"
+version = "0.1.0"
+dependencies = [
+ "room-core",
+]
+
+[[package]]
 name = "prim-hrtf"
 version = "0.1.0"
 source = "git+https://github.com/hiinaspace/prim-hrtf?rev=e38fa7d#e38fa7d544d6b34e0811c5ce2cd7c7bf1c69a41f"
