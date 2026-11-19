@@ -117,6 +117,7 @@ class Audio:
         self.mic_id = None
         self.default_before = self.default_sink()
         self.violation = None
+        self.owner = None  # callable -> pids of the prim processes this run started
         self.stop_wd = threading.Event()
         CLEANUPS.append(self.close)
 
@@ -175,8 +176,12 @@ class Audio:
                 out[cur].append(l.split(None, 1)[1].split(":")[0])
         return out
 
-    def stream_targets(self, pids_names=("alsa_playback.prim", "alsa_capture.prim")):
-        """Peer node names that prim's ALSA streams link to."""
+    def stream_targets(self, pids_names=("alsa_playback.prim", "alsa_capture.prim"), owned=False):
+        """Peer node names that prim's ALSA streams link to. All streams of that name by default; with
+        owned=True only those of the prim processes this run started (another session's prim on this
+        host has streams of the same name, which must neither trip the watchdog nor hide ours)."""
+        if owned and self.owner:
+            return self.owned_targets(pids_names)
         res = {}
         for port, peers in self.links().items():
             node = port.split(":")[0]
@@ -184,15 +189,42 @@ class Audio:
                 res.setdefault(node, set()).update(peers)
         return res
 
+    def owned_targets(self, pids_names):
+        """Links of the ALSA streams whose client process is one of ours (pw-dump: node -> client -> pid)."""
+        import json as j
+        objs = j.loads(sh(["pw-dump"]))
+        mine = set(self.owner())
+        # a client with no pid property is treated as ours: when in doubt, the watchdog fires
+        own = lambda cid: pid_of.get(cid) in mine or pid_of.get(cid) is None
+        pid_of = {o["id"]: o["info"]["props"].get("application.process.id") for o in objs
+                  if o.get("type") == "PipeWire:Interface:Client" and o.get("info", {}).get("props")}
+        nodes = {o["id"]: o["info"]["props"] for o in objs if o.get("type") == "PipeWire:Interface:Node" and o.get("info", {}).get("props")}
+        res = {}
+        for nid, pr in nodes.items():
+            if pr.get("node.name") in pids_names and own(pr.get("client.id")):
+                res.setdefault(pr["node.name"], set())
+        for o in objs:
+            if o.get("type") == "PipeWire:Interface:Link":
+                i = o.get("info", {})
+                a, b = i.get("output-node-id"), i.get("input-node-id")
+                for me, peer in ((a, b), (b, a)):
+                    pr = nodes.get(me)
+                    if pr and pr.get("node.name") in res and own(pr.get("client.id")) and peer in nodes:
+                        res[pr["node.name"]].add(nodes[peer].get("node.name", "?"))
+        return res
+
     def check_links(self):
         bad = {n: sorted(p for p in ps if not p.startswith(PFX)) for n, ps in self.stream_targets().items()}
         bad = {n: p for n, p in bad.items() if p}
+        if bad and self.owner:  # confirm it is one of ours before killing the run
+            bad = {n: sorted(p for p in ps if not p.startswith(PFX)) for n, ps in self.stream_targets(owned=True).items()}
+            bad = {n: p for n, p in bad.items() if p}
         return bad
 
     def prove_silent_links(self, expect_sink, tries=150):
         """Listener running silent: its playback links only to expect_sink, capture only to our mic."""
         for _ in range(tries):
-            t = self.stream_targets()
+            t = self.stream_targets(owned=True)
             if "alsa_playback.prim" in t and "alsa_capture.prim" in t:
                 bad = self.check_links()
                 if bad:
@@ -554,6 +586,8 @@ class Cluster:
         CLEANUPS.append(lambda: shutil.rmtree(self.rt_dir, ignore_errors=True))
         self.L = Node(self, "L")
         self.T = []
+        if audio:
+            audio.owner = lambda: [n.voice.pid for n in [self.L] + self.T if n.voice is not None and n.voice.pid]
         self.sinks = []
         self.recs = {}
         self.rec_list = []
