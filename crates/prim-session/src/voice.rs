@@ -4,6 +4,15 @@
 //! A lost lease is retried inside the voice process, so the session only starts voice when
 //! none is running (`VoiceError::NotRunning`). Exit 4 now means another program took the
 //! lease over (or policy ended it): the session does not fight back, the person decides.
+//!
+//! Fail-safe rules (a live microphone with nothing visible is the one thing never to do):
+//! - every start the session makes is `--start-muted`; the mic goes live only through an
+//!   explicit request (`voice_control`) from an attached client;
+//! - `mic`/`deaf` in the view are what voice last reported, never what was asked for;
+//! - a request that cannot be applied yet (voice starting, reconnecting, no ack) stays
+//!   `pending` and is retried by the supervisor until voice acknowledges it;
+//! - no IPC with the voice client happens while the session state lock is held: the
+//!   supervisor takes a [`Plan`] under the lock, talks unlocked, and applies the outcome.
 
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -17,6 +26,30 @@ use prim_client::session::VoiceState;
 
 use crate::procs;
 
+/// A change of mic and/or deafen that was asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Req {
+    pub mic: Option<bool>,
+    pub deaf: Option<bool>,
+}
+
+impl Req {
+    fn merge(self, newer: Req) -> Req {
+        Req { mic: newer.mic.or(self.mic), deaf: newer.deaf.or(self.deaf) }
+    }
+}
+
+/// What the supervisor does with the voice client without holding the state lock.
+pub struct Plan {
+    pending: Option<Req>,
+}
+
+/// The outcome of a [`Plan`].
+pub struct Probe {
+    status: Result<VoiceStatus, VoiceError>,
+    applied: Option<(Req, Result<VoiceStatus, VoiceError>)>,
+}
+
 pub struct Voice {
     /// The session starts voice by itself once a room is up.
     pub wanted: bool,
@@ -28,10 +61,9 @@ pub struct Voice {
     state: &'static str,
     detail: String,
     starts: u32,
-    /// A mic/deafen change arrived while voice was still starting (no lease yet): apply it
-    /// as soon as the client reports.
-    pending: bool,
-    started: Option<Instant>,
+    /// A mic/deafen request that voice has not acknowledged yet (still starting, reconnecting).
+    pending: Option<Req>,
+    pending_since: Option<Instant>,
     last_probe: Option<Instant>,
     /// Private-sink mode for tests: a tone "microphone" and a null output, never real devices.
     test: bool,
@@ -49,8 +81,8 @@ impl Voice {
             state: "off",
             detail: String::new(),
             starts: 0,
-            pending: false,
-            started: None,
+            pending: None,
+            pending_since: None,
             last_probe: None,
             test: std::env::var_os("PRIM_SESSION_VOICE_TEST").is_some()
                 || std::env::var_os("PRIM_UI_VOICE_TEST").is_some(),
@@ -78,7 +110,7 @@ impl Voice {
         }
     }
 
-    /// Voice starts once, with the wanted state in its flags; later changes are requests.
+    /// Voice starts once, muted, with the wanted deafen state; later changes are requests.
     fn args(&self, sock: &Path, takeover: bool) -> Vec<String> {
         let capture = if self.test { "tone:auto" } else { "device" };
         let output = if self.test { "null" } else { "device" };
@@ -89,9 +121,8 @@ impl Voice {
             format!("--capture={capture}"),
             format!("--output={output}"),
         ];
-        if !self.mic {
-            a.push("--start-muted".into());
-        }
+        // Always muted: only an explicit request from an attached client opens the mic.
+        a.push("--start-muted".into());
         if self.deaf {
             a.push("--start-deaf".into());
         }
@@ -114,8 +145,11 @@ impl Voice {
                 self.state = "running";
                 self.detail.clear();
                 self.starts += 1;
-                self.started = Some(Instant::now());
-                self.pending = false;
+                // The new process is muted whatever the last one was doing; an old unapplied
+                // request must not unmute a relaunch.
+                self.mic = false;
+                self.pending = None;
+                self.pending_since = None;
             }
             Err(e) => {
                 self.state = "failed";
@@ -151,6 +185,8 @@ impl Voice {
         self.kill_running(sock);
         self.state = "off";
         self.detail.clear();
+        self.pending = None;
+        self.pending_since = None;
         // Next time voice is turned on it starts muted and hearing, as documented.
         self.mic = false;
         self.deaf = false;
@@ -169,48 +205,71 @@ impl Voice {
         }
     }
 
-    /// Record the wanted mic/deafen. With no voice client running, start one if wanted.
-    /// Returns true when a running client must be told (`control`, outside the lock).
-    pub fn want(&mut self, mic: bool, deaf: bool, room_up: bool, sock: &Path) -> bool {
-        self.mic = mic;
-        self.deaf = deaf;
-        if !self.running() {
-            if self.wanted && room_up {
-                self.start(sock, true);
-            }
-            return false;
+    /// A request for mic/deafen. With no voice process, start one (muted) and keep the request
+    /// pending until it has a lease. With a process (leased or not) return the request for the
+    /// caller to send unlocked: a live process is never replaced for a toggle.
+    pub fn request(&mut self, req: Req, room_up: bool, sock: &Path) -> Option<Req> {
+        if self.running() {
+            return Some(req);
         }
-        true
+        if self.wanted && room_up {
+            self.start(sock, true);
+            self.set_pending(req);
+        }
+        None
     }
 
-    /// Adopt what the running client reports as the truth (it may have muted itself).
+    fn set_pending(&mut self, req: Req) {
+        self.pending = Some(self.pending.map_or(req, |p| p.merge(req)));
+        self.pending_since.get_or_insert_with(Instant::now);
+    }
+
+    /// What voice reports is the truth (it may have muted itself); requests don't edit it.
     pub fn learn(&mut self, st: &VoiceStatus) {
         if st.voice_running {
             self.mic = st.mic;
             self.deaf = st.deaf;
-            self.pending = false;
         }
     }
 
-    /// A process we started is still within its first seconds: it has no lease yet.
-    pub fn running_unleased(&self) -> bool {
-        self.running() && self.started.is_some_and(|t| t.elapsed() < Duration::from_secs(5))
-    }
-
-    /// `NotRunning` for a client that should exist: start it with the wanted state.
-    pub fn restart_missing(&mut self, mic: bool, deaf: bool, room_up: bool, sock: &Path) {
-        self.child = None;
-        self.adopted = None;
-        self.mic = mic;
-        self.deaf = deaf;
-        if self.wanted && room_up {
-            self.start(sock, true);
+    /// Fold in the outcome of a request sent to the voice client.
+    pub fn applied(&mut self, req: Req, r: Result<VoiceStatus, VoiceError>) {
+        match r {
+            Ok(st) => {
+                self.learn(&st);
+                self.pending = None;
+                self.pending_since = None;
+                self.detail.clear();
+            }
+            Err(e) => {
+                // Not acknowledged (starting, reconnecting, no ack): keep it and retry.
+                self.set_pending(req);
+                self.detail = format!("mic/deafen change not applied yet ({e}); retrying");
+            }
         }
     }
 
-    pub fn note_not_running(&mut self) {
-        // Still starting: apply the wanted state when the client reports.
-        self.pending = true;
+    /// Under the lock: should the supervisor talk to the voice client now?
+    pub fn plan(&mut self, room_up: bool) -> Option<Plan> {
+        let every = if self.pending.is_some() { Duration::from_millis(250) } else { Duration::from_secs(1) };
+        if !(self.running() && room_up && self.last_probe.is_none_or(|t| t.elapsed() >= every)) {
+            return None;
+        }
+        self.last_probe = Some(Instant::now());
+        Some(Plan { pending: self.pending })
+    }
+
+    /// Under the lock again: apply what the unlocked probe found.
+    pub fn finish_probe(&mut self, p: Probe) {
+        if let Ok(st) = &p.status {
+            self.learn(st);
+        }
+        if let Some((req, r)) = p.applied {
+            self.applied(req, r);
+        }
+        if self.pending.is_some() && self.pending_since.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
+            self.detail = "voice process is up but holds no lease; mic/deafen change is waiting".into();
+        }
     }
 
     /// Find a voice client for this room that is already running and treat it as ours.
@@ -223,7 +282,7 @@ impl Voice {
             match status(sock) {
                 Ok(st) if st.voice_running => self.learn(&st),
                 _ => {
-                    self.mic = !argv.iter().any(|a| a == "--start-muted");
+                    self.mic = false; // unknown: report muted until its own report arrives
                     self.deaf = argv.iter().any(|a| a == "--start-deaf");
                 }
             }
@@ -265,19 +324,6 @@ impl Voice {
                 self.state = "off";
             }
         }
-        // Learn what the client really does (it can mute itself), about once a second.
-        if self.running() && room_up && self.last_probe.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
-            self.last_probe = Some(Instant::now());
-            if let Ok(st) = status(sock) {
-                if self.pending && st.voice_running {
-                    // A change arrived during startup: apply it now.
-                    let _ = control(sock, Some(self.mic), Some(self.deaf));
-                    self.pending = false;
-                } else {
-                    self.learn(&st);
-                }
-            }
-        }
         // Voice follows the room: start it when a room is up, drop it when the room is gone.
         if self.wanted && room_up && !self.running() && self.state == "off" {
             self.start(sock, false);
@@ -308,15 +354,79 @@ fn status(sock: &Path) -> Result<VoiceStatus, VoiceError> {
 }
 
 /// Ask the running voice client to change mic/deafen. `voice_reconnecting` is wait-and-retry,
-/// never a restart; the caller restarts only on `NotRunning`.
-pub fn control(sock: &Path, mic: Option<bool>, deaf: Option<bool>) -> Result<VoiceStatus, VoiceError> {
+/// never a restart (a process that is really gone is started again by `poll`).
+pub fn control(sock: &Path, req: Req, tries: u32) -> Result<VoiceStatus, VoiceError> {
     let tray = crate::tray::live();
     let c = connect(sock).ok_or_else(|| VoiceError::Other("room daemon not reachable".into()))?;
-    for _ in 0..12 {
-        match c.voice_control(mic, deaf, Some(tray)) {
+    for _ in 0..tries.max(1) {
+        match c.voice_control(req.mic, req.deaf, Some(tray)) {
             Err(VoiceError::Reconnecting) => std::thread::sleep(Duration::from_millis(300)),
             r => return r,
         }
     }
     Err(VoiceError::Reconnecting)
+}
+
+/// Unlocked: read what voice does and, when a request is pending and voice is up, send it
+/// (one try; the supervisor comes back in 250 ms).
+pub fn probe(sock: &Path, plan: Plan) -> Probe {
+    let status = status(sock);
+    let applied = match (&status, plan.pending) {
+        (Ok(st), Some(req)) if st.voice_running => Some((req, control(sock, req, 1))),
+        _ => None,
+    };
+    Probe { status, applied }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(mic: bool, deaf: bool) -> VoiceStatus {
+        VoiceStatus { voice_running: true, mic, deaf, ..Default::default() }
+    }
+
+    #[test]
+    fn a_running_process_is_never_replaced_for_a_toggle() {
+        let mut v = Voice::new(true);
+        v.adopted = Some(std::process::id() as i32); // any live pid: "a voice that is up"
+        let req = Req { mic: Some(true), deaf: None };
+        assert_eq!(v.request(req, true, Path::new("/nonexistent/room.sock")), Some(req));
+        assert_eq!(v.starts, 0, "no start was made");
+    }
+
+    #[test]
+    fn an_unacknowledged_request_stays_pending_and_status_does_not_run_ahead() {
+        let mut v = Voice::new(true);
+        let mute = Req { mic: Some(false), deaf: None };
+        v.mic = true; // voice reports a live mic
+        v.applied(mute, Err(VoiceError::NoAck));
+        assert!(v.mic, "status still shows what voice reported, not what was asked");
+        assert_eq!(v.pending, Some(mute), "the mute is kept for retry");
+        assert!(v.detail.contains("not applied"), "{}", v.detail);
+        // A later probe's status read must not erase the pending mute.
+        v.learn(&st(true, false));
+        assert_eq!(v.pending, Some(mute));
+        // Acknowledged: now it clears and the report is adopted.
+        v.applied(mute, Ok(st(false, false)));
+        assert!(!v.mic && v.pending.is_none() && v.detail.is_empty());
+    }
+
+    #[test]
+    fn pending_requests_merge_newest_wins() {
+        let mut v = Voice::new(true);
+        v.applied(Req { mic: Some(true), deaf: Some(true) }, Err(VoiceError::Reconnecting));
+        v.applied(Req { mic: Some(false), deaf: None }, Err(VoiceError::Reconnecting));
+        assert_eq!(v.pending, Some(Req { mic: Some(false), deaf: Some(true) }));
+    }
+
+    #[test]
+    fn start_args_are_always_muted() {
+        let mut v = Voice::new(true);
+        v.mic = true; // a stale "live" belief must not reach a relaunch
+        v.deaf = true;
+        let a = v.args(Path::new("/x/room.sock"), false);
+        assert!(a.iter().any(|x| x == "--start-muted"), "{a:?}");
+        assert!(a.iter().any(|x| x == "--start-deaf"), "{a:?}");
+    }
 }

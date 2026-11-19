@@ -299,6 +299,7 @@ async fn roster_chat_voice_and_non_members() {
         b.win.wait_until_a(10, "alice indicator follows", || voice_of(&b.win, "alice") == Some((true, on))).await.unwrap();
     }
     // The room key must show one incarnation throughout (peers' receivers never reset).
+    tokio::time::sleep(Duration::from_millis(1300)).await; // status is cached up to 1 s
     let now = call(SessionRequest::Status);
     same("after all toggles", &now);
     assert_eq!(a.win.lock().voice_holder(), Some(holder0), "voice session/incarnation changed across toggles");
@@ -311,7 +312,15 @@ async fn roster_chat_voice_and_non_members() {
 
     // The lease expires when the client is frozen; the client reconnects itself.
     call(SessionRequest::Voice { on: true });
+    // A mute pressed while voice is still starting must not be lost: unmute then mute at once,
+    // before the new client has a lease. It must end muted, with the status never ahead of voice.
+    call(SessionRequest::SetMic { on: true });
+    call(SessionRequest::SetMic { on: false });
     b.win.wait_until_a(10, "voice back", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let early = call(SessionRequest::Status);
+    assert!(!early.voice.mic, "mute during startup was lost: {:?}", early.voice);
+    assert_eq!(voice_of(&b.win, "alice"), Some((true, false)), "peer sees a live mic after a startup mute");
     let st2 = call(SessionRequest::Status);
     let pid = st2.voice.pid.expect("voice pid") as i32;
     let starts = st2.voice.starts;
@@ -340,6 +349,24 @@ async fn roster_chat_voice_and_non_members() {
     // ... and the same process took the lease again.
     a.win.wait_until_a(5, "lease held again", || a.win.lock().voice_lease_held()).await.unwrap();
     b.win.wait_until_a(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    // A voice client that dies with no front end attached comes back muted, never live.
+    call(SessionRequest::SetMic { on: true });
+    b.win.wait_until_a(10, "alice mic live before the crash", || voice_of(&b.win, "alice") == Some((true, true))).await.unwrap();
+    let dying = call(SessionRequest::Status);
+    // SAFETY: killing the voice client this test's session started.
+    unsafe { libc::kill(dying.voice.pid.expect("voice pid") as i32, libc::SIGKILL) };
+    let mut relaunched = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let st = call(SessionRequest::Status);
+        if st.voice.running && st.voice.pid != dying.voice.pid {
+            relaunched = Some(st);
+            break;
+        }
+    }
+    let relaunched = relaunched.expect("the session did not relaunch voice after kill -9");
+    assert!(!relaunched.voice.mic, "relaunched voice is not muted: {:?}", relaunched.voice);
+    b.win.wait_until_a(10, "relaunch is muted for peers", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     call(SessionRequest::Quit);
     let _ = session.0.wait();
 
@@ -348,15 +375,22 @@ async fn roster_chat_voice_and_non_members() {
     }
 }
 
-/// Ends the `prim session` this test started (and through it the daemon's voice client)
-/// even when an assertion fails, so a red run leaves no orphan voice process behind.
+/// Ends the `prim session` this test started and its voice client, even when an assertion
+/// fails: a clean Quit first; if the session is stuck, kill it and then the voice pid it
+/// last reported, so a red run leaves no orphan voice process behind.
 struct SessionGuard(std::process::Child, PathBuf);
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        let _ = SessionClient::new(&self.1).call(&SessionRequest::Quit);
+        let client = SessionClient::new(&self.1);
+        let voice_pid = client.status().ok().and_then(|st| st.voice.pid);
+        let _ = client.call(&SessionRequest::Quit);
         std::thread::sleep(Duration::from_millis(500));
         let _ = self.0.kill();
         let _ = self.0.wait();
+        if let Some(pid) = voice_pid {
+            // SAFETY: SIGTERM to the voice client of the session this test started.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
     }
 }

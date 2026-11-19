@@ -14,14 +14,21 @@ A as the friend. Then:
      rt.sent keeps growing (the stream never stopped)
   4. start Godot again (role reattach2): same member id, same name, same mute state
   5. assert voice again unchanged (no restart on adoption)
-  6. toggle deafen and mic through the session (`prim ctl session ...`): the voice process,
-     start count and incarnation must stay the same (VC: changes happen in place)
+  6. toggle deafen and mic through the session (`prim ctl session ...`): every command
+     succeeds, each intermediate state is what was asked for, and the voice process, start
+     count and incarnation stay the same (VC: changes happen in place); the peer's daemon
+     sees a voice-flag update for each toggle
+  7. kill -9 the session (voice survives), start a new one (it adopts voice): a toggle through
+     the adopted voice keeps the same process and incarnation
+  8. kill -9 the voice process with no client attached: the session relaunches it MUTED
 
 Faults, each of which must turn the run red (--fault NAME):
   restart-on-attach   the relaunched client cycles voice off and on at startup, which
                       starts a new voice process: step 5 must catch the new incarnation
                       (a mute/deafen toggle no longer restarts voice since round VC, so it
                       cannot be the fault; step 6 below is its positive check)
+  restart-on-toggle   the step-6 deafen toggle is replaced by a voice off/on cycle (what a
+                      restart-based mute would do): step 6 must catch the new voice
   quit-on-close       the first client ends the session when it dies (simulated by
                       `prim ctl session quit` at the moment of the kill): step 3 must catch it
 
@@ -33,7 +40,7 @@ from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("out", nargs="?", default="/tmp/prim-session-survive")
-ap.add_argument("--fault", default="", choices=["", "restart-on-attach", "quit-on-close"])
+ap.add_argument("--fault", default="", choices=["", "restart-on-attach", "quit-on-close", "restart-on-toggle"])
 args = ap.parse_args()
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -198,18 +205,80 @@ try:
           after["voice"]["pid"] == before["voice"]["pid"] and after["voice"]["starts"] == before["voice"]["starts"], {"before": before["voice"], "after": after["voice"]})
     check("relaunch: same voice incarnation", after["incarnation"] == before["incarnation"] and bool(after["incarnation"]), {"before": before["incarnation"], "after": after["incarnation"]})
     check("relaunch: both members still in the room", after["members"] == before["members"], after["members"])
-    # Step 6: toggles never restart voice.
-    for op in (("deafen", "on"), ("deafen", "off"), ("mic", "off"), ("mic", "on")):
-        ctl(sock_a, "session", *op)
-        time.sleep(0.5)
-    time.sleep(1.5)
-    tog = snapshot()
-    check("toggles: mic/deafen changes kept the same voice process, start count and incarnation",
-          tog["voice"]["pid"] == before["voice"]["pid"] and tog["voice"]["starts"] == before["voice"]["starts"]
-          and tog["incarnation"] == before["incarnation"] and bool(tog["incarnation"]), {"before": before, "after": tog})
-    check("toggles: mic is on again and deafen is off", tog["voice"]["mic"] and not tog["voice"]["deaf"], tog["voice"])
+    # Step 6: toggles never restart voice. Each command must succeed and each intermediate
+    # state must be the one asked for (not just the same state before and after).
+    def peer_sees_update():
+        # B's daemon: wait for the next update of A's voice key (started before the toggle).
+        return subprocess.Popen([str(prim), "ctl", "--socket", str(sock_b), "sub", f"member/{info['key']}/voice", "--count", "1", "--timeout", "6"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+
+    steps = [(("deafen", "on"), {"deaf": True, "mic": True}), (("deafen", "off"), {"deaf": False, "mic": True}),
+             (("mic", "off"), {"deaf": False, "mic": False}), (("mic", "on"), {"deaf": False, "mic": True})]
+    if args.fault == "restart-on-toggle":
+        steps[0] = (("voice", "cycle"), {"deaf": True, "mic": True})
+    for op, want in steps:
+        sub = peer_sees_update()
+        time.sleep(0.4)
+        if op == ("voice", "cycle"):
+            rcs = [ctl(sock_a, "session", "voice", "off")[0], ctl(sock_a, "session", "voice", "on")[0], ctl(sock_a, "session", "mic", "on")[0], ctl(sock_a, "session", "deafen", "on")[0]]
+            rc = max(rcs)
+        else:
+            rc = ctl(sock_a, "session", *op)[0]
+        time.sleep(1.5)
+        snap = snapshot()
+        early = sub.poll() is not None  # a `sub` that ended before the toggle proves nothing
+        out = sub.communicate(timeout=15)[0]
+        ok = (rc == 0 and snap["voice"]["deaf"] == want["deaf"] and snap["voice"]["mic"] == want["mic"]
+              and snap["voice"]["pid"] == before["voice"]["pid"] and snap["voice"]["starts"] == before["voice"]["starts"]
+              and snap["incarnation"] == before["incarnation"] and bool(snap["incarnation"]))
+        check(f"toggle {' '.join(op)}: ok, state as asked, same voice process/starts/incarnation", ok, {"rc": rc, "want": want, "voice": snap["voice"], "incarnation": snap["incarnation"]})
+        check(f"toggle {' '.join(op)}: the peer's daemon saw a voice-flag update", sub.returncode == 0 and bool(out.strip()) and not early, {"rc": sub.returncode, "early": early, "out": out.strip()[:120]})
+    # Leave mic on, deafen off for the rest.
+    ctl(sock_a, "session", "mic", "on"); ctl(sock_a, "session", "deafen", "off")
+    time.sleep(1.0)
     if g2 is not None and g2.poll() is None:
         g2.terminate()
+    voices_seen = [before["voice"]["pid"]]
+
+    # Step 7: kill -9 the session; a new one adopts the running voice; a toggle keeps it.
+    sess0 = jctl(sock_a, "session", "status")
+    voice_pid = sess0["voice"]["pid"]
+    inc0 = snapshot()["incarnation"]
+    os.kill(sess0["pid"], signal.SIGKILL)
+    time.sleep(1.0)
+    senv = os.environ | {"XDG_STATE_HOME": str(OUT / "a/state"), "XDG_RUNTIME_DIR": str(OUT / "a/run"), "PRIM_SOCKET": str(sock_a),
+                         "PRIM_BIN": str(prim), "PRIM_SESSION_VOICE_TEST": "1"}
+    r = subprocess.run([str(prim), "ctl", "--socket", str(sock_a), "session", "ensure"], env=senv, capture_output=True, text=True, timeout=60)
+    time.sleep(2.0)
+    adopted = snapshot()
+    check("adopted: a new session took over the running voice (same pid, same incarnation, mic on)",
+          r.returncode == 0 and adopted["session_pid"] != sess0["pid"] and adopted["voice"]["pid"] == voice_pid
+          and adopted["incarnation"] == inc0 and adopted["voice"]["mic"], {"rc": r.returncode, "before": sess0["voice"], "after": adopted["voice"]})
+    rcs = [ctl(sock_a, "session", "mic", "off")[0]]
+    time.sleep(1.0)
+    mid2 = snapshot()
+    rcs.append(ctl(sock_a, "session", "mic", "on")[0])
+    time.sleep(1.0)
+    adopted2 = snapshot()
+    check("adopted: mic off then on through the adopted voice keeps the same process and incarnation",
+          max(rcs) == 0 and mid2["voice"]["mic"] is False and adopted2["voice"]["mic"] is True
+          and adopted2["voice"]["pid"] == voice_pid and adopted2["incarnation"] == inc0, {"rcs": rcs, "mid": mid2["voice"], "after": adopted2["voice"]})
+
+    # Step 8: kill -9 the voice with no client attached: it must come back muted.
+    os.kill(voice_pid, signal.SIGKILL)
+    voices_seen.append(voice_pid)
+    back = None
+    for _ in range(120):
+        time.sleep(0.25)
+        snap = snapshot()
+        if snap["voice"]["running"] and snap["voice"]["pid"] not in (None, voice_pid):
+            back = snap
+            break
+    check("relaunch after kill -9 of voice: comes back, and MUTED (no client attached)",
+          back is not None and back["voice"]["mic"] is False, back and back["voice"])
+    if back:
+        voices_seen.append(back["voice"]["pid"])
+        mine.append(back["voice"]["pid"])
     # Window close with no tray (tray_live is false until round T1): leave + quit, so no
     # live microphone is left with nothing visible. With the override it keeps everything.
     for keep in ("1", ""):
@@ -227,7 +296,7 @@ try:
             check("tray_live is false and window close leaves the room and quits everything",
                   got is not None and got["tray_live"] is False and not up, {"tray_live": got and got["tray_live"], "session_up": up})
             check("no voice process is left after a close with no tray",
-                  not any(pid_alive(p) for p in [before["voice"]["pid"]]), before["voice"]["pid"])
+                  not any(pid_alive(p) for p in voices_seen), voices_seen)
 except SystemExit:
     pass
 finally:

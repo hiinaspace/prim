@@ -31,6 +31,14 @@ Godot / prim ctl / prim ui / tray     (clients; any may come and go)
   as needed) and restarted only when `voice_status`/`voice_control` says `NotRunning`;
   `voice_reconnecting` means wait and retry. Exit 4 (takeover or policy) is not fought: the
   state becomes `busy` until the person turns voice on again (which takes the lease over).
+  **Fail-safe:** every start the session makes (first start, relaunch after a crash, a session
+  restart) is `--start-muted`; only an explicit request opens the mic, so a crashed voice
+  never comes back live. `status.voice.mic/deaf` are what voice last reported, never what was
+  asked for; an unacknowledged request stays pending (retried every 250 ms, `detail` says so).
+  A live process is never replaced for a toggle (so no new incarnation). The session never
+  talks to the voice client while holding its state lock. Open decision: `prim ctl session
+  mic on` with no window and no tray is honoured (an explicit request; refusing needs the
+  session to know a front end is attached, which only `tray_live` says today).
   The voice client mutes itself if Godot's tracking lease goes away and `tray_live` is false;
   the session reads that back (about once a second) so `status.voice.mic` is what voice does.
 - **Status**: `{pid, room: none|starting|up|failed, kind: found|join|resume|attached,

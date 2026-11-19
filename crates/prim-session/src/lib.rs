@@ -117,36 +117,25 @@ impl Control {
     }
 
     /// The one place mic and deafen change: a request to the running voice client, which
-    /// changes in place (no restart, same incarnation). Only a missing client is started.
+    /// changes in place (no restart, same incarnation). A process is never replaced for a
+    /// toggle; a request that cannot be applied yet stays pending (see `voice.rs`) and the
+    /// returned status shows what voice actually reports, never what was asked for.
     pub fn set_voice_state(&self, mic: Option<bool>, deaf: Option<bool>) -> Result<SessionStatus, String> {
+        let req = voice::Req { mic, deaf };
         let (sock, remote) = {
             let mut s = self.lock();
-            let (m, d) = (mic.unwrap_or(s.voice.mic), deaf.unwrap_or(s.voice.deaf));
             if mic == Some(true) || deaf.is_some() {
                 s.voice.wanted = true;
             }
             let room_up = s.room.phase() == "up";
             let sock = s.room_socket.clone();
-            let remote = s.voice.want(m, d, room_up, &sock);
+            let remote = s.voice.request(req, room_up, &sock);
             (sock, remote)
         };
-        if remote {
-            // Outside the lock: the voice client may take up to a second to acknowledge.
-            let r = voice::control(&sock, mic, deaf);
-            let mut s = self.lock();
-            match r {
-                Ok(st) => s.voice.learn(&st),
-                Err(prim_client::client::VoiceError::NotRunning) => {
-                    let room_up = s.room.phase() == "up";
-                    let (m, d) = (s.voice.mic, s.voice.deaf);
-                    if s.voice.running_unleased() {
-                        s.voice.note_not_running();
-                    } else {
-                        s.voice.restart_missing(m, d, room_up, &sock);
-                    }
-                }
-                Err(e) => return Err(format!("voice: {e}")),
-            }
+        if let Some(req) = remote {
+            // Unlocked: the voice client may take a second to acknowledge.
+            let r = voice::control(&sock, req, 12);
+            self.lock().voice.applied(req, r);
         }
         Ok(status_of(&self.lock()))
     }
@@ -224,8 +213,19 @@ pub fn run(opts: Options) -> Result<()> {
             .name("supervise".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(250));
-                let mut s = c.lock();
-                tick(&mut s);
+                let plan = {
+                    let mut s = c.lock();
+                    tick(&mut s);
+                    let room_up = s.room.phase() == "up";
+                    let sock = s.room_socket.clone();
+                    s.voice.plan(room_up).map(|p| (sock, p))
+                };
+                // Talk to the voice client with the state unlocked (status calls, ctl and
+                // accept must not wait for it).
+                if let Some((sock, plan)) = plan {
+                    let out = voice::probe(&sock, plan);
+                    c.lock().voice.finish_probe(out);
+                }
             })?;
     }
     tray::start(control.clone());
