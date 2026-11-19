@@ -126,6 +126,9 @@ pub struct App {
     name_edit: String,
     join_text: String,
     editing_name: Option<String>,
+    /// The rename box takes focus once, on the frame it opens; asking every frame would
+    /// swallow the Enter that ends the edit (and keep focus away from the chat box).
+    editing_name_focus: bool,
     chat_input: String,
     advanced: bool,
     invite: Option<(u64, String)>,
@@ -159,6 +162,7 @@ impl App {
             name_edit: default_name,
             join_text: String::new(),
             editing_name: None,
+            editing_name_focus: false,
             chat_input: String::new(),
             advanced: std::env::var_os("PRIM_UI_ADVANCED").is_some(),
             invite: None,
@@ -834,9 +838,11 @@ impl App {
                 let mut done = None;
                 if let Some(buf) = &mut self.editing_name {
                     let r = ui.add(egui::TextEdit::singleline(buf).desired_width(130.0).char_limit(chat::MAX_NAME));
-                    r.request_focus();
-                    if r.lost_focus() {
-                        done = Some(ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if std::mem::take(&mut self.editing_name_focus) {
+                        r.request_focus();
+                    } else if r.lost_focus() || !r.has_focus() {
+                        // Enter or clicking elsewhere keeps the new name; Escape drops it.
+                        done = Some(!ui.input(|i| i.key_pressed(egui::Key::Escape)));
                     }
                 }
                 if let Some(commit) = done {
@@ -856,6 +862,7 @@ impl App {
                     let resp = ui.add(egui::Label::new(RichText::new("rename").size(11.0).color(DIM).underline()).sense(Sense::click()));
                     if resp.on_hover_text("Change your name").clicked() {
                         self.editing_name = Some(m.name.clone());
+                        self.editing_name_focus = true;
                     }
                 }
                 if m.keyholder {
