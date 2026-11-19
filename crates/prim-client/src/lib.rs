@@ -11,6 +11,7 @@
 pub mod chat;
 pub mod client;
 pub mod paths;
+pub mod pose;
 pub mod room;
 pub mod session;
 pub mod transport;
