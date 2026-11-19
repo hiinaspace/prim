@@ -2,7 +2,7 @@
 //! `prim-voice`: the voice client of a `prim-room` daemon (docs/room/VOICE.md).
 //!
 //! It holds the `voice` lease on the daemon's realtime socket, sends 20 ms Opus
-//! packets from a capture source, and renders everyone else's voice through NetEq and
+//! packets from a capture source, and renders everyone else's voice through the playout receiver and
 //! prim-hrtf onto an output. `prim voice` is a thin wrapper over [`run`].
 
 pub mod audio;
@@ -22,6 +22,7 @@ pub mod send;
 pub mod shared;
 pub mod signals;
 pub mod stats;
+pub mod testfault;
 pub mod tone;
 pub mod track;
 

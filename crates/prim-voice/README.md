@@ -3,7 +3,7 @@
 The voice client of a `prim-room` daemon: `prim voice` (see `docs/room/VOICE.md`).
 
 It holds the `voice` lease on the daemon's realtime socket, encodes 20 ms Opus packets from a
-capture source and sends them, and renders everyone else's voice (NetEq per sender, then
+capture source and sends them, and renders everyone else's voice (a playout receiver per sender, then
 prim-hrtf at that sender's seat) to an output.
 
 ```

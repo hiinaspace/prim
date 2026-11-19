@@ -6,4 +6,6 @@ cd "$(dirname "$0")/../.." || exit 1
 c=$(git rev-parse --short HEAD)
 if [ -n "$(git status --porcelain)" ]; then c="$c+dirty"; fi
 d=$(git diff HEAD | sha256sum | cut -d' ' -f1)
-echo "PRIM_R0_COMMIT=$c PRIM_R0_DIFF_SHA=$d"
+s=$(git -C dependencies/godot-network-audio rev-parse --short HEAD)
+if [ -n "$(git -C dependencies/godot-network-audio status --porcelain --untracked-files=no)" ]; then s="$s+dirty"; fi
+echo "PRIM_R0_COMMIT=$c PRIM_R0_DIFF_SHA=$d PRIM_R0_SUB=$s"

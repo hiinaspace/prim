@@ -693,10 +693,10 @@ pub fn run_meter(f: &dyn Flags) -> Result<()> {
 }
 
 /// The record side of the test, then through the real send path (same Opus encoder, 16 kbps,
-/// DTX), then the real receive path (NetEq), to the selected speakers. Prints JSON lines
+/// DTX), then the real receive path (PlayoutReceiver), to the selected speakers. Prints JSON lines
 /// for the window: recording progress, playing, done (with sizes), or an error.
 pub fn run_test(f: &dyn Flags) -> Result<()> {
-    use voice_core::{PacketArrival, VoiceEncoder, VoiceEncoderConfig, VoiceReceiver};
+    use voice_core::{PacketObservation, PlayoutReceiver, VoiceEncoder, VoiceEncoderConfig};
     let audio = from_flags(f)?;
     let secs: f64 = f.value("seconds").map(str::parse).transpose().context("--seconds")?.unwrap_or(5.0);
     let ring = Ring::new(48_000 * 2);
@@ -751,7 +751,7 @@ pub fn run_test(f: &dyn Flags) -> Result<()> {
     // Play back through the receive path in real time, as a friend's client would hear it.
     emit(json!({"phase": "playing", "of": secs}));
     let mut play = Playback::open(f, &audio)?;
-    let mut rx = VoiceReceiver::new(crate::shared::SAMPLE_RATE).map_err(|e| anyhow::anyhow!("receiver: {e}"))?;
+    let mut rx = PlayoutReceiver::new().map_err(|e| anyhow::anyhow!("receiver: {e}"))?;
     let start = Instant::now();
     let mut next = 0usize;
     let mut frame = vec![0f32; 480]; // 10 ms at 48 kHz mono
@@ -761,10 +761,11 @@ pub fn run_test(f: &dyn Flags) -> Result<()> {
         let due = start.elapsed().as_micros() as u64;
         while next < packets.len() && packets[next].0 <= due {
             let (_, p) = &packets[next];
-            let _ = rx.push_packet(p.clone(), PacketArrival { received_at_mono_us: crate::clock::mono_us() });
+            let t = crate::clock::mono_us();
+            let _ = rx.push_packet(p.clone(), PacketObservation { daemon_arrival_us: t, local_us: t });
             next += 1;
         }
-        rx.pull_frame(&mut frame);
+        rx.pull(&mut frame);
         play.write(&audio, &frame);
         frames += 1;
         let target = Duration::from_millis(frames * 10);

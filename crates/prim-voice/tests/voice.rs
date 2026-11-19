@@ -1,4 +1,4 @@
-//! prim-voice against a mock daemon. These run in real time (NetEq and the mixer are
+//! prim-voice against a mock daemon. These run in real time (the playout receiver and the mixer are
 //! paced by the wall clock), so each takes a few seconds.
 
 mod common;
@@ -139,6 +139,7 @@ fn two_talkers_render_non_silent_stereo_placed_on_their_seats_at_the_matched_lev
         (SeatSel::KeyPrefix("0101".into()), 90.0),
         (SeatSel::KeyPrefix("0202".into()), -90.0),
     ];
+    let probe = SchedProbe::start();
     let c = Client::start(conn, cfg).unwrap();
     let (fa, fb) = (700.0, 1100.0);
     let a = play(
@@ -163,12 +164,33 @@ fn two_talkers_render_non_silent_stereo_placed_on_their_seats_at_the_matched_lev
     b.join().unwrap();
     std::thread::sleep(Duration::from_millis(100));
     let stats = c.stop();
+    let stall_ms = probe.stop();
+    let stalled = stall_ms >= STALLED_HOST_MS;
+    eprintln!("worst wake-up overshoot of a 1 ms sleep: {stall_ms:.1} ms");
     let out = buf.lock().unwrap().clone();
     let n = out.len() / 2;
     // The window 1.5 s .. 2.5 s into the output: both talkers are well established.
     let (al, ar) = amp_l_r(&out, 72_000, 48_000, fa);
     let (bl, br) = amp_l_r(&out, 72_000, 48_000, fb);
     eprintln!("A(+90deg) L={al:.4} R={ar:.4}   B(-90deg) L={bl:.4} R={br:.4}   ({n} frames)");
+    if stalled {
+        // The mixer keeps 20 ms ahead; this host woke a 1 ms sleeper up to {stall_ms} ms late, so
+        // zero-filled gaps moved the tones off the fixed window and the level and underrun
+        // checks below mean nothing here. That is not a pass: fail, and run it on a quiet host.
+        let loudest = |hz: f32, right: bool| {
+            (0..out.len() / 2 / 12_000)
+                .map(|w| {
+                    let (l, r) = amp_l_r(&out, w * 12_000, 12_000, hz);
+                    if right { r } else { l }
+                })
+                .fold(0.0f32, f32::max)
+        };
+        panic!(
+            "INCONCLUSIVE, not passed: host stalled {stall_ms:.1} ms (>= {STALLED_HOST_MS} ms); \
+             both tones audible and placed: {}",
+            loudest(fa, true) > 0.02 && loudest(fb, false) > 0.02
+        );
+    }
     assert!(ar > 0.02 && bl > 0.02, "non-silent");
     assert!(
         ar > 1.5 * al,
@@ -310,20 +332,53 @@ fn restart_fencing_drops_late_old_incarnation_and_the_old_tone_is_gone() {
     assert!(amp(1) < 0.03 * amp(2));
 }
 
+/// A burst of lost packets longer than the 120 ms concealment cap: the stats must show the time
+/// that was neither played nor concealed (it used to vanish: `silence_samples` did not count it).
+#[test]
+fn a_loss_burst_longer_than_the_plc_cap_shows_in_lost_unconcealed_samples() {
+    let (mock, conn) = Mock::spawn(key(9), false);
+    let buf: Capture = Arc::new(Mutex::new(Vec::new()));
+    let c = Client::start(conn, capture_cfg(&buf)).unwrap();
+    let packets = encode_tone(600.0, 0.3, 140, 0, 0);
+    let (head, tail) = (&packets[..60], &packets[72..]);
+    // Packets 60..72 (240 ms) never leave the talker: packet 72 is due 13 slots after packet 59
+    // (`play` starts its clock 5 ms after the call).
+    play(mock.conn.clone(), key(1), 5, head.to_vec(), 0, 0, 1).join().unwrap();
+    std::thread::sleep(Duration::from_millis(13 * 20 - 5));
+    play(mock.conn.clone(), key(1), 5, tail.to_vec(), 72, 0, 2).join().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    let stats = c.stop();
+    let r = &stats["peers"][key(1).hex()]["receiver"];
+    let (plc, fade, lost) = (
+        r["plc_samples"].as_u64().unwrap(),
+        r["fade_samples"].as_u64().unwrap(),
+        r["lost_unconcealed_samples"].as_u64().unwrap(),
+    );
+    eprintln!("12 slots lost: plc {plc} fade {fade} lost_unconcealed {lost} silence {}", r["silence_samples"]);
+    // 12 slots lost, 6 concealed (5 PLC and the fade-out) leaves 6 unconcealed. (plc and fade also
+    // hold the concealment at the end of the call, when the talker stops without an END marker,
+    // so only `lost_unconcealed_samples` is exact here.)
+    assert!(fade >= 960 && plc >= 4 * 960);
+    assert!(
+        lost.abs_diff(6 * 960) <= 2 * 960,
+        "{lost} unconcealed samples for a 12 slot loss with a 6 slot cap"
+    );
+}
+
 #[derive(Default, Debug)]
 struct Delay {
     target: f64,
-    preferred: f64,
+    peak: f64,
     buffer: f64,
     accel_per_s: f64,
     expand_per_s: f64,
     preempt_per_s: f64,
 }
 
-/// Mean NetEq delay figures over the last 5 s of an 8 s call whose packets are due
+/// Mean receiver delay figures over the last 5 s of an 8 s call whose packets are due
 /// 20 ms apart, reach the daemon up to `net_us` late (it stamps them then), and reach
 /// the client up to `ipc_us` after that.
-fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> Delay {
+fn playout_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> Delay {
     let (mock, conn) = Mock::spawn(key(9), false);
     let cfg = Config {
         arrival,
@@ -349,11 +404,11 @@ fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> D
         if mono_us() - t0 > 3_000_000 {
             if let Some(s) = c.peer_receiver_stats(&key(1)) {
                 d.target += s.target_delay_ms as f64;
-                d.preferred += s.preferred_buffer_size_ms as f64;
-                d.buffer += s.current_buffer_size_ms as f64;
-                d.accel_per_s += s.accelerate_per_sec as f64;
-                d.expand_per_s += s.expand_per_sec as f64;
-                d.preempt_per_s += s.preemptive_expand_per_sec as f64;
+                d.peak += s.peak_delay_ms;
+                d.buffer += s.buffer_ms;
+                d.accel_per_s += s.accelerate_ops as f64 / (mono_us() - t0) as f64 * 1e6;
+                d.expand_per_s += s.plc_samples as f64 / 960.0 / (mono_us() - t0) as f64 * 1e6;
+                d.preempt_per_s += s.preemptive_ops as f64 / (mono_us() - t0) as f64 * 1e6;
                 n += 1.0;
             }
         }
@@ -362,7 +417,7 @@ fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> D
     c.stop();
     drop(mock);
     d.target /= n;
-    d.preferred /= n;
+    d.peak /= n;
     d.buffer /= n;
     d.accel_per_s /= n;
     d.expand_per_s /= n;
@@ -371,21 +426,21 @@ fn neteq_delay(arrival: ArrivalPolicy, net_us: u64, ipc_us: u64, seed: u64) -> D
 }
 
 #[test]
-fn neteq_arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
-    // NetEq quantises its target in 20 ms steps, so the effect shows near a step: with
-    // 24 or 26 ms of network jitter (which the daemon's stamp does see) the control
-    // targets 20 ms. Add 0..8 ms of IPC jitter between the stamp and the read and
-    // compare arrival = the daemon's stamp with arrival = read time. All six calls
+fn arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
+    // The timeline receiver's target follows the observed delay peak plus a margin, in
+    // milliseconds (the old NetEq receiver quantised it to 20 ms steps). Add 0..8 ms of IPC jitter between
+    // the stamp and the read and compare arrival = the daemon's stamp with arrival = read
+    // time: the stamp must leave the target alone, the read time must raise it. All six calls
     // run at once with the same jitter pattern, so they share the load.
     let run = |net: u64| {
         (
-            std::thread::spawn(move || neteq_delay(ArrivalPolicy::Stamp, net, 0, 12)),
-            std::thread::spawn(move || neteq_delay(ArrivalPolicy::Stamp, net, 8_000, 12)),
-            std::thread::spawn(move || neteq_delay(ArrivalPolicy::ReadTime, net, 8_000, 12)),
+            std::thread::spawn(move || playout_delay(ArrivalPolicy::Stamp, net, 0, 12)),
+            std::thread::spawn(move || playout_delay(ArrivalPolicy::Stamp, net, 8_000, 12)),
+            std::thread::spawn(move || playout_delay(ArrivalPolicy::ReadTime, net, 8_000, 12)),
         )
     };
     let runs = [(24_000, run(24_000)), (26_000, run(26_000))];
-    eprintln!("NetEq means over the last 5 s (ms), packets 20 ms apart (buffer is noisy: preemptive expand runs the whole call):");
+    eprintln!("receiver means over the last 5 s (ms), packets 20 ms apart (buffer is noisy: preemptive expand runs the whole call):");
     for (net, (a, b, c)) in runs {
         let (ctl, stamp, read) = (a.join().unwrap(), b.join().unwrap(), c.join().unwrap());
         eprintln!(" network jitter 0..{} ms:", net / 1000);
@@ -395,8 +450,8 @@ fn neteq_arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
             ("IPC 0..8, arrival = read time", &read),
         ] {
             eprintln!(
-                "  {name:30} target {:5.1}  preferred {:5.1}  buffer {:5.1}  accel/s {:.2} expand/s {:.2}",
-                x.target, x.preferred, x.buffer, x.accel_per_s, x.expand_per_s
+                "  {name:30} target {:5.1}  peak {:5.1}  buffer {:5.1}  accel/s {:.2} expand/s {:.2}",
+                x.target, x.peak, x.buffer, x.accel_per_s, x.expand_per_s
             );
         }
         assert!(
@@ -405,8 +460,12 @@ fn neteq_arrival_is_the_daemon_stamp_so_ipc_jitter_does_not_grow_the_buffer() {
             stamp.target,
             ctl.target
         );
+        // Not the +10 ms the NetEq-era test asked for: that receiver quantised its target to
+        // 20 ms steps, so any rise was a step. This one is millisecond-exact and the injected IPC
+        // jitter is 0..8 ms, so the most a read-time arrival can add over the stamp is under 8 ms
+        // (and less where the two jitters overlap). +3 ms is "clearly raised, not noise".
         assert!(
-            read.target >= stamp.target + 10.0,
+            read.target >= stamp.target + 3.0,
             "read-time arrival should grow the target: {:.1} vs {:.1}",
             read.target,
             stamp.target

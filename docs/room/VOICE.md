@@ -170,10 +170,12 @@ Threads; the device callbacks only copy between preallocated ring buffers:
 
 - **rt reader:** decodes `VoiceIn`, fences it by incarnation per sender
   (`room_core::voice::IncarnationFence`), resets that sender's receiver on a new
-  stream, pushes to the sender's `voice_core::VoiceReceiver` (NetEq) with the
-  daemon's arrival stamp. Stores the newest `Listener`.
-- **mixer:** paced by the output ring's fill (two 10 ms blocks ahead). Per block,
-  per active sender: pull 480 samples from NetEq, render with `prim_hrtf::Renderer`
+  stream, pushes to the sender's `voice_core::PlayoutReceiver` (see "Receiver" below)
+  with both the daemon's arrival stamp and its own read time. Stores the newest
+  `Listener`.
+- **mixer:** paced by the output ring's fill (two 10 ms blocks ahead; more when the
+  device pulls more at once, see "Ring depth" below). Per block, per sender that is not
+  idle (see "Idle peers and stage timing"): pull 480 samples from the receiver, render with `prim_hrtf::Renderer`
   from the sender's seat relative to the listener pose, gain
   `prim_hrtf::voice_gain(distance) × level_match`, sum. `level_match` is −4.7 dB:
   prim-hrtf runs that much louder than the Godot/Steam Audio path at equal gain
@@ -193,6 +195,188 @@ Threads; the device callbacks only copy between preallocated ring buffers:
   survives it: its daemon queues are discarded (session fencing) and receivers fence
   its late packets.
 
+## Receiver (timeline playout, 2026-11-18)
+
+`voice_core::PlayoutReceiver` replaced the NetEq wrapper. One per sender, no clock of its
+own (every time is a `u64` of microseconds the caller passes).
+
+- **Timeline.** Fixed 20 ms slots on the packets' 48 kHz timestamps (+960 per slot, wrap-safe,
+  `u16` seq and `u32` timestamp). A cursor says which slot plays next. Each slot is decoded,
+  recovered from the next packet's in-band FEC (only if the packet carries it *and* the
+  receiver config has `fec` on), or concealed with Opus PLC. A packet behind the cursor is
+  counted `late` and never played; a repeat is `duplicate`; nothing plays after a newer
+  timestamp. Seq only separates loss from DTX (a timestamp gap with contiguous seq is
+  silence, not loss). Packets that are not exactly one 960-sample mono 48 kHz Opus frame are
+  `Rejected` before any accounting.
+- **Delay.** WebRTC-style: relative delay against a 2 s trailing minimum, a peak tracker that
+  rises at once and decays 5 ms/s, target = peak + 10 ms clamped to 20..250 ms. The peak is
+  bounded: a relative delay is clamped to `max - 2 x margin` (230 ms) before it can raise it, and
+  one above `2 x max` (a stray timestamp, a path stalled far past what a buffer could cover) is not
+  fed to it, so no single packet pins the target for longer than 46 s (it used to be 100 s for a
+  packet 0.8 s late, and a timestamp 10 min ahead gave a peak of 600 s). A packet more than 64
+  slots behind the cursor is dropped as late without reaching the estimator. The estimator
+  sees the daemon stamp only; a late packet whose daemon-side delay was within the target is
+  counted `local_late` (the miss was in this process). The buffer is held at
+  `floor(target/20)+2` slots: a stretch needs 1.5 slots in hand, so the target counts the
+  slot being played plus one.
+- **Skip.** If the buffer holds more than `max/20 + 8` slots (400 ms at the defaults: six slots
+  beyond the largest target, so Accelerate's fast mode at `target + 4` always gets its chance
+  first) the receiver jumps to half the maximum delay behind the newest packet. The jump
+  cross-fades one slot of the old timeline into the new one over 20 ms and starts the decoder
+  cold; it was a hard splice, and fired at 290 ms, before Accelerate could act at the cap
+  (`skipped_samples`).
+- **Level control.** Accelerate / PreemptiveExpand (copied from the videocall-rs fork) on
+  the 20 ms boundary only, never on concealed audio, not in the first 160 ms of a talkspurt.
+  The search costs about 330 us per operation at 48 kHz in a release build (1.6 % of a core
+  per peer if it ran every slot), so it is not downsampled. The fork's Accelerate is
+  energy-based, not pitch-synchronous: in normal mode it only cuts inside a quiet stretch.
+- **Talkspurts.** START/END are hints. A one-packet DTX refresh (a single packet followed by END
+  or a DTX gap; Opus sends one every 400 ms in a quiet room) is *decoded* so the decoder keeps its
+  state, but played as digital zeros: S's default is digital silence in pauses, and an isolated
+  20 ms burst of room noise every 400 ms is a 2.5 Hz tick on headphones. It causes no target reset and
+  no prebuffer (`dtx_refreshes`, `silence_samples`). A real talkspurt of exactly one packet
+  followed by silence is muted the same way (a one-packet utterance is not a thing speech does; a
+  start forced on one packet after the onset wait with the second packet over 40 ms late loses that
+  one slot). A real onset sets the cursor to the first
+  packet's timestamp and waits for the buffer to reach the target. Between talkspurts the
+  output is digital zero and `is_idle()` is true. Concealment is bounded at 120 ms of
+  consecutive lost slots, the last of them a fade-out; then the receiver goes idle and the next
+  packet is a new onset. Wherever audio ends (END marker, DTX gap, the cap) one concealed frame is
+  ramped to zero instead of cut (`fade_samples`; it was a step of 0.068 against the speech's own 0.032
+  on the oracle signal). Time lost past the cap is `lost_unconcealed_samples` (zeros inside the
+  timeline, plus the packets missing before a talkspurt that resumed after going idle on a loss,
+  by `seq`); `silence_samples` is the sender's own pauses. A marker that reaches an idle receiver
+  with no audio buffered is dropped, and onset wait counts only audio, not markers.
+- **Opus.** `audiopus_sys` is patched to the in-repo `opus-sys` crate (a pinned libopus 1.5.2
+  source tree built with cmake, linked statically), so desktop and the aarch64 shell use the
+  same codec; `voice_core::opus_version()` is asserted in a unit test and printed as
+  `opus_version` in the stats JSON.
+
+### Idle peers and stage timing
+
+Between talkspurts a receiver is idle (`is_idle()`), and the mixer stops rendering that peer
+(`IdleGate` in `mixer.rs`): *Render* while it has audio, *Tail* for `ceil((interp_len-1)/480)`
+more blocks of silent input so the HRTF's convolution tail leaves the filter, then *Park*
+(history and gain reset by `reset_source`) and *Skip*. prim-hrtf's CIPIC filters are 200 taps and
+`interp_len()` is a power of two (256), so the tail is one block; the unit test
+`skipping_an_idle_peer_does_not_truncate_the_hrtf_tail` renders a noise burst with and without the skip; the
+tail energy matches within 0.1 dB (identical to float noise: the tail block carries the whole residue).
+A receiver that wakes (a new onset) leaves Skip on its first non-idle block. `--test-no-idle-skip`
+turns the skip off for A/B runs only.
+
+Per-stage histograms (microseconds, per block over all senders) are in the stats JSON under
+`histograms`: `mixer_block_us`, `mixer_lock_us` (taking the per-peer lock), `mixer_pull_us`
+(receiver pull incl. decode and level control), `mixer_hrtf_us`, `mixer_sum_us`. A `mixer`
+object counts `peer_blocks_rendered`, `_tail` and `_skipped`. Per peer, `blocks_skipped`.
+The receiver's concealment is real, not a proxy: `concealed_samples`, `late`, `reordered_accepted`,
+`duplicate`, `local_late`, `dtx_refreshes` come from `PlayoutReceiver::stats()`.
+
+### Ring depth
+
+The device callback records the largest burst it was asked for (callbacks less than 2 ms apart
+add up: ALSA delivers a 1024 quantum as 2 x 512) and the mixer keeps
+`ceil(1.25 x burst / 480)` blocks rendered ahead, between 2 and 8. A fixed two blocks (960
+frames) underran every other pull at quantum 1024 (1126 underruns in 38 s on the R0 build, 0 now).
+Quantum 512 keeps R0's depth; 1024 keeps 3 blocks. Stats: `mixer.out_burst_frames`,
+`mixer.ring_ahead_frames`. The burst is the maximum over the last 5-10 s (it used to be a running
+maximum that one stall left high for the life of the process) and is cleared when the output
+device is reopened. The standing playout latency is `floor(target/20)+2` slots: about
+20 ms more than R0's NetEq at the same target.
+
+### Measured (dev desktop, 2026-11-18, release, oracle-1 load: 7 talkers, speech clips, real PipeWire null sink)
+
+| figure | value |
+|---|---|
+| listener age (daemon arrival to mixer output) | p50 5.6 ms, p99 11.0 ms, max 11.7 ms |
+| buffer per talker (mean) | 48-67 ms, target 20 ms (`floor(20/20)+2` = 3 slots; R0's NetEq held ~40) |
+| mixer block (all senders, 10 ms budget) | p50 0.26 ms, p99 1.1 ms, p99.9 1.7 ms, max 2.7 ms |
+| stages at p50 / p99 | lock 0 / 2 us, pull 115 / 977 us, hrtf 114 / 243 us, sum 20 / 36 us |
+| listener CPU | 6.0 % of one core (continuous talk); 4.8 % with 54 % of peer-blocks skipped vs 5.4 % without the skip (speech with pauses) |
+| output underruns | 0 (default quantum and force-quantum 1024) |
+| ring depth | 3 blocks (30 ms rendered ahead): the device pulls 1024 frames at once at the default quantum too |
+| IPC (idle, 7 talkers) | in-queue p99.9 128 us, two hops p99 168 us |
+
+The idle skip pays only with pauses: continuous talk skips 0.5 % of peer-blocks. Frame (aarch64) figures
+are not in this table: the Frame was unreachable when this was written; the R0 figure (mixer max 26.7 ms)
+is still the last Frame measurement.
+
+### Test faults and exit
+
+`prim voice` knobs for the harness, never set in normal use: `--test-drop-burst N,M` (drop M
+of every N packets), `--test-reorder K,D` (hold every Kth packet back D packets),
+`--test-no-idle-skip`, and R0's `--test-drop-every`. They act on the talker after encoding, so
+the receiver sees real network faults. A clean exit flushes held packets and sends the END
+marker, so receivers go idle at once instead of concealing for 120 ms.
+
+### Seeded-fault proof
+
+The loss, ordering, DTX, wrap and drift oracles live in `voice-core/tests/`. Each was run
+against the old receiver (`56b4c31`, NetEq) on the same scenarios, in real time because the old
+receiver reads `Instant::now` itself (`docs/room/legacy-neteq-oracles.rs.txt` is the runner; it
+needs the harness from `voice-core/src/fixture_harness.rs` as `tests/h.rs` in that checkout).
+Real Opus encode of a 4 s synthetic voiced signal, 200 slots, 30 ms network delay.
+
+| oracle | timeline receiver (pass criterion) | old NetEq receiver |
+|---|---|---|
+| loss every 50th (a) samples out vs 200 x 960 | exact | +1920 (two extra slots) |
+| (c) concealed vs scripted 2 % | 2.00 % | 3.71 % (a 4-slot start-up concealment counted too) |
+| loss every 20th (b) max step vs lossless | 0.0323 vs 0.0321 | 0.2692 vs 0.0573 (x4.70 splice) |
+| (c) concealed vs scripted 5 % | 5.00 % | 7.18 % |
+| bursts of 2-3: concealed vs 6 % | 6.00 % | 7.43 %; output +1920 |
+| ordering (reorder, duplicate, 700 ms late) | dominant frequency never falls more than 75 Hz; 1 late, 1 duplicate, 960 samples concealed | chirp falls back 2725 Hz (old audio played after newer); `late_packets_discarded` 0; 3840 samples concealed; output +4800 |
+| DTX refresh: target resets | 0, 2 prebuffers | 19 talkspurt flushes |
+| seq + timestamp wrap | exact count, 960 concealed | debug-build panic, "attempt to multiply with overflow" in neteq `delay_manager.rs:118` |
+| 60 s, +500 ppm, no DTX | 0 PLC, 0 late | 6240 samples concealed |
+| 60 s, -500 ppm, no DTX | 0 PLC, 0 late | 4320 samples concealed; both runs kept 88 ms buffered |
+
+The timeline column's continuity figure changed in the senior review. The lossless yardstick used
+to include the end-of-stream cut (a step of 0.144 against the speech's own 0.032), which made
+"within 1.5x lossless" a limit of 0.216 and let real splices pass. It is now measured on the
+interior (first to last non-zero sample minus one slot): lossless 0.0321, every 50th 0.0321, every
+20th 0.0323, bursts 0.0321, FEC and quantum-1024 runs inside 1.5x of the same. The old receiver's
+column was not re-run; its own lossless figure (0.0573) is not smaller than an honest one, so its
+0.2692 fails the limit by more than before (x4.7 against 0.0573, x8.4 against 0.0321).
+
+The old receiver's numbers are not all failures of the same kind. Its per-loss concealment
+count is near the scripted rate once the 3840-sample start-up concealment is subtracted, and
+its continuity only breaks at 5 % loss. What it fails outright is ordering, DTX refreshes,
+wrap, drift and the exact sample count. The step-delay and sparse-spike estimator tests were
+not run against the old receiver.
+
+### Reader/mixer hand-off (per-peer inbox)
+
+The rt reader never takes a sender's `PeerRx` lock. It fences by incarnation and pushes into
+that sender's `Inbox` (own tiny mutex, bounded at 256 entries); the mixer drains the inbox
+into the `PlayoutReceiver` under the peer lock at the start of each pull. A new incarnation
+clears the queue and puts a `Reset` first, so old-stream packets are never pushed into the new
+stream. Measured in a full oracle run (bulk, 7 talkers): reader wait on the peer mutex
+p99.9 1292 us (max 2.5 ms) before, 5 us (max 45 us) after; the mixer holds the lock p99.9
+about 1.9 ms (max 3.6-5.5 ms) across decode and stretch, which is what the reader used to
+wait behind. Bulk oracle 2a (hop p99.9 < 2 ms) still fails in full runs after this change, so
+that lock was not the cause; see D-report.
+
+### Known limits (timeline receiver)
+
+Found by the senior review and deliberately not fixed yet:
+
+- **Buffer after a small path-delay step is not brought back to the set point.** A +40 ms step
+  (6 s into a 60 s stream, 0..8 ms jitter) leaves the buffer at a mean of 10 ms (min 0) for the
+  next 44 s with 0 Preemptive Expand ops; +200 ms leaves it at 132 ms with 0 Accelerate ops.
+  Root cause: both stretches need cleanly decoded audio for 1.5 slots in hand (`STRETCH_LOOKAHEAD`,
+  30 ms), so once a step has drained the buffer under that, Preemptive Expand can never run,
+  and the only thing that rebuilds depth is a talkspurt restart (an underrun, concealment, then
+  the prebuffer to the raised target). It plays at zero margin until the next jitter peak. The
+  fork's Accelerate is energy-based (cuts only in a quiet stretch), so on a continuously voiced
+  signal it never lowers a buffer that is too deep either; real speech with pauses does. A fix
+  needs a deliberate one-slot concealed insertion (a "hold") when the span is under the set point,
+  which is audible and needs a listening pass, so it was not done blind.
+- Resync after a timestamp jump (review item 6): a packet far ahead moves the anchor and the
+  newest-packet mark; recovery relies on the skip and the late bound.
+- Buffers are allocated while running (item 10), no preallocation.
+- Time-stretch thresholds (item 11) are not tuned against real speech.
+- `local_late` is not folded into the target (item 15).
+- Items 14, 17-20 and 22 of the review are tracked in its report, not here.
+
 ## Oracles (R0)
 
 Run on a Linux desktop with real PipeWire devices; histograms land in a CACHEDIR.TAG directory.
@@ -210,3 +394,37 @@ Run on a Linux desktop with real PipeWire devices; histograms land in a CACHEDIR
    ±500 ppm talkers).
 5. Stale-buffer disposal: each incarnation of a talker sends a distinct tone; after a
    restart the listener's output contains none of the old tone.
+6. **Loss** (`loss`): a steady 440 Hz tone, recorded from the private null sink's monitor, with
+   the talker dropping every 50th, every 20th, and 2 of every 50 packets (2 %, 5 %, 4 %).
+   Pass: exact sample accounting (`out + accelerate - preemptive == slots x 960`), receiver
+   concealment within 0.35 points of the scripted rate, recorded duration at most 80 ms shorter than the receiver's
+   output (the ring and sink still hold audio when the recorder stops; longer is a failure), and a continuous
+   tone: max sample step at most 4x the tone's own (computed from the tone's amplitude), no run of
+   near-silent samples longer than 48 (1 ms). A lossless run is the yardstick (L0). Opus PLC does not keep a
+   pure tone's phase, so the phase hop and amplitude dip are reported, not asserted.
+7. **Ordering** (`reorder`): swapped neighbours are accepted and counted `reordered_accepted`
+   with no concealment and a continuous tone. A packet held 0.8 s is counted `late`, concealed
+   once, never played, and `late + reordered_accepted` equals what the talker held (+-2). The
+   late run must also be continuous and skip nothing (`skipped_samples` 0): 0.8 s is beyond twice
+   the maximum delay, so the estimator ignores it and nothing is stretched. (Before the review
+   this was waived on the grounds that Preemptive Expand splices the tone; the real cause was the
+   skip firing before Accelerate could act.)
+8. **Drift** (`drift`): two talkers at +-500 ppm with `--no-dtx`, 90 s: the target stays flat,
+   no concealment, no late, no output underruns.
+9. **Quantum 1024** (`quantum`): the oracle-1 load (7 talkers) with `clock.force-quantum 1024`
+   and the listener at `PIPEWIRE_LATENCY=1024/48000`; the setting is restored afterwards.
+   Pass: 0 underruns after warm-up, `mixer.out_burst_frames >= 1000` and the ring kept above it.
+
+10. **Idle skip** (`idle`): talkers take turns (speech with pauses), skip on and off, then 7
+   continuous talkers. Pass: >= 30 % of peer-blocks skipped, none with the skip off, lower
+   listener CPU with the skip, no underruns in any.
+
+Run one with `uv run --no-project python tools/r0/oracles.py loss|reorder|drift|quantum`, all with
+`all`. `--listener-prim OLD` runs only the listener from another build (the harness's own
+failing-on-old proof); `--godot DIR` points at the r2a-4 inputs when `~/code/prim-hrtf` is gone.
+The oracles measure; they assume a quiet host. `L0` fails and says so when the clean recording
+itself has a hole, which is what a loaded host does to the recorder.
+
+Not built here: the Godot GDExtension (`gdext`) and `voice-mesh-bench` do not compile against the
+current `voice-core` API (they still use the removed `VoiceReceiver` and `PacketArrival`, see `gdext/src/stream.rs`). Nothing in `prim` depends
+on them.

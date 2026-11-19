@@ -237,13 +237,9 @@ dependencies = [
 
 [[package]]
 name = "audiopus_sys"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62314a1546a2064e033665d658e88c620a62904be945f8147e6b16c3db9f8651"
+version = "0.2.3"
 dependencies = [
  "cmake",
- "log",
- "pkg-config",
 ]
 
 [[package]]
@@ -2984,12 +2980,10 @@ dependencies = [
 [[package]]
 name = "neteq"
 version = "0.9.1"
-source = "git+https://github.com/hiinaspace/videocall-rs.git?rev=e854b5a85cfabd8bb550e510c5380a50b159145b#e854b5a85cfabd8bb550e510c5380a50b159145b"
+source = "git+https://github.com/hiinaspace/videocall-rs.git?rev=69c6ccb08afe56d0d1b1cd9e5a7de011679fa152#69c6ccb08afe56d0d1b1cd9e5a7de011679fa152"
 dependencies = [
- "hound",
  "log",
  "ringbuf",
- "ropus",
  "serde",
  "thiserror 1.0.69",
  "web-time",
@@ -4445,16 +4439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ropus"
-version = "0.12.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80804dadbfa2851c95fe45ff9ae8f4328d6371fdc0d51b14740d49a8b41d3758"
-dependencies = [
- "cc",
- "wide",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4601,15 +4585,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "safe_arch"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "same-file"
@@ -6048,16 +6023,6 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
-]
-
-[[package]]
-name = "wide"
-version = "0.7.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
-dependencies = [
- "bytemuck",
- "safe_arch",
 ]
 
 [[package]]

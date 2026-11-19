@@ -1,5 +1,5 @@
 //! The rt reader: decodes daemon messages, fences voice by incarnation per sender and
-//! feeds each sender's NetEq with the daemon's arrival stamp.
+//! feeds each sender's playout receiver with the daemon's arrival stamp.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -8,11 +8,13 @@ use std::time::Duration;
 use room_core::ids::Key;
 use room_core::rt::{peer_flags, RtMsg};
 use room_core::voice::{voice_flags, Fence, VoiceEnvelope};
-use voice_core::{PacketArrival, PacketFlags, VoicePacket, VoiceReceiver};
+use voice_core::{
+    PacketFlags, PacketObservation, PlayoutConfig, PlayoutReceiver, PushOutcome, VoicePacket,
+};
 
 use crate::clock::mono_us;
 use crate::config::ArrivalPolicy;
-use crate::shared::{ExitReason, ListenerState, PeerRx, Shared};
+use crate::shared::{ExitReason, InEntry, Inbox, ListenerState, PeerRx, Shared, INBOX_MAX};
 use crate::tone;
 
 /// A `VoiceIn` older than this at read is dropped (VOICE.md, queue bounds).
@@ -150,12 +152,14 @@ pub fn judge_timing(
     }
 }
 
-fn new_receiver(sh: &Shared) -> voice_core::Result<VoiceReceiver> {
+fn new_receiver(sh: &Shared) -> voice_core::Result<PlayoutReceiver> {
     match sh.cfg.min_delay_ms {
-        None => VoiceReceiver::new(crate::shared::SAMPLE_RATE),
-        Some(min) => {
-            VoiceReceiver::new_with_delay_bounds(crate::shared::SAMPLE_RATE, min, 250.max(min))
-        }
+        None => PlayoutReceiver::new(),
+        Some(min) => PlayoutReceiver::with_config(PlayoutConfig {
+            min_delay_ms: min,
+            max_delay_ms: 250.max(min),
+            ..PlayoutConfig::default()
+        }),
     }
 }
 
@@ -193,51 +197,14 @@ fn voice_in(
     }
     sh.seats.lock().unwrap().add(from);
 
-    let peer_arc = sh
-        .senders
-        .lock()
-        .unwrap()
-        .map
-        .entry(from)
-        .or_insert_with(|| Arc::new(Mutex::new(PeerRx::new())))
-        .clone();
-    let mut peer = peer_arc.lock().unwrap();
-    match peer.fence.judge(env.incarnation) {
-        Fence::Stale => {
-            peer.stale += 1;
-            drop(peer);
-            sh.stats.bump("fence_stale");
-            return;
-        }
-        Fence::NewStream { .. } => {
-            peer.new_streams += 1;
-            peer.incarnation = env.incarnation;
-            peer.needs_reset = true;
-            match peer.receiver.as_mut() {
-                Some(r) => {
-                    let _ = r.reset_stream();
-                }
-                None => match new_receiver(sh) {
-                    Ok(r) => peer.receiver = Some(r),
-                    Err(_) => {
-                        peer.push_errors += 1;
-                        drop(peer);
-                        sh.stats.bump("drop_push_error");
-                        return;
-                    }
-                },
-            }
-            sh.stats.bump("fence_new_stream");
-            let hz = tone::auto_hz(env.incarnation);
-            let mut tones = sh.tones.lock().unwrap();
-            if !tones.iter().any(|(i, _)| *i == env.incarnation) {
-                tones.push((env.incarnation, hz));
-            }
-        }
-        Fence::Current => {}
-    }
-    let Some(rx) = peer.receiver.as_mut() else {
-        return;
+    let inbox = {
+        let mut senders = sh.senders.lock().unwrap();
+        let inbox = senders.inboxes.entry(from).or_default().clone();
+        senders
+            .map
+            .entry(from)
+            .or_insert_with(|| Arc::new(Mutex::new(PeerRx::with_inbox(inbox.clone()))));
+        inbox
     };
     let pkt = VoicePacket {
         seq: env.seq,
@@ -248,32 +215,185 @@ fn voice_in(
         ),
         payload: env.payload,
     };
-    // `now` is read just before the call: voice-core turns (arrival, now) into the
-    // Instant NetEq's delay estimator sees, `Instant::now() - (now - arrival)`.
-    let now = mono_us();
-    match rx.push_packet_with_now_mono(
-        pkt,
-        PacketArrival {
-            received_at_mono_us: arrival_us,
-        },
-        now,
-    ) {
-        Ok(()) => {
-            peer.packets_accepted += 1;
-            peer.last_packet_us = now;
-            peer.active = true;
+    // Both observations go in: the delay estimator uses `arrival_us` (the daemon's stamp,
+    // or the read time under the ReadTime experiment); `read_us` is when this process had
+    // the packet, and lets the receiver tell local lateness from network lateness.
+    let obs = PacketObservation {
+        daemon_arrival_us: arrival_us,
+        local_us: read_us,
+    };
+    let t_wait = std::time::Instant::now();
+    let outcome = enqueue(&inbox, env.incarnation, pkt, obs);
+    sh.stats
+        .inner
+        .lock()
+        .unwrap()
+        .reader_peer_wait_us
+        .record(t_wait.elapsed().as_micros() as u64);
+    match outcome {
+        Enqueue::Stale => sh.stats.bump("fence_stale"),
+        Enqueue::NewStream => {
+            sh.stats.bump("fence_new_stream");
+            let hz = tone::auto_hz(env.incarnation);
+            let mut tones = sh.tones.lock().unwrap();
+            if !tones.iter().any(|(i, _)| *i == env.incarnation) {
+                tones.push((env.incarnation, hz));
+            }
         }
-        Err(_) => {
-            peer.push_errors += 1;
-            drop(peer);
-            sh.stats.bump("drop_push_error");
+        Enqueue::Queued => {}
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Enqueue {
+    /// An older incarnation than the current one: dropped.
+    Stale,
+    /// First packet of a new incarnation: a reset is queued ahead of it.
+    NewStream,
+    Queued,
+}
+
+/// The reader's half of the hand-off: fence by incarnation and queue the packet for the mixer.
+/// Takes only the inbox's own lock (a `Vec::push`), never the sender's `PeerRx` lock. A new
+/// incarnation clears whatever the old one left queued and puts a `Reset` first, so queued
+/// packets of the old stream can never be pushed into the new one.
+pub fn enqueue(inbox: &Inbox, incarnation: u32, pkt: VoicePacket, obs: PacketObservation) -> Enqueue {
+    let mut st = inbox.state.lock().unwrap();
+    let mut out = Enqueue::Queued;
+    match st.fence.judge(incarnation) {
+        Fence::Stale => {
+            st.stale += 1;
+            return Enqueue::Stale;
+        }
+        Fence::NewStream { .. } => {
+            st.entries.clear();
+            st.entries.push(InEntry::Reset { incarnation });
+            out = Enqueue::NewStream;
+        }
+        Fence::Current => {}
+    }
+    if st.entries.len() >= INBOX_MAX {
+        // Keep the Reset (if any, it is first) and drop the oldest packet.
+        if let Some(i) = st.entries.iter().position(|e| matches!(e, InEntry::Packet { .. })) {
+            st.entries.remove(i);
+            st.overflow += 1;
         }
     }
+    st.entries.push(InEntry::Packet { pkt, obs });
+    out
+}
+
+/// The mixer's half: apply what the reader queued, in order, to the sender's receiver. Called
+/// with the sender's `PeerRx` lock held, at the start of each block.
+pub fn drain_inbox(sh: &Shared, p: &mut PeerRx) {
+    {
+        let mut st = p.inbox.state.lock().unwrap();
+        if st.entries.is_empty() {
+            return;
+        }
+        std::mem::swap(&mut st.entries, &mut p.scratch);
+    }
+    let mut entries = std::mem::take(&mut p.scratch);
+    for e in entries.drain(..) {
+        match e {
+            InEntry::Reset { incarnation } => {
+                p.new_streams += 1;
+                p.incarnation = incarnation;
+                p.needs_reset = true;
+                match p.receiver.as_mut() {
+                    Some(r) => {
+                        let _ = r.reset_stream();
+                    }
+                    None => match new_receiver(sh) {
+                        Ok(r) => p.receiver = Some(r),
+                        Err(_) => {
+                            p.push_errors += 1;
+                            sh.stats.bump("drop_push_error");
+                        }
+                    },
+                }
+            }
+            InEntry::Packet { pkt, obs } => {
+                let Some(rx) = p.receiver.as_mut() else {
+                    continue;
+                };
+                match rx.push_packet(pkt, obs) {
+                    PushOutcome::Rejected => {
+                        p.push_errors += 1;
+                        sh.stats.bump("drop_push_error");
+                    }
+                    _ => {
+                        p.packets_accepted += 1;
+                        p.last_packet_us = obs.local_us;
+                        p.active = true;
+                    }
+                }
+            }
+        }
+    }
+    p.scratch = entries;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pkt(seq: u16) -> VoicePacket {
+        VoicePacket {
+            seq,
+            timestamp: seq as u32 * 960,
+            flags: PacketFlags::from_bits(0),
+            payload: vec![0u8; 4],
+        }
+    }
+    fn test_obs() -> PacketObservation {
+        PacketObservation { daemon_arrival_us: 0, local_us: 0 }
+    }
+
+    #[test]
+    fn enqueue_never_waits_on_peer_lock() {
+        // The mixer holds the sender's PeerRx lock across decode; the reader must not wait.
+        let inbox = Arc::new(Inbox::default());
+        let peer = Arc::new(Mutex::new(PeerRx::with_inbox(inbox.clone())));
+        let held = peer.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ib = inbox.clone();
+        std::thread::spawn(move || {
+            for i in 0..50 {
+                enqueue(&ib, 1, test_pkt(i), test_obs());
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("reader blocked while the peer lock was held");
+        drop(held);
+        assert_eq!(inbox.state.lock().unwrap().entries.len(), 51); // Reset + 50
+    }
+
+    #[test]
+    fn new_incarnation_clears_old_queue_and_resets_first() {
+        let inbox = Inbox::default();
+        assert_eq!(enqueue(&inbox, 5, test_pkt(1), test_obs()), Enqueue::NewStream);
+        enqueue(&inbox, 5, test_pkt(2), test_obs());
+        assert_eq!(enqueue(&inbox, 6, test_pkt(1), test_obs()), Enqueue::NewStream);
+        assert_eq!(enqueue(&inbox, 5, test_pkt(3), test_obs()), Enqueue::Stale);
+        let st = inbox.state.lock().unwrap();
+        assert!(matches!(st.entries[0], InEntry::Reset { incarnation: 6 }));
+        assert_eq!(st.entries.len(), 2);
+        assert_eq!(st.stale, 1);
+    }
+
+    #[test]
+    fn inbox_is_bounded() {
+        let inbox = Inbox::default();
+        for i in 0..(INBOX_MAX as u16 + 40) {
+            enqueue(&inbox, 1, test_pkt(i), test_obs());
+        }
+        let st = inbox.state.lock().unwrap();
+        assert!(st.entries.len() <= INBOX_MAX);
+        assert!(matches!(st.entries[0], InEntry::Reset { .. }));
+        assert!(st.overflow > 0);
+    }
 
     #[test]
     fn timing_rules() {
