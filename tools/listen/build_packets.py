@@ -93,12 +93,14 @@ def packet1(a):
             seed = 1000 + 17 * ci + int(pct)
             sh([a.new_bin, "pkts", clip, base + ".events", "16", str(pct), str(seed)])
             jobs.append(dict(ci=ci, cond=cname, pct=pct, seed=seed, base=base))
-    # new receiver is instant; old receiver is real time: run all six at once
+    # new receiver is instant; old receiver is real time: old runs are real time
     for j in jobs:
         sh([a.new_bin, "play", j["base"] + ".events", j["base"] + ".new.f32", j["base"] + ".new.json"])
-    procs = [subprocess.Popen([a.old_bin, j["base"] + ".events", j["base"] + ".old.f32", j["base"] + ".old.json"]) for j in jobs]
-    for p in procs:
-        assert p.wait() == 0
+    # at most two at a time (each is real time but light); callers run the whole thing under nice
+    for k in range(0, len(jobs), 2):
+        procs = [subprocess.Popen([a.old_bin, j["base"] + ".events", j["base"] + ".old.f32", j["base"] + ".old.json"]) for j in jobs[k:k + 2]]
+        for p in procs:
+            assert p.wait() == 0
     rng = random.Random(20261118)
     orders = ["old_is_A"] * 3 + ["new_is_A"] * 3  # balanced, shuffled by the seed
     rng.shuffle(orders)
