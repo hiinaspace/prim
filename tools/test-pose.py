@@ -111,6 +111,12 @@ def run_scenario(mode: str) -> dict:
         except subprocess.TimeoutExpired:
             pass
     finally:
+        # Godot started a `prim session` (setsid, with voice under it): ask it to quit, or it
+        # outlives the scenario.
+        try:
+            subprocess.run([prim, "ctl", "--socket", str(d / "a.sock"), "session", "quit"], capture_output=True, timeout=20)
+        except Exception:
+            pass
         for p in procs.values():
             if p.poll() is None:
                 try:

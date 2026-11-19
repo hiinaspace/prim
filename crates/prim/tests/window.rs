@@ -238,14 +238,14 @@ async fn roster_chat_voice_and_non_members() {
 
     // Voice: a real `prim session` adopts alice's daemon and runs voice for it. Starting
     // voice sets the member indicator; mic and stop change/clear it.
-    let mut session = std::process::Command::new(env!("CARGO_BIN_EXE_prim"))
+    let mut session = SessionGuard(std::process::Command::new(env!("CARGO_BIN_EXE_prim"))
         .args(["session", "--socket"])
         .arg(&a.socket)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap(), a.socket.clone());
     let sc = SessionClient::new(&a.socket);
     let mut tries = 0;
     let st = loop {
@@ -341,9 +341,22 @@ async fn roster_chat_voice_and_non_members() {
     a.win.wait_until_a(5, "lease held again", || a.win.lock().voice_lease_held()).await.unwrap();
     b.win.wait_until_a(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     call(SessionRequest::Quit);
-    let _ = session.wait();
+    let _ = session.0.wait();
 
     for n in [a, b, c, d] {
         n.daemon.shutdown().await;
+    }
+}
+
+/// Ends the `prim session` this test started (and through it the daemon's voice client)
+/// even when an assertion fails, so a red run leaves no orphan voice process behind.
+struct SessionGuard(std::process::Child, PathBuf);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let _ = SessionClient::new(&self.1).call(&SessionRequest::Quit);
+        std::thread::sleep(Duration::from_millis(500));
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
