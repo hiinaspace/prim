@@ -668,3 +668,47 @@ fn revoked_lease_stops_the_client_with_the_reason() {
     );
     c.stop();
 }
+
+/// A tracking loss right behind an unmute in the control queue: the loss mutes, because it
+/// is decided after the unmute has been applied.
+#[test]
+fn a_tracking_loss_queued_behind_an_unmute_still_mutes() {
+    use room_core::rt::report_bits;
+    let (mock, conn) = Mock::spawn(key(9), false);
+    let cfg = Config {
+        start_muted: true,
+        ..Config::default()
+    };
+    let c = Client::start(conn, cfg).unwrap();
+    mock.send(&RtMsg::TrackingLease { held: true });
+    std::thread::sleep(Duration::from_millis(100));
+    mock.send(&RtMsg::VoiceControl {
+        req: 7,
+        mic: Some(true),
+        deaf: None,
+        tray_live: None,
+    });
+    mock.send(&RtMsg::TrackingLease { held: false });
+    let t0 = mono_us();
+    let mut last = None;
+    let mut got_ack = false;
+    while mono_us() - t0 < 2_000_000 {
+        for (_, m) in mock.drain() {
+            if let RtMsg::VoiceReport { ack, state } = m {
+                got_ack |= ack == 7;
+                last = Some(state);
+            }
+        }
+        if got_ack && last.is_some_and(|s| s & report_bits::MUTED != 0) {
+            // The unmute was reported, then the safety mute.
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(got_ack, "the unmute was acknowledged");
+    assert!(
+        last.is_some_and(|s| s & report_bits::MUTED != 0),
+        "muted after the loss, last report {last:?}"
+    );
+    c.stop();
+}

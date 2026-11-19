@@ -16,10 +16,14 @@ use room_core::voice::voice_state;
 
 use crate::clock::mono_us;
 use crate::config::{CaptureSpec, Config};
+use crate::rtio::SendOutcome;
 use crate::shared::Shared;
 
 /// Longest the control thread waits for the encoder and the mixer to honour a change.
 pub const APPLY_WAIT_US: u64 = 100_000;
+
+/// How often an announce that did not go out is tried again.
+pub const REANNOUNCE_US: u64 = 250_000;
 
 pub struct Control {
     /// Target: the microphone is live (not muted).
@@ -45,6 +49,22 @@ impl Control {
             version: AtomicU64::new(0),
             enc_seen: AtomicU64::new(0),
             mix_seen: AtomicU64::new(0),
+        }
+    }
+
+    /// The command a lost tracking lease turns into: unless the tray is the mute authority,
+    /// an open microphone with nobody watching it is muted. Evaluated when the command
+    /// reaches the front of the control queue, so it sees the effect of every earlier one.
+    pub fn on_tracking_lost(&self) -> Option<Cmd> {
+        if !self.tray_live.load(Ordering::SeqCst) && self.mic_live.load(Ordering::SeqCst) {
+            Some(Cmd::Apply {
+                req: 0,
+                mic: Some(false),
+                deaf: None,
+                tray_live: None,
+            })
+        } else {
+            None
         }
     }
 
@@ -96,12 +116,17 @@ pub enum Cmd {
     },
     /// Re-announce the current state (after a (re)connect).
     Announce,
+    /// The tracking lease went away. The control thread decides whether that mutes, in
+    /// queue order (see [`Control::on_tracking_lost`]).
+    TrackingLost,
 }
 
 pub fn spawn(sh: Arc<Shared>, rx: Receiver<Cmd>) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("voice-control".into())
         .spawn(move || {
+            let mut pending = false;
+            let mut last_try = 0u64;
             while !sh.is_shutdown() {
                 match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(Cmd::Apply {
@@ -109,9 +134,37 @@ pub fn spawn(sh: Arc<Shared>, rx: Receiver<Cmd>) -> std::thread::JoinHandle<()> 
                         mic,
                         deaf,
                         tray_live,
-                    }) => apply(&sh, req, mic, deaf, tray_live),
-                    Ok(Cmd::Announce) => report(&sh, 0),
-                    Err(RecvTimeoutError::Timeout) => {}
+                    }) => {
+                        pending = !apply(&sh, req, mic, deaf, tray_live);
+                        last_try = mono_us();
+                    }
+                    Ok(Cmd::Announce) => {
+                        pending = !report(&sh, 0);
+                        last_try = mono_us();
+                    }
+                    Ok(Cmd::TrackingLost) => {
+                        if let Some(Cmd::Apply {
+                            req,
+                            mic,
+                            deaf,
+                            tray_live,
+                        }) = sh.ctl.on_tracking_lost()
+                        {
+                            sh.stats.bump("tray_safety_mutes");
+                            pending = !apply(&sh, req, mic, deaf, tray_live);
+                            last_try = mono_us();
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        // A state change that could not be put on the wire (socket full, link
+                        // down) is announced again until it goes out, so the room's flags
+                        // cannot stay stale.
+                        if pending && mono_us().saturating_sub(last_try) >= REANNOUNCE_US {
+                            sh.stats.bump("control_reannounces");
+                            pending = !report(&sh, 0);
+                            last_try = mono_us();
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
@@ -119,7 +172,14 @@ pub fn spawn(sh: Arc<Shared>, rx: Receiver<Cmd>) -> std::thread::JoinHandle<()> 
         .expect("spawn control")
 }
 
-fn apply(sh: &Shared, req: u32, mic: Option<bool>, deaf: Option<bool>, tray_live: Option<bool>) {
+/// `true` when the report went out.
+fn apply(
+    sh: &Shared,
+    req: u32,
+    mic: Option<bool>,
+    deaf: Option<bool>,
+    tray_live: Option<bool>,
+) -> bool {
     let c = &sh.ctl;
     let before = (
         c.mic_live.load(Ordering::SeqCst),
@@ -156,25 +216,31 @@ fn apply(sh: &Shared, req: u32, mic: Option<bool>, deaf: Option<bool>, tray_live
         sh.stats.bump("control_ack_timeouts");
     }
     sh.stats.bump("control_applies");
-    report(sh, req);
+    report(sh, req)
 }
 
 /// Tell the daemon (and so peers) the state: the wire flags first, then the report that
 /// answers `ack`.
-fn report(sh: &Shared, ack: u32) {
+/// `true` when both messages were sent.
+fn report(sh: &Shared, ack: u32) -> bool {
     let flags = sh.ctl.wire_flags(&sh.cfg);
     let state = sh.ctl.report_state();
     // A report during a reconnect is lost; the reader announces again once it is up.
     if !sh.link.is_up() {
         sh.stats.bump("control_report_no_link");
-        return;
+        return false;
     }
-    sh.link.send(&RtMsg::SetState {
+    let a = sh.link.send(&RtMsg::SetState {
         flags,
         incarnation: sh.incarnation,
     });
-    sh.link.send(&RtMsg::VoiceReport { ack, state });
+    let b = sh.link.send(&RtMsg::VoiceReport { ack, state });
     sh.last_send_us.store(mono_us(), Ordering::Relaxed);
+    let ok = a == SendOutcome::Sent && b == SendOutcome::Sent;
+    if !ok {
+        sh.stats.bump("control_report_unsent");
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -188,6 +254,27 @@ mod tests {
         assert_eq!(wire_flags(true, true, true), voice_state::MIC);
         assert_eq!(wire_flags(false, true, true), 0);
         assert_eq!(wire_flags(true, false, false), voice_state::LISTENING, "no capture: never MIC");
+    }
+
+    /// The safety mute is evaluated in queue order: an unmute queued ahead of the loss is
+    /// applied first, so the loss then mutes it. (Decided at arrival, the mic still read as
+    /// muted, nothing was queued, and the unmute left the mic open with no tracker.)
+    #[test]
+    fn a_queued_unmute_does_not_slip_past_the_safety_mute() {
+        let c = Control::new(&Config {
+            start_muted: true,
+            ..Config::default()
+        });
+        assert!(c.on_tracking_lost().is_none(), "decided now: still muted, nothing to do");
+        // The queue: Apply{unmute}, then TrackingLost.
+        c.mic_live.store(true, Ordering::SeqCst);
+        match c.on_tracking_lost() {
+            Some(Cmd::Apply { mic: Some(false), .. }) => {}
+            other => panic!("expected a mute, got {other:?}"),
+        }
+        // The tray as mute authority keeps the mic as it is.
+        c.tray_live.store(true, Ordering::SeqCst);
+        assert!(c.on_tracking_lost().is_none());
     }
 
     #[test]

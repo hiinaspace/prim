@@ -229,15 +229,9 @@ fn tracking_lease(sh: &Shared, held: bool) {
     }
     *sh.listener.lock().unwrap() = None;
     sh.stats.bump("listener_cleared");
-    if !sh.ctl.tray_live.load(Ordering::SeqCst) && sh.ctl.mic_live.load(Ordering::SeqCst) {
-        sh.stats.bump("tray_safety_mutes");
-        sh.send_cmd(crate::control::Cmd::Apply {
-            req: 0,
-            mic: Some(false),
-            deaf: None,
-            tray_live: None,
-        });
-    }
+    // Whether to mute is decided on the control thread, after every command queued before
+    // this one: an unmute still in the queue must not slip past the safety mute.
+    sh.send_cmd(crate::control::Cmd::TrackingLost);
 }
 
 /// What to do with one `VoiceIn`, decided from its stamps alone.
