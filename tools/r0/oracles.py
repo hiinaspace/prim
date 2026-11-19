@@ -1957,9 +1957,10 @@ def clean_ref(args, res, audio):
 # 2.7x on the new receiver); a splice is ~30x, the old receiver's dropouts 5-9x) and no dropout (no
 # run of near-silent samples longer than 0.5 ms).
 STEP_RATIO_MAX = 4.0      # max sample step of a faulted run vs the lossless run
-SILENT_RUN_MAX = 24       # samples under 1 % of the tone's amplitude in a row (0.5 ms)
+SILENT_RUN_MAX = 48       # samples under 1 % of the tone's amplitude in a row (1 ms). A concealed slot cross-fades two
+#                           tones of unrelated phase and can null for 0.5-0.6 ms (seen: 26, 31); a dropout is 10-100x longer
 CONCEAL_TOL_PCT = 0.35    # concealed_pct vs the scripted rate, in percentage points
-SPAN_TOL_S = 0.020        # recorded tone duration vs the receiver's output samples
+SPAN_TOL_S = 0.080        # recorded tone duration vs the receiver's output samples: the ring (up to 3 blocks, 30 ms) and the sink's quantum still hold audio when the recorder stops, so the recording is 24-48 ms shorter
 
 
 def lossless_step(ref):

@@ -258,6 +258,23 @@ Quantum 512 keeps R0's depth; 1024 keeps 3 blocks. Stats: `mixer.out_burst_frame
 `mixer.ring_ahead_frames`. The standing playout latency is `floor(target/20)+2` slots: about
 20 ms more than R0's NetEq at the same target.
 
+### Measured (dev desktop, 2026-11-18, release, oracle-1 load: 7 talkers, speech clips, real PipeWire null sink)
+
+| figure | value |
+|---|---|
+| listener age (daemon arrival to mixer output) | p50 5.6 ms, p99 11.0 ms, max 11.7 ms |
+| buffer per talker (mean) | 48-67 ms, target 20 ms (`floor(20/20)+2` = 3 slots; R0's NetEq held ~40) |
+| mixer block (all senders, 10 ms budget) | p50 0.26 ms, p99 1.1 ms, p99.9 1.7 ms, max 2.7 ms |
+| stages at p50 / p99 | lock 0 / 2 us, pull 115 / 977 us, hrtf 114 / 243 us, sum 20 / 36 us |
+| listener CPU | 6.0 % of one core (continuous talk); 4.8 % with 54 % of peer-blocks skipped vs 5.4 % without the skip (speech with pauses) |
+| output underruns | 0 (default quantum and force-quantum 1024) |
+| ring depth | 3 blocks (30 ms rendered ahead): the device pulls 1024 frames at once at the default quantum too |
+| IPC (idle, 7 talkers) | in-queue p99.9 128 us, two hops p99 168 us |
+
+The idle skip pays only with pauses: continuous talk skips 0.5 % of peer-blocks. Frame (aarch64) figures
+are not in this table: the Frame was unreachable when this was written; the R0 figure (mixer max 26.7 ms)
+is still the last Frame measurement.
+
 ### Test faults and exit
 
 `prim voice` knobs for the harness, never set in normal use: `--test-drop-burst N,M` (drop M
@@ -314,8 +331,9 @@ Run on a Linux desktop with real PipeWire devices; histograms land in a CACHEDIR
    the talker dropping every 50th, every 20th, and 2 of every 50 packets (2 %, 5 %, 4 %).
    Pass: exact sample accounting (`out + accelerate - preemptive == slots x 960`), receiver
    concealment within 0.35 points of the scripted rate, recorded duration equal to the receiver's
-   output, and a continuous tone: max sample step at most 4x the tone's own, no run of near-silent
-   samples longer than 24 (0.5 ms). A lossless run is the yardstick (L0). Opus PLC does not keep a
+   output within 80 ms (the ring and sink still hold audio when the recorder stops), and a continuous
+   tone: max sample step at most 4x the tone's own (computed from the tone's amplitude), no run of
+   near-silent samples longer than 48 (1 ms). A lossless run is the yardstick (L0). Opus PLC does not keep a
    pure tone's phase, so the phase hop and amplitude dip are reported, not asserted.
 7. **Ordering** (`reorder`): swapped neighbours are accepted and counted `reordered_accepted`
    with no concealment and a continuous tone. A packet held 0.8 s is counted `late`, concealed
@@ -327,6 +345,10 @@ Run on a Linux desktop with real PipeWire devices; histograms land in a CACHEDIR
 9. **Quantum 1024** (`quantum`): the oracle-1 load (7 talkers) with `clock.force-quantum 1024`
    and the listener at `PIPEWIRE_LATENCY=1024/48000`; the setting is restored afterwards.
    Pass: 0 underruns after warm-up, `mixer.out_burst_frames >= 1000` and the ring kept above it.
+
+10. **Idle skip** (`idle`): talkers take turns (speech with pauses), skip on and off, then 7
+   continuous talkers. Pass: >= 30 % of peer-blocks skipped, none with the skip off, lower
+   listener CPU with the skip, no underruns in any.
 
 Run one with `uv run --no-project python tools/r0/oracles.py loss|reorder|drift|quantum`, all with
 `all`. `--listener-prim OLD` runs only the listener from another build (the harness's own
