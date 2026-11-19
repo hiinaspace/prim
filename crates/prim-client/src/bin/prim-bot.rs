@@ -84,9 +84,9 @@ fn main() {
         }
         // Orbit: radius 1 m, 0.6 rad/s (0.6 m/s), centred 0.6 m in front of the origin.
         let a = t * 0.6;
-        let pos = [a.cos(), 0.0, -0.6 + a.sin()];
+        let pos = [0.9 * a.sin(), 0.0, -1.4 + 0.2 * a.cos()];
         // Facing along the direction of travel (marker forward is -z rotated by yaw).
-        let yaw = std::f64::consts::PI - a;
+        let yaw = if a.cos() >= 0.0 { -std::f64::consts::FRAC_PI_2 } else { std::f64::consts::FRAC_PI_2 };
         let body = json!({"v": 1, "n": n, "pos": pos, "yaw": yaw}).to_string();
         // Errors (daemon down) are expected during fault runs; keep trying.
         let _ = client.write("member", "pose", true, false, body.as_bytes());

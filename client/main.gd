@@ -297,9 +297,13 @@ func _verify() -> void:
 		if rec.is_empty():
 			_check("per-eye capture", false, {"reason": "no capture"})
 		else:
-			xrprobe.check_capture(rec, {"sky": true, "world": true})
-			_checks.append({"name": "per-eye capture taken", "pass": true,
+			var eyes_ok: bool = xrprobe.check_capture(rec, {"sky": true, "world": true})
+			_checks.append({"name": "per-eye capture (views, non-black, sky/world)", "pass": eyes_ok,
 				"detail": {"buffers": rec.get("buffers"), "scene": rec.get("scene")}})
+			var bp: Variant = view.marker_position(remote[0]) if not remote.is_empty() else null
+			_check("bot in view of the camera at capture",
+				bp != null and camera.is_position_in_frustum((bp as Vector3) + Vector3(0, 0.8, 0)),
+				{"marker": str(bp)})
 	# 3. Hold, then judge movement over the final window only (a bot that died mid-run
 	#    must fail even though it moved earlier).
 	var remaining := hold - (Time.get_ticks_msec() - t0) / 1000.0

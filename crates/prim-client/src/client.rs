@@ -138,6 +138,12 @@ impl Inner {
                 // Hold the registry across publishing the writer and replaying, so a
                 // concurrent subscribe() is sent exactly once.
                 let reg = self.registry.lock().unwrap();
+                if self.stop.load(Ordering::Relaxed) {
+                    // close() ran before the writer was published: nothing would shut
+                    // this connection down and the read below would block forever.
+                    conn.shutdown();
+                    break;
+                }
                 *self.writer.lock().unwrap() = Some(conn);
                 for (sub, pattern) in &reg.subs {
                     let req = self.req();

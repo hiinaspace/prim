@@ -328,7 +328,10 @@ def main() -> int:
                 events.emit("fault", what="kill-bot-daemon")
             while p.poll() is None:
                 if gates.new_xid():
-                    p.terminate()
+                    try:
+                        os.killpg(p.pid, signal.SIGTERM)  # whole group: godot, monado, weston
+                    except ProcessLookupError:
+                        pass
                     print("ABORT: new Xid appeared during the run. Stop and tell S.")
                     return 3
                 time.sleep(1.0)
@@ -344,7 +347,7 @@ def main() -> int:
                     procs.stop("godot")
                     return 3
                 time.sleep(1.0)
-            rc = 0
+            rc = p.returncode or 0
     except KeyboardInterrupt:
         rc = 0
     finally:
