@@ -185,8 +185,11 @@ impl Mixer {
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         let (mut rendered, mut tail, mut skipped) = (0u64, 0u64, 0u64);
+        let mut hold_ns: Vec<u64> = Vec::new();
         for (key, arc) in list {
             let mut p = timed(&arc, &mut lock_ns);
+            let t_hold = Instant::now();
+            crate::recv::drain_inbox(sh, &mut p);
             if !p.active {
                 continue;
             }
@@ -262,6 +265,7 @@ impl Mixer {
             }
             pull_ns += t_pull.elapsed().as_nanos() as u64;
             drop(p);
+            hold_ns.push(t_hold.elapsed().as_micros() as u64);
 
             let seat = timed(&sh.seats, &mut lock_ns).position(&key);
             let (dir, dist) = local_direction(lpos, lrot, seat);
@@ -290,6 +294,9 @@ impl Mixer {
         let sum_ns = t_sum.elapsed().as_nanos() as u64;
         let mut g = sh.stats.inner.lock().unwrap();
         g.mixer_lock_us.record(lock_ns / 1000);
+        for h in hold_ns {
+            g.mixer_peer_hold_us.record(h);
+        }
         g.mixer_pull_us.record(pull_ns / 1000);
         g.mixer_hrtf_us.record(hrtf_ns / 1000);
         g.mixer_sum_us.record(sum_ns / 1000);

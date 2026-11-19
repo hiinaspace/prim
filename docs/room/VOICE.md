@@ -343,6 +343,18 @@ its continuity only breaks at 5 % loss. What it fails outright is ordering, DTX 
 wrap, drift and the exact sample count. The step-delay and sparse-spike estimator tests were
 not run against the old receiver.
 
+### Reader/mixer hand-off (per-peer inbox)
+
+The rt reader never takes a sender's `PeerRx` lock. It fences by incarnation and pushes into
+that sender's `Inbox` (own tiny mutex, bounded at 256 entries); the mixer drains the inbox
+into the `PlayoutReceiver` under the peer lock at the start of each pull. A new incarnation
+clears the queue and puts a `Reset` first, so old-stream packets are never pushed into the new
+stream. Measured in a full oracle run (bulk, 7 talkers): reader wait on the peer mutex
+p99.9 1292 us (max 2.5 ms) before, 5 us (max 45 us) after; the mixer holds the lock p99.9
+about 1.9 ms (max 3.6-5.5 ms) across decode and stretch, which is what the reader used to
+wait behind. Bulk oracle 2a (hop p99.9 < 2 ms) still fails in full runs after this change, so
+that lock was not the cause; see D-report.
+
 ### Known limits (timeline receiver)
 
 Found by the senior review and deliberately not fixed yet:

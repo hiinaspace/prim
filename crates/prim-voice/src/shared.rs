@@ -97,8 +97,50 @@ pub struct ListenerState {
     pub pose: Pose,
 }
 
-pub struct PeerRx {
+/// What the rt reader hands the mixer for one sender, in arrival order.
+pub enum InEntry {
+    /// A new incarnation: reset the receiver (and the renderer slot) before what follows.
+    Reset { incarnation: u32 },
+    Packet {
+        pkt: voice_core::VoicePacket,
+        obs: voice_core::PacketObservation,
+    },
+}
+
+/// Longest inbox kept (5 s of packets); beyond it the oldest packet is dropped and counted.
+pub const INBOX_MAX: usize = 256;
+
+pub struct InboxState {
     pub fence: IncarnationFence,
+    pub entries: Vec<InEntry>,
+    pub stale: u64,
+    pub overflow: u64,
+}
+
+/// One sender's queue between the rt reader and the mixer. Its own tiny lock: the reader only
+/// ever waits for a `Vec::push`, never behind decode, time-stretch or HRTF work, which the mixer
+/// does under the sender's `PeerRx` lock.
+pub struct Inbox {
+    pub state: Mutex<InboxState>,
+}
+
+impl Default for Inbox {
+    fn default() -> Self {
+        Inbox {
+            state: Mutex::new(InboxState {
+                fence: IncarnationFence::default(),
+                entries: Vec::with_capacity(32),
+                stale: 0,
+                overflow: 0,
+            }),
+        }
+    }
+}
+
+pub struct PeerRx {
+    pub inbox: Arc<Inbox>,
+    /// Swapped with the inbox's entries on each drain, so draining allocates nothing.
+    pub scratch: Vec<InEntry>,
     pub receiver: Option<PlayoutReceiver>,
     pub incarnation: u32,
     pub slot: Option<usize>,
@@ -124,8 +166,13 @@ impl Default for PeerRx {
 
 impl PeerRx {
     pub fn new() -> PeerRx {
+        Self::with_inbox(Arc::new(Inbox::default()))
+    }
+
+    pub fn with_inbox(inbox: Arc<Inbox>) -> PeerRx {
         PeerRx {
-            fence: IncarnationFence::default(),
+            inbox,
+            scratch: Vec::with_capacity(32),
             receiver: None,
             incarnation: 0,
             slot: None,
@@ -147,6 +194,8 @@ impl PeerRx {
 pub struct Senders {
     /// One lock per sender: the reader and the mixer contend only on the same talker.
     pub map: HashMap<Key, Arc<Mutex<PeerRx>>>,
+    /// The same senders' inboxes, for the reader (which must not take a `PeerRx` lock).
+    pub inboxes: HashMap<Key, Arc<Inbox>>,
 }
 
 pub struct StatsInner {
@@ -155,6 +204,10 @@ pub struct StatsInner {
     pub mixer_block_us: Hist,
     /// Per-block totals over all senders of each mixer stage, in microseconds.
     pub mixer_lock_us: Hist,
+    /// How long the rt reader waited to take a sender's receiver lock, per packet.
+    pub reader_peer_wait_us: Hist,
+    /// How long the mixer held a sender's receiver lock (drain, pull, level control), per block.
+    pub mixer_peer_hold_us: Hist,
     pub mixer_pull_us: Hist,
     pub mixer_hrtf_us: Hist,
     pub mixer_sum_us: Hist,
@@ -182,6 +235,8 @@ impl Stats {
                 listener_age_us: Hist::default(),
                 mixer_block_us: Hist::default(),
                 mixer_lock_us: Hist::default(),
+                reader_peer_wait_us: Hist::default(),
+                mixer_peer_hold_us: Hist::default(),
                 mixer_pull_us: Hist::default(),
                 mixer_hrtf_us: Hist::default(),
                 mixer_sum_us: Hist::default(),
