@@ -17,6 +17,10 @@ pub fn snapshot(sh: &Shared) -> Value {
                 "ipc_delay_us": g.ipc_delay_us.to_json(),
                 "listener_age_us": g.listener_age_us.to_json(),
                 "mixer_block_us": g.mixer_block_us.to_json(),
+                "mixer_lock_us": g.mixer_lock_us.to_json(),
+                "mixer_pull_us": g.mixer_pull_us.to_json(),
+                "mixer_hrtf_us": g.mixer_hrtf_us.to_json(),
+                "mixer_sum_us": g.mixer_sum_us.to_json(),
                 "callback_gap_us": sh.stats.callback_gap_us.to_json(),
             }),
             g.counters.clone(),
@@ -45,6 +49,7 @@ pub fn snapshot(sh: &Shared) -> Value {
                 "stale_dropped": p.stale,
                 "push_errors": p.push_errors,
                 "blocks_pulled": p.blocks_pulled,
+                "blocks_skipped": p.blocks_skipped,
                 "active": p.active,
             });
             if let Some(s) = rs {
@@ -116,11 +121,17 @@ pub fn snapshot(sh: &Shared) -> Value {
             "bytes": c("sent_bytes"),
             "keepalives": c("keepalives"),
             "test_dropped": c("test_dropped"),
+            "test_reordered": c("test_reordered"),
             "device_changes": c("device_changes"),
         },
         "device_stall_reopen": c("device_stall_reopen"),
         "device_open_failures": c("device_open_failures"),
         "voice_in": c("voice_in"),
+        "mixer": {
+            "peer_blocks_rendered": c("mixer_peer_blocks_rendered"),
+            "peer_blocks_tail": c("mixer_peer_blocks_tail"),
+            "peer_blocks_skipped": c("mixer_peer_blocks_skipped"),
+        },
     });
     if sh.cfg.stats_tone {
         doc["tone_seconds"] = Value::Array(tones);

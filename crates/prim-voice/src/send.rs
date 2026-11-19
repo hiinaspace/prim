@@ -11,6 +11,7 @@ use voice_core::{VoiceEncoder, VoiceEncoderConfig, VoicePacket};
 use crate::clock::mono_us;
 use crate::rtio::SendOutcome;
 use crate::shared::Shared;
+use crate::testfault::{FaultConfig, FaultState};
 
 /// The first packets of an incarnation carry `STREAM_START`.
 pub const STREAM_START_PACKETS: u64 = 5;
@@ -82,17 +83,26 @@ pub fn drain_encoder<F: FnMut(VoicePacket) -> bool>(
     true
 }
 
-/// Send one packet; `false` when the socket is closed and the loop must end.
-fn send_packet(sh: &Shared, p: &VoicePacket, sent: &mut u64) -> bool {
-    // Test-only fault (`--test-drop-every N`): lose every Nth media packet so the
-    // listener sees a sequence gap. End markers (empty payload) are kept.
-    if let Some(n) = sh.cfg.test_drop_every {
-        static MEDIA_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if !p.payload.is_empty() && (MEDIA_SEEN.fetch_add(1, Ordering::Relaxed) + 1) % n == 0 {
-            sh.stats.bump("test_dropped");
-            return true;
+/// Put one encoder packet through the test-only fault stage, then on the wire. `false`
+/// when the socket is closed and the loop must end.
+fn send_packet(sh: &Shared, fault: &mut FaultState, p: VoicePacket, sent: &mut u64) -> bool {
+    let (d0, r0) = (fault.dropped, fault.reordered);
+    let out = fault.apply(p);
+    if fault.dropped > d0 {
+        sh.stats.add("test_dropped", fault.dropped - d0);
+    }
+    if fault.reordered > r0 {
+        sh.stats.add("test_reordered", fault.reordered - r0);
+    }
+    for p in &out {
+        if !send_now(sh, p, sent) {
+            return false;
         }
     }
+    true
+}
+
+fn send_now(sh: &Shared, p: &VoicePacket, sent: &mut u64) -> bool {
     let env = envelope(p, sh.incarnation, *sent);
     let bytes = env.payload.len() as u64;
     let now = mono_us();
@@ -133,6 +143,11 @@ fn encoder_loop(sh: &Shared) {
     let mut pending: Option<((u16, u32), bool)> = None;
     let mut last_frame_end_us = mono_us();
     let mut sent: u64 = 0;
+    let mut fault = FaultState::new(FaultConfig {
+        drop_every: sh.cfg.test_drop_every,
+        drop_burst: sh.cfg.test_drop_burst,
+        reorder: sh.cfg.test_reorder,
+    });
     let mut tmp = vec![0f32; 4096];
     while !sh.is_shutdown() {
         let g = sh.gen.device_gen.load(Ordering::SeqCst);
@@ -142,7 +157,7 @@ fn encoder_loop(sh: &Shared) {
             if let Some(mut e) = enc.take() {
                 let mut ended = false;
                 if let Some(end) = e.finish_talkspurt() {
-                    if !send_packet(sh, &end, &mut sent) {
+                    if !send_packet(sh, &mut fault, end, &mut sent) {
                         return;
                     }
                     ended = true;
@@ -179,13 +194,25 @@ fn encoder_loop(sh: &Shared) {
         }
         let ok = drain_encoder(enc, poll_budget(n, rate), Some(&sh.stats), |p| {
             last_frame_end_us = mono_us();
-            send_packet(sh, &p, &mut sent)
+            send_packet(sh, &mut fault, p, &mut sent)
         });
         if !ok {
             return;
         }
         if n == 0 {
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    // A clean exit ends the talkspurt (CONTRACTS section 6), so receivers go idle at once
+    // instead of concealing a talker that left. Packets a test fault still holds go first.
+    if let Some(e) = enc.as_mut() {
+        for p in fault.flush() {
+            if !send_now(sh, &p, &mut sent) {
+                return;
+            }
+        }
+        if let Some(end) = e.finish_talkspurt() {
+            send_packet(sh, &mut fault, end, &mut sent);
         }
     }
 }

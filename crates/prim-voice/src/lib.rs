@@ -21,6 +21,7 @@ pub mod send;
 pub mod shared;
 pub mod signals;
 pub mod stats;
+pub mod testfault;
 pub mod tone;
 pub mod track;
 

@@ -32,6 +32,8 @@ pub const VALUED_FLAGS: &[&str] = &[
     "arrival",
     "min-delay-ms",
     "test-drop-every",
+    "test-drop-burst",
+    "test-reorder",
 ];
 
 pub const HELP: &str = "\
@@ -51,6 +53,9 @@ options:
   --min-delay-ms N      NetEq minimum delay (default 20, voice-core's)
   --no-dtx              send silence instead of using Opus DTX
   --test-drop-every N   TEST ONLY (harness oracle fault): drop every Nth outgoing media packet
+  --test-drop-burst N,M TEST ONLY: of every N media packets drop M consecutive ones
+  --test-reorder N,K    TEST ONLY: hold every Nth media packet and send it after K more (K=1 swaps)
+  --test-no-idle-skip   TEST ONLY: mixer renders silent peers too (A/B for the idle skip)
   --duration SECS       exit after this long (default: run until SIGINT/SIGTERM)
   SIGUSR1               reopen the audio devices on the current default
 
@@ -108,6 +113,12 @@ pub struct Config {
     /// Test-only fault for the R0 oracle harness: drop every Nth outgoing media packet
     /// (non-empty payload) before it reaches the daemon. Never set in product use.
     pub test_drop_every: Option<u64>,
+    /// Test-only: of every N media packets drop M consecutive ones.
+    pub test_drop_burst: Option<(u64, u64)>,
+    /// Test-only: hold every Nth media packet and release it after K more.
+    pub test_reorder: Option<(u64, u64)>,
+    /// Test-only: the mixer pulls and renders idle peers too (the pre-skip behaviour).
+    pub test_no_idle_skip: bool,
 }
 
 impl Default for Config {
@@ -125,6 +136,9 @@ impl Default for Config {
             min_delay_ms: None,
             incarnation: None,
             test_drop_every: None,
+            test_drop_burst: None,
+            test_reorder: None,
+            test_no_idle_skip: false,
         }
     }
 }
@@ -155,6 +169,19 @@ fn parse_output(s: &str) -> Result<OutputSpec> {
             None => bail!("--output {s:?}: expected device, wav:PATH or null"),
         },
     })
+}
+
+/// `N,M` with both nonzero.
+fn parse_pair(flag: &str, v: &str) -> Result<(u64, u64)> {
+    let (a, b) = v
+        .split_once(',')
+        .with_context(|| format!("--{flag} {v:?}: expected N,M"))?;
+    let a: u64 = a.parse().with_context(|| format!("--{flag} {v:?}"))?;
+    let b: u64 = b.parse().with_context(|| format!("--{flag} {v:?}"))?;
+    if a == 0 || b == 0 {
+        bail!("--{flag} values must be nonzero");
+    }
+    Ok((a, b))
 }
 
 fn parse_seat(s: &str, by_index: bool) -> Result<(SeatSel, f32)> {
@@ -221,6 +248,13 @@ impl Config {
             }
             c.test_drop_every = Some(n);
         }
+        if let Some(v) = f.value("test-drop-burst") {
+            c.test_drop_burst = Some(parse_pair("test-drop-burst", v)?);
+        }
+        if let Some(v) = f.value("test-reorder") {
+            c.test_reorder = Some(parse_pair("test-reorder", v)?);
+        }
+        c.test_no_idle_skip = f.has("test-no-idle-skip");
         if let Some(v) = f.value("min-delay-ms") {
             c.min_delay_ms = Some(v.parse().with_context(|| format!("--min-delay-ms {v:?}"))?);
         }
@@ -254,5 +288,8 @@ mod tests {
         assert_eq!(az, -45.0);
         assert_eq!(parse_seat("2=90", true).unwrap().0, SeatSel::Index(2));
         assert!(parse_seat("zz=1", false).is_err());
+        assert_eq!(parse_pair("x", "50,2").unwrap(), (50, 2));
+        assert!(parse_pair("x", "50").is_err());
+        assert!(parse_pair("x", "0,1").is_err());
     }
 }

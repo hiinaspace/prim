@@ -53,6 +53,9 @@ pub struct PeerRx {
     pub stale: u64,
     pub push_errors: u64,
     pub blocks_pulled: u64,
+    pub blocks_skipped: u64,
+    /// The mixer's idle-skip state for this sender.
+    pub gate: crate::mixer::IdleGate,
 }
 
 impl Default for PeerRx {
@@ -76,6 +79,8 @@ impl PeerRx {
             stale: 0,
             push_errors: 0,
             blocks_pulled: 0,
+            blocks_skipped: 0,
+            gate: Default::default(),
         }
     }
 }
@@ -90,6 +95,11 @@ pub struct StatsInner {
     pub ipc_delay_us: Hist,
     pub listener_age_us: Hist,
     pub mixer_block_us: Hist,
+    /// Per-block totals over all senders of each mixer stage, in microseconds.
+    pub mixer_lock_us: Hist,
+    pub mixer_pull_us: Hist,
+    pub mixer_hrtf_us: Hist,
+    pub mixer_sum_us: Hist,
     pub counters: BTreeMap<&'static str, u64>,
     pub tone_seconds: VecDeque<serde_json::Value>,
 }
@@ -113,6 +123,10 @@ impl Stats {
                 ipc_delay_us: Hist::default(),
                 listener_age_us: Hist::default(),
                 mixer_block_us: Hist::default(),
+                mixer_lock_us: Hist::default(),
+                mixer_pull_us: Hist::default(),
+                mixer_hrtf_us: Hist::default(),
+                mixer_sum_us: Hist::default(),
                 counters: BTreeMap::new(),
                 tone_seconds: VecDeque::new(),
             }),

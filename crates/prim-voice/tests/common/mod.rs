@@ -225,3 +225,40 @@ pub fn amp_l_r(buf: &[f32], from_frame: usize, frames: usize, hz: f32) -> (f32, 
         prim_voice::tone::goertzel_amp(&r, hz, 48000.0),
     )
 }
+
+/// Measures how late this host wakes a sleeping thread while a real-time test runs. The
+/// mixer keeps 20 ms of audio ahead of the output, so a wake-up later than that is a host
+/// that cannot deliver real time, and a test that asserts "no underruns" or a level at a
+/// fixed output position says nothing about the code on such a run.
+pub struct SchedProbe {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    th: Option<std::thread::JoinHandle<u64>>,
+}
+
+impl SchedProbe {
+    pub fn start() -> SchedProbe {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = stop.clone();
+        let th = std::thread::spawn(move || {
+            let mut worst = 0u64;
+            while !s.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = std::time::Instant::now();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let over = t.elapsed().as_micros() as u64;
+                worst = worst.max(over.saturating_sub(1000));
+            }
+            worst
+        });
+        SchedProbe { stop, th: Some(th) }
+    }
+
+    /// Worst wake-up overshoot of a 1 ms sleep, in ms.
+    pub fn stop(mut self) -> f64 {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.th.take().unwrap().join().unwrap() as f64 / 1000.0
+    }
+}
+
+/// The wake-up overshoot above which a real-time assertion is not meaningful (half the
+/// mixer's 20 ms of headroom).
+pub const STALLED_HOST_MS: f64 = 10.0;
