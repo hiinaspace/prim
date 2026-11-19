@@ -1,0 +1,11 @@
+[package]
+name = "prim-events"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "JSONL event sink: monotonic-timestamped lifecycle events (spawn, daemon_ready, joined, first_frame, first_voice) any Prim component can append to one shared file"
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
