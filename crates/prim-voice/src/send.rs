@@ -264,7 +264,8 @@ fn send_now(sh: &Shared, p: &VoicePacket, sent: &mut u64) -> bool {
         SendOutcome::Closed => {
             if sh.cfg.rt_socket.is_some() {
                 // The reader reconnects; media sent meanwhile is dropped and counted.
-                sh.link.set_up(false);
+                // Link::send already marked the link down, if this was still the
+                // current connection.
                 sh.stats.bump("drop_no_link");
                 true
             } else {
