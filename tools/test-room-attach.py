@@ -40,6 +40,14 @@ for c in (godot, ROOT / ".local/godot/bin/godot", Path.home() / "code/prim-gw/.l
     if c and Path(c).exists():
         godot = str(c)
         break
+lib = ROOT / "target/debug/libprim_native.so"
+dst = ROOT / "client/bin/linux/libprim_native.so"
+if not lib.exists():
+    sys.exit("build first: cargo build -p prim -p prim_native (missing " + str(lib) + ")")
+dst.parent.mkdir(parents=True, exist_ok=True)
+if dst.is_symlink() or dst.exists():
+    dst.unlink()
+dst.symlink_to(lib)
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 procs = []
 def run(cmd, log, env, **kw):

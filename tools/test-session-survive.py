@@ -43,6 +43,14 @@ for c in (godot, ROOT / ".local/godot/bin/godot", Path.home() / "code/prim-gw/.l
     if c and Path(c).exists():
         godot = str(c)
         break
+lib = ROOT / "target/debug/libprim_native.so"
+dst = ROOT / "client/bin/linux/libprim_native.so"
+if not lib.exists():
+    sys.exit("build first: cargo build -p prim -p prim_native (missing " + str(lib) + ")")
+dst.parent.mkdir(parents=True, exist_ok=True)
+if dst.is_symlink() or dst.exists():
+    dst.unlink()
+dst.symlink_to(lib)
 if not godot or not prim.exists():
     sys.exit("need target/debug/prim, target/debug/libprim_native.so staged in client/bin/linux, and a godot engine")
 
