@@ -17,7 +17,7 @@ gui = ["dep:eframe"]
 
 [dependencies]
 anyhow = "1"
-eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"], optional = true }
 libc = "0.2"
 prim-room = { path = "../prim-room" }
 room-core = { path = "../room-core" }
