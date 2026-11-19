@@ -189,8 +189,8 @@ func _intruder() -> void:
 		"forgedsig":
 			var out := []
 			var script := ProjectSettings.globalize_path("res://../tools/forge-token.py")
-			var rc := OS.execute(script, [tok], out, true)
-			var forged: String = str(out[0]).strip_edges() if out.size() > 0 else ""
+			var rc := OS.execute(script, [tok], out, false)
+			var forged: String = str(out[0]).strip_edges().split("\n")[-1] if out.size() > 0 else ""
 			if not _check("forgedsig: forged a well-formed token", rc == 0 and forged.begins_with("prim1") and forged != tok, {"rc": rc}):
 				_drop(role + ".done", {})
 				return
@@ -205,7 +205,7 @@ func _intruder() -> void:
 	session.extra_args.append_array(["--peer-addr", "%s=127.0.0.1:%d" % [h["key"], h["port"]]])
 	menu.token_edit.text = tok
 	menu.join_button.pressed.emit()
-	var got_in: bool = await _wait(func(): return session.phase == "in_room", 30.0)
+	var got_in: bool = await _wait(func(): return session.phase == "in_room", 70.0)
 	_check("%s: refused (never in the room)" % role, not got_in,
 		{"phase": session.phase, "members": session.members.size(), "error": session.error})
 	_check("%s: says why" % role, session.error != "", {"error": session.error})

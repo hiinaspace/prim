@@ -69,7 +69,10 @@ func setup(s) -> void:
 	root.add_child(_choose_box)
 	host_button = Button.new()
 	host_button.text = "Host a room"
-	host_button.pressed.connect(func(): session.host_room())
+	host_button.pressed.connect(func():
+		if name_edit.text.strip_edges() != "":
+			session.set_display_name(name_edit.text)
+		session.host_room())
 	_choose_box.add_child(host_button)
 	_choose_box.add_child(HSeparator.new())
 	var jl := Label.new()
@@ -83,7 +86,10 @@ func setup(s) -> void:
 	jrow.add_child(token_edit)
 	join_button = Button.new()
 	join_button.text = "Join"
-	join_button.pressed.connect(func(): session.join_room(token_edit.text))
+	join_button.pressed.connect(func():
+		if name_edit.text.strip_edges() != "":
+			session.set_display_name(name_edit.text)
+		session.join_room(token_edit.text))
 	jrow.add_child(join_button)
 
 	_pending_box = VBoxContainer.new()
@@ -144,7 +150,7 @@ func refresh() -> void:
 	match ph:
 		"connecting": status.text = "Looking for a running room…"
 		"choose": status.text = "No room yet."
-		"pending": status.text = "Starting the room…" if s.daemon_pid > 0 else "Connected to the room daemon, waiting for the room…"
+		"pending": status.text = ("Joining… an invite that is used up, expired or revoked never answers; this gives up after 45 s." if s._starting_kind == "join" else "Starting the room…") if s.daemon_pid > 0 else "Connected to the room daemon, waiting for the room…"
 		"in_room": status.text = "In the room (%s)%s" % [s.lifecycle, "  · attached to a running daemon" if s.attached else ""]
 		"removed": status.text = "You are not in a room."
 	if invite_edit.text != s.invite:
