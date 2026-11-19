@@ -196,9 +196,19 @@ pub fn stop_daemon(socket: &Path) -> bool {
     for p in &pids {
         terminate(*p);
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while daemon_alive(socket) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(100));
+    let wait = |secs: u64| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while daemon_alive(socket) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait(5);
+    if daemon_alive(socket) {
+        for p in &pids {
+            // SAFETY: plain signal to a pid we found ourselves.
+            unsafe { libc::kill(*p, libc::SIGKILL) };
+        }
+        wait(2);
     }
     !daemon_alive(socket)
 }
@@ -256,6 +266,7 @@ impl Supervised {
     }
 
     pub fn start(&mut self, args: &[String]) -> Result<()> {
+        self.stop(); // never overwrite (and so orphan) a live child
         let c = command(args, &format!("{}.log", self.id))?.spawn()?;
         self.child = Some(c);
         self.state = ProcState::Running;
@@ -362,6 +373,9 @@ impl Voice {
 
     pub fn stop(&mut self) {
         self.sup.stop();
+        // Next time voice is turned on it starts muted and hearing, as documented.
+        self.mic = false;
+        self.deaf = false;
         // A voice client from an earlier window.
         for p in find_procs("voice", "rt-socket", &self.socket) {
             terminate(p);

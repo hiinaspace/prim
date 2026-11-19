@@ -51,7 +51,7 @@ pub const CLIENTS: &[ClientSpec] = &[
         blurb: "Walk around the living room as an avatar",
         icon: Icon::Cube,
         kind: ClientKind::Program(&[]),
-        unavailable: Some("Not ready yet. It joins this window in the 3D client round (C1)."),
+        unavailable: Some("Not ready yet (3D client round C1)."),
     },
     ClientSpec {
         id: "player",
@@ -59,7 +59,7 @@ pub const CLIENTS: &[ClientSpec] = &[
         blurb: "Play a video in sync with the room",
         icon: Icon::Play,
         kind: ClientKind::Program(&[]),
-        unavailable: Some("Not ready yet. It arrives with the standalone player round (PM)."),
+        unavailable: Some("Not ready yet (player round PM)."),
     },
 ];
 
@@ -108,6 +108,9 @@ pub struct App {
     /// `PRIM_UI_DEMO=voice,mic,deaf`: press those buttons once in a room (screenshot runs
     /// on a display with no pointer). Consumed on first use.
     demo: Option<String>,
+    /// `PRIM_UI_ACT=create;join=<token>;say=<text>`: the same actions as the buttons, in order
+    /// (an end-to-end run on a display with no pointer).
+    act: Vec<String>,
     /// A voice client left over from an earlier window is taken over once, muted.
     adopted: bool,
     socket: PathBuf,
@@ -140,6 +143,7 @@ impl App {
         App {
             rt,
             demo: std::env::var("PRIM_UI_DEMO").ok(),
+            act: std::env::var("PRIM_UI_ACT").map(|v| v.split(';').map(str::to_string).collect()).unwrap_or_default(),
             adopted: false,
             voice: Voice::new(&socket),
             socket,
@@ -205,8 +209,8 @@ impl App {
         let cb = self.repaint_cb();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(400)); // let the goodbye go out
-            supervise::stop_daemon(&socket);
-            let _ = tx.send(Ok(()));
+            let stopped = supervise::stop_daemon(&socket);
+            let _ = tx.send(if stopped { Ok(()) } else { Err("Prim did not stop; it is still running on this computer.".to_string()) });
             cb();
         });
         self.busy = Some(("Leaving the room…".into(), rx));
@@ -232,6 +236,23 @@ impl App {
                         self.voice.restart_with(mic, deaf);
                     }
                 }
+            }
+        }
+        if let Some(a) = self.act.first().cloned() {
+            let in_room = self.handle.as_ref().is_some_and(|h| h.lock().in_room());
+            let idle = self.busy.is_none() && self.attaching.is_none() && self.handle.is_none();
+            if a == "create" && idle {
+                let meta = self.name_edit.clone();
+                self.start_room(StartMode::Found { meta }, "Creating your room…");
+                self.act.remove(0);
+            } else if let (Some(t), true) = (a.strip_prefix("join="), idle) {
+                self.start_room(StartMode::Join(t.to_string()), "Joining the room…");
+                self.act.remove(0);
+            } else if let (Some(t), true) = (a.strip_prefix("say="), in_room) {
+                if let Some(h) = &self.handle {
+                    h.chat(t);
+                }
+                self.act.remove(0);
             }
         }
         if let Some((_, rx)) = &self.busy {
@@ -383,6 +404,9 @@ impl Snapshot {
 }
 
 fn hostname() -> String {
+    if let Ok(n) = std::env::var("PRIM_UI_NAME") {
+        return n;
+    }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())
@@ -587,7 +611,7 @@ impl App {
         egui::Panel::top("toolbar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
             .show(root, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let (voice_hint, voice_label) = if voice_on {
                         ("Voice is on. Click to turn it off.", "Voice on")
                     } else {
@@ -632,7 +656,9 @@ impl App {
                     )
                     .clicked()
                     {
-                        let (m, d) = (self.voice.mic, !self.voice.deaf);
+                        // Deafening also mutes, as in Mumble and Discord.
+                        let d = !self.voice.deaf;
+                        let m = self.voice.mic && !d;
                         self.voice.restart_with(m, d);
                     }
                     ui.add_space(10.0);
@@ -652,10 +678,16 @@ impl App {
                             self.confirm = Some(Confirm::Close);
                         }
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let r = ui.toggle_value(&mut self.advanced, "Advanced view");
-                        r.on_hover_text("Show the room as an inspectable tree: members, state, channels, leases, routes");
-                    });
+                    let wide = ui.max_rect().width() > 900.0;
+                    let adv = |ui: &mut egui::Ui, on: &mut bool| {
+                        ui.toggle_value(on, "Advanced view")
+                            .on_hover_text("Show the room as an inspectable tree: members, state, channels, leases, routes");
+                    };
+                    if wide {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| adv(ui, &mut self.advanced));
+                    } else {
+                        adv(ui, &mut self.advanced);
+                    }
                 });
                 if let Some((_, tok)) = self.invite.clone() {
                     ui.add_space(6.0);
@@ -683,7 +715,8 @@ impl App {
                         "closed" => (AMBER, "This room was closed by its opener".to_string()),
                         _ => (RED, "Not in a room".to_string()),
                     };
-                    ui.colored_label(dot, "●");
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 4.5, dot);
                     ui.label(text);
                     if s.removed {
                         ui.colored_label(RED, "You were removed from this room.");
