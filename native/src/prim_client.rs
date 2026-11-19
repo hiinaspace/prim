@@ -10,8 +10,12 @@
 use godot::prelude::*;
 use prim_client::transport::UnixTransport;
 use prim_client::wire::{unb64, Event, ReplyJson, UpdateJson};
+use prim_client::chat::Clients;
+use prim_client::room::{Room, RoomOpts};
+use prim_client::session::{SessionClient, SessionRequest, SessionStatus};
 use prim_client::{Client, ClientEvent};
 use serde_json::Value;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
 
 fn json_to_variant(v: &Value) -> Variant {
@@ -48,29 +52,68 @@ fn dict_of(v: &Value) -> VarDictionary {
 #[class(base=Node)]
 pub struct PrimClient {
     base: Base<Node>,
-    client: Option<Client>,
+    /// The room model around the daemon connection (round A1): status, names, chat,
+    /// default-name rule and pending requests live in `prim-client`, not in GDScript.
+    room: Option<Room>,
+    session_tx: Sender<(i64, Result<SessionStatus, String>)>,
+    session_rx: Receiver<(i64, Result<SessionStatus, String>)>,
+    next_session_req: i64,
+    default_name: String,
+    room_socket: Option<std::path::PathBuf>,
 }
 
 #[godot_api]
 impl INode for PrimClient {
     fn init(base: Base<Node>) -> Self {
-        Self { base, client: None }
+        let (session_tx, session_rx) = channel();
+        Self {
+            base,
+            room: None,
+            session_tx,
+            session_rx,
+            next_session_req: 1,
+            default_name: String::new(),
+            room_socket: None,
+        }
     }
 
     fn process(&mut self, _: f64) {
-        let mut events = Vec::new();
-        if let Some(c) = &self.client {
-            // Bounded per frame so a flood cannot stall rendering.
-            while events.len() < 256 {
-                match c.try_recv() {
-                    Some(e) => events.push(e),
-                    None => break,
-                }
+        // The room model folds every event in (and sends its own follow-up requests); the
+        // raw events still reach GDScript, except the model's own "**" subscription.
+        let events = match &mut self.room {
+            Some(r) => r.pump(),
+            None => Vec::new(),
+        };
+        for e in events {
+            let own = matches!(&e, ClientEvent::Event(Event::Updates { sub, .. })
+                if self.room.as_ref().is_some_and(|r| r.owns_sub(*sub)));
+            if !own {
+                self.emit_client_event(e);
             }
         }
-        for e in events {
-            self.emit_client_event(e);
+        while let Ok((id, res)) = self.session_rx.try_recv() {
+            let d = match res {
+                Ok(st) => {
+                    let mut d = dict_of(&serde_json::to_value(&st).unwrap_or(Value::Null));
+                    d.set(&GString::from("ok").to_variant(), &true.to_variant());
+                    d
+                }
+                Err(m) => {
+                    let mut d = VarDictionary::new();
+                    d.set(&GString::from("ok").to_variant(), &false.to_variant());
+                    d.set(&GString::from("error").to_variant(), &GString::from(m.as_str()).to_variant());
+                    d
+                }
+            };
+            self.base_mut()
+                .emit_signal("session_reply", &[id.to_variant(), d.to_variant()]);
         }
+    }
+}
+
+impl PrimClient {
+    fn cl(&self) -> Option<&Client> {
+        self.room.as_ref().map(|r| r.client())
     }
 }
 
@@ -116,15 +159,15 @@ impl PrimClient {
     fn removed();
     #[signal]
     fn daemon_error(message: GString);
+    /// The answer to `session_request`: `ok`, and on success the session's status
+    /// (room, kind, error, voice{running,wanted,mic,deaf,state,...}); `error` on failure.
+    #[signal]
+    fn session_reply(id: i64, data: VarDictionary);
 
     /// Default socket path: `$XDG_RUNTIME_DIR/prim/room.sock`.
     #[func]
     fn default_socket_path() -> GString {
-        let p = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
-            Some(d) => std::path::PathBuf::from(d).join("prim").join("room.sock"),
-            None => std::path::PathBuf::from("/tmp/prim/room.sock"),
-        };
-        p.to_string_lossy().as_ref().into()
+        prim_client::paths::room_socket().to_string_lossy().as_ref().into()
     }
 
     /// Start the worker against a Unix socket. It connects (and reconnects) in the
@@ -136,9 +179,18 @@ impl PrimClient {
         } else {
             path.to_string()
         };
+        self.room_socket = Some(std::path::PathBuf::from(&p));
         #[cfg(unix)]
         {
-            self.client = Some(Client::start(UnixTransport::new(p)));
+            let name = (!self.default_name.is_empty()).then(|| self.default_name.clone());
+            self.room = Some(Room::start(
+                UnixTransport::new(p),
+                RoomOpts {
+                    default_name: name,
+                    chat: true,
+                    repaint: None,
+                },
+            ));
             true
         }
         #[cfg(not(unix))]
@@ -150,27 +202,26 @@ impl PrimClient {
 
     #[func]
     fn close(&mut self) {
-        self.client = None;
+        self.room = None;
     }
 
     #[func]
     fn is_daemon_connected(&self) -> bool {
-        self.client.as_ref().is_some_and(|c| c.is_connected())
+        self.cl().is_some_and(|c| c.is_connected())
     }
 
     /// Subscribe to a state pattern, e.g. "member/*/pose". Returns the subscription id,
     /// or -1 on error.
     #[func]
     fn subscribe(&mut self, pattern: GString) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| c.subscribe(&pattern.to_string()).ok())
             .map_or(-1, i64::from)
     }
 
     #[func]
     fn unsubscribe(&mut self, sub: i64) {
-        if let Some(c) = &self.client {
+        if let Some(c) = self.cl() {
             let _ = c.unsubscribe(sub as u32);
         }
     }
@@ -186,8 +237,7 @@ impl PrimClient {
         persistent: bool,
         value: PackedByteArray,
     ) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| {
                 c.write(
                     &scope.to_string(),
@@ -203,15 +253,14 @@ impl PrimClient {
 
     #[func]
     fn register_channel(&mut self, channel: i64) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| c.register_channel(channel as u16).ok())
             .map_or(-1, |r| r as i64)
     }
 
     #[func]
     fn unregister_channel(&mut self, channel: i64) {
-        if let Some(c) = &self.client {
+        if let Some(c) = self.cl() {
             let _ = c.unregister_channel(channel as u16);
         }
     }
@@ -225,8 +274,7 @@ impl PrimClient {
         reliable: bool,
         payload: PackedByteArray,
     ) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| {
                 c.send(&to.to_string(), channel as u16, reliable, payload.as_slice())
                     .ok()
@@ -242,7 +290,7 @@ impl PrimClient {
         payload: PackedByteArray,
         max_age_ms: i64,
     ) -> bool {
-        self.client.as_ref().is_some_and(|c| {
+        self.cl().is_some_and(|c| {
             c.send_datagram(
                 &to.to_string(),
                 channel as u16,
@@ -256,8 +304,7 @@ impl PrimClient {
     /// Mint a one-time invite token (reply kind "invite", field "token"). 0 = daemon default.
     #[func]
     fn create_invite(&mut self, expiry_ms: i64) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| {
                 c.request(|req| prim_client::wire::Request::CreateInvite {
                     req,
@@ -272,8 +319,7 @@ impl PrimClient {
     /// Revoke a member (hex key) or an unused invite's key.
     #[func]
     fn revoke(&mut self, subject: GString) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| {
                 c.request(|req| prim_client::wire::Request::Revoke {
                     req,
@@ -287,17 +333,140 @@ impl PrimClient {
     /// Leave the room (the daemon then exits).
     #[func]
     fn leave(&mut self) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| c.request(|req| prim_client::wire::Request::Leave { req }).ok())
             .map_or(-1, |r| r as i64)
+    }
+
+    // ---- the room model (round A1) -------------------------------------------------
+
+    /// The name a member gets when it has none; call before `connect_to`. Empty = the
+    /// machine's host name (`$PRIM_NAME` first).
+    #[func]
+    fn set_default_name(&mut self, name: GString) {
+        self.default_name = if name.is_empty() {
+            prim_client::chat::default_name()
+        } else {
+            name.to_string()
+        };
+    }
+
+    /// Everything a menu shows, as one Dictionary: attached, in_room, lifecycle, room,
+    /// room_name, me, my_name, join ("none"|"pending"|"refused"), join_refused, removed,
+    /// notice, invite, voice_session, voice_incarnation, members[{key, name, is_me,
+    /// presence, coordinator, listening, mic, deaf, ...}].
+    #[func]
+    fn room_view(&self) -> VarDictionary {
+        match &self.room {
+            Some(r) => dict_of(&r.model.view()),
+            None => VarDictionary::new(),
+        }
+    }
+
+    /// Chat lines with id >= `from_id`: [{id, from, name, text, system, unix, delivery}].
+    #[func]
+    fn chat_lines(&self, from_id: i64) -> VarArray {
+        let mut out = VarArray::new();
+        let Some(r) = &self.room else { return out };
+        let m = &r.model;
+        for l in m.chat.iter().filter(|l| l.id as i64 >= from_id) {
+            let unix = l
+                .at
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let v = serde_json::json!({
+                "id": l.id, "from": l.from, "name": l.from.as_ref().map(|k| m.name_of(k)),
+                "text": l.text, "system": l.from.is_none(), "unix": unix,
+                "delivery": l.delivery,
+            });
+            out.push(&json_to_variant(&v));
+        }
+        out
+    }
+
+    #[func]
+    fn chat_send(&mut self, text: GString) {
+        if let Some(r) = &mut self.room {
+            r.chat(&text.to_string());
+        }
+    }
+
+    /// Write `member/<me>/profile`.
+    #[func]
+    fn set_display_name(&mut self, name: GString) {
+        if let Some(r) = &mut self.room {
+            r.set_name(&name.to_string());
+        }
+    }
+
+    /// Mint an invite (one hour); it appears as `invite` in `room_view`.
+    #[func]
+    fn make_invite(&mut self, expiry_ms: i64) {
+        if let Some(r) = &mut self.room {
+            r.invite_for(if expiry_ms > 0 { expiry_ms as u64 } else { 3_600_000 });
+        }
+    }
+
+    /// Tell the others which of my programs run (`member/<me>/clients`).
+    #[func]
+    fn set_clients(&mut self, godot: bool, player: bool, deaf: bool) {
+        if let Some(r) = &mut self.room {
+            r.set_clients(Clients { godot, player, deaf });
+        }
+    }
+
+    // ---- the session supervisor (`prim session`) -----------------------------------
+
+    /// Ask the session to do something, off the main thread: returns an id; the answer
+    /// comes as `session_reply(id, data)`. `op`: ensure (start one if none runs), status,
+    /// create (arg = room name), join (arg = invite), resume (arg = room id), leave,
+    /// cancel, voice_on, voice_off, mic_on, mic_off, deafen_on, deafen_off, quit.
+    #[func]
+    fn session_request(&mut self, op: GString, arg: GString, extra: PackedStringArray) -> i64 {
+        let id = self.next_session_req;
+        self.next_session_req += 1;
+        let tx = self.session_tx.clone();
+        let (op, arg) = (op.to_string(), arg.to_string());
+        let args: Vec<String> = extra.as_slice().iter().map(|s| s.to_string()).collect();
+        let sock = self
+            .room_socket
+            .clone()
+            .unwrap_or_else(prim_client::paths::room_socket);
+        std::thread::spawn(move || {
+            let sc = SessionClient::new(&sock);
+            let req = match op.as_str() {
+                "ensure" => {
+                    let _ = tx.send((id, sc.ensure_running(&sock).map_err(|e| e.to_string())));
+                    return;
+                }
+                "status" => SessionRequest::Status,
+                "create" => SessionRequest::Create { name: arg, args },
+                "join" => SessionRequest::Join { token: arg, args },
+                "resume" => SessionRequest::Resume { room: arg, args },
+                "leave" => SessionRequest::Leave,
+                "cancel" => SessionRequest::Cancel,
+                "voice_on" => SessionRequest::Voice { on: true },
+                "voice_off" => SessionRequest::Voice { on: false },
+                "mic_on" => SessionRequest::SetMic { on: true },
+                "mic_off" => SessionRequest::SetMic { on: false },
+                "deafen_on" => SessionRequest::SetDeafen { on: true },
+                "deafen_off" => SessionRequest::SetDeafen { on: false },
+                "quit" => SessionRequest::Quit,
+                other => {
+                    let _ = tx.send((id, Err(format!("unknown session op {other:?}"))));
+                    return;
+                }
+            };
+            let _ = tx.send((id, sc.call(&req).map_err(|e| e.to_string())));
+        });
+        id
     }
 
     /// Ask for the room status; the answer is a `reply` whose data has "status".
     #[func]
     fn request_status(&mut self) -> i64 {
-        self.client
-            .as_ref()
+        self.cl()
             .and_then(|c| c.status().ok())
             .map_or(-1, |r| r as i64)
     }

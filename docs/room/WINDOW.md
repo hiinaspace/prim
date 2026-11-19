@@ -84,10 +84,9 @@ this computer last saw the value change; records carry no wall-clock time.
 
 ## Local API gaps found
 
-- No request to stop the daemon (found by scanning `/proc`).
+- ~~No request to stop the daemon~~ (A1: `shutdown`, see ROOM.md).
 - No runtime mic mute or deafen in `prim voice` (the window replaces the client).
 - The registered-channel table is not in `Status`, so the advanced view lists only the
   window's own channel.
-- A room has no name the API can read (`found --meta` is stored but not exposed), so the
-  window shows the first hex digits of the room id.
+- ~~A room has no name the API can read~~ (A1: `status.name`, see ROOM.md).
 - A daemon serves one room, so "leave and join another" means stop and start a daemon.

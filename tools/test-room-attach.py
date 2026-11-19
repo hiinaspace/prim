@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""C1: the Godot client attaches to a room that `prim ui` (the room window) already started.
+"""C1 (retargeted in A1): the Godot client attaches to a room a session already runs.
 
-`prim ui` runs under a private headless weston with PRIM_UI_ACT=create, which starts a daemon
-and founds a room exactly as the Create button does. A headless Godot (role attach) then
-connects to that daemon's room.sock without hosting or joining, must show the name prim ui
-gave the member (the Godot default name must not overwrite it), mints an invite, sees a
-second daemon join with it, and renames itself. Needs `prim` built with the ui feature.
+`prim session` plus `prim ctl session create` start a daemon and found a room exactly as the
+menu's Host button does, with no window and no `prim ui`. The member is given a name from
+the command line side (`prim ctl write member profile`). A headless Godot (role attach) then
+adopts that session and its room without hosting or joining, must show the name it was
+given (the Godot default name must not overwrite it), mints an invite, sees a second daemon
+join with it, and renames itself.
 """
 import json, os, shutil, socket, subprocess, sys, time
 from pathlib import Path
@@ -31,15 +32,22 @@ def kill_daemons_under(path):
 ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/prim-room-attach")
 shutil.rmtree(OUT, ignore_errors=True)
-for d in ("wl", "ui", "godot", "peer"):
+for d in ("ui", "godot", "peer"):
     (OUT / d).mkdir(parents=True)
 prim = ROOT / "target/debug/prim"
 godot = os.environ.get("PRIM_GODOT")
-for c in (godot, ROOT / ".local/godot/bin/godot", shutil.which("godot")):
+for c in (godot, ROOT / ".local/godot/bin/godot", Path.home() / "code/prim-gw/.local/godot/bin/godot", shutil.which("godot")):
     if c and Path(c).exists():
         godot = str(c)
         break
-weston = os.environ.get("WESTON") or str(Path.home() / "code/xrprobe/.local/weston/bin/weston")
+lib = ROOT / "target/debug/libprim_native.so"
+dst = ROOT / "client/bin/linux/libprim_native.so"
+if not lib.exists():
+    sys.exit("build first: cargo build -p prim -p prim_native (missing " + str(lib) + ")")
+dst.parent.mkdir(parents=True, exist_ok=True)
+if dst.is_symlink() or dst.exists():
+    dst.unlink()
+dst.symlink_to(lib)
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 procs = []
 def run(cmd, log, env, **kw):
@@ -47,25 +55,23 @@ def run(cmd, log, env, **kw):
     procs.append(p)
     return p
 try:
-    wenv = {k: v for k, v in os.environ.items() if k not in ("WAYLAND_DISPLAY", "DISPLAY")} | {"XDG_RUNTIME_DIR": str(OUT / "wl")}
-    run([weston, "--backend=headless", "--renderer=gl", "--socket=a", "--width=1280", "--height=720", "--idle-time=0"], "weston.log", wenv)
-    for _ in range(100):
-        if (OUT / "wl/a").exists(): break
-        time.sleep(0.1)
     sock = OUT / "ui/room.sock"
-    uenv = wenv | {"WAYLAND_DISPLAY": str(OUT / "wl/a"), "PRIM_SOCKET": str(sock), "PRIM_UI_ACT": "create",
-                   "PRIM_UI_EXE": str(prim), "XDG_STATE_HOME": str(OUT / "ui/state"),
-                   "PRIM_UI_DAEMON_ARGS": f"--relay none --bind 127.0.0.1:{port} --state-dir {OUT}/ui/room-state"}
-    run([str(prim), "ui"], "ui.log", uenv)
-    for _ in range(200):
-        if sock.exists(): break
+    senv = os.environ | {"PRIM_BIN": str(prim), "XDG_STATE_HOME": str(OUT / "ui/state"), "PRIM_SESSION_VOICE_TEST": "1"}
+    run([str(prim), "session", "--socket", str(sock), "--no-voice"], "session.log", senv)
+    for _ in range(100):
+        if (OUT / "ui/session.sock").exists(): break
         time.sleep(0.1)
     else:
-        sys.exit("prim ui did not start a daemon; see " + str(OUT / "ui.log"))
+        sys.exit("prim session did not start; see " + str(OUT / "session.log"))
+    ctl = lambda *a: subprocess.run([str(prim), "ctl", "--socket", str(sock), *a], env=senv, capture_output=True, text=True, timeout=60)
+    r = ctl("session", "create", "Attach room", "--relay=none", f"--bind=127.0.0.1:{port}", f"--state-dir={OUT}/ui/room-state")
+    if r.returncode != 0:
+        sys.exit("session create failed: " + r.stdout + r.stderr)
+    want = "Elsewhere"
+    me = json.loads(ctl("status", "--json").stdout)["me"]
+    r = ctl("write", "member", "profile", "--persistent", json.dumps({"v": 1, "name": want}))
     time.sleep(1.0)
-    # What name did prim ui give itself? (its default is the host name)
-    want = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
-    genv = os.environ | {"XDG_DATA_HOME": str(OUT / "godot/data"), "ROOM_TEST_EXPECT_NAME": want, "PRIM_BIN": str(prim)}
+    genv = os.environ | {"XDG_DATA_HOME": str(OUT / "godot/data"), "ROOM_TEST_EXPECT_NAME": want, "PRIM_BIN": str(prim), "XDG_STATE_HOME": str(OUT / "ui/state")}
     gcmd = [godot, "--headless", "--path", str(ROOT / "client"), "--xr-mode", "off", "--", "--desktop", "--role", "attach",
             "--test-dir", str(OUT), "--socket", str(sock), "--name", "Godot-default"]
     g = run(gcmd, "godot.log", genv)
@@ -79,6 +85,10 @@ try:
          "--relay", "none", "--bind", "127.0.0.1:0", "--peer-addr", f"{info['key']}=127.0.0.1:{port}"], "peer.log", penv)
     code = g.wait(timeout=90)
 finally:
+    try:
+        subprocess.run([str(prim), "ctl", "--socket", str(OUT / "ui/room.sock"), "session", "quit"], capture_output=True, timeout=30)
+    except Exception:
+        pass
     for p in procs:
         if p.poll() is None:
             p.terminate()

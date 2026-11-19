@@ -11,12 +11,16 @@ var name_edit: LineEdit
 var name_button: Button
 var host_button: Button
 var token_edit: LineEdit
+var paste_button: Button
 var join_button: Button
 var cancel_button: Button
 var invite_button: Button
 var invite_edit: LineEdit
 var copy_button: Button
 var leave_button: Button
+var mic_button: CheckButton
+var deafen_button: CheckButton
+var quit_button: Button
 var status: Label
 var error_label: Label
 var roster: RichTextLabel
@@ -84,6 +88,10 @@ func setup(s) -> void:
 	token_edit.placeholder_text = "prim1…"
 	token_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	jrow.add_child(token_edit)
+	paste_button = Button.new()
+	paste_button.text = "Paste"
+	paste_button.pressed.connect(func(): token_edit.text = DisplayServer.clipboard_get().strip_edges())
+	jrow.add_child(paste_button)
 	join_button = Button.new()
 	join_button.text = "Join"
 	join_button.pressed.connect(func():
@@ -124,10 +132,22 @@ func setup(s) -> void:
 	roster.fit_content = true
 	roster.scroll_active = false
 	_room_box.add_child(roster)
+	mic_button = CheckButton.new()
+	mic_button.text = "Microphone on"
+	mic_button.toggled.connect(func(on): if on != session.voice.get("mic", false): session.set_mic(on))
+	_room_box.add_child(mic_button)
+	deafen_button = CheckButton.new()
+	deafen_button.text = "Deafen (hear no one)"
+	deafen_button.toggled.connect(func(on): if on != session.voice.get("deaf", false): session.set_deafen(on))
+	_room_box.add_child(deafen_button)
 	leave_button = Button.new()
 	leave_button.text = "Leave room"
 	leave_button.pressed.connect(func(): session.leave_room())
 	_room_box.add_child(leave_button)
+	quit_button = Button.new()
+	quit_button.text = "Quit Prim (ends the room session and voice)"
+	quit_button.pressed.connect(func(): session.leave_and_quit())
+	root.add_child(quit_button)
 	session.changed.connect(refresh)
 	refresh()
 
@@ -150,12 +170,19 @@ func refresh() -> void:
 	match ph:
 		"connecting": status.text = "Looking for a running room…"
 		"choose": status.text = "No room yet."
-		"pending": status.text = ("Joining… an invite that is used up, expired or revoked never answers; this gives up after 45 s." if s._starting_kind == "join" else "Starting the room…") if s.daemon_pid > 0 else "Connected to the room daemon, waiting for the room…"
+		"pending": status.text = "Joining… waiting for the room to answer. An invite that is used up, expired or revoked is refused; press Cancel to stop waiting." if s.starting_kind == "join" else "Starting the room…"
 		"in_room": status.text = "In the room (%s)%s" % [s.lifecycle, "  · attached to a running daemon" if s.attached else ""]
 		"removed": status.text = "You are not in a room."
 	if invite_edit.text != s.invite:
 		invite_edit.text = s.invite
 		copy_button.text = "Copy"
+	if mic_button.button_pressed != s.voice.get("mic", false):
+		mic_button.set_pressed_no_signal(s.voice.get("mic", false))
+	if deafen_button.button_pressed != s.voice.get("deaf", false):
+		deafen_button.set_pressed_no_signal(s.voice.get("deaf", false))
+	var vr: bool = s.voice.get("running", false)
+	mic_button.disabled = not s.voice.get("wanted", false) and not vr
+	deafen_button.disabled = mic_button.disabled
 	invite_button.disabled = s.lifecycle != "open"
 	copy_button.disabled = s.invite == ""
 	var lines := PackedStringArray()

@@ -1,93 +1,95 @@
 extends Node
-## C1: the Godot side of "be in a room". Everything goes through the room daemon over
-## room.sock (PrimClient): attach to a room that is already running (for example one
-## `prim ui` started), or start a daemon here to host or join, mint an invite, show who
-## I am, and write my display name as `member/<me>/profile` ({"v":1,"name":...}, durable).
+## Godot's face of "be in a room" (round A1: a thin client, no supervision).
 ##
-## phase: connecting -> choose (no daemon, or ours exited: see `error`) | pending (daemon up,
-##        not in a room yet) | in_room | removed (the room removed me)
-## Nothing here knows about 3D; the menu (ui/room_menu.gd) and the tests drive it.
+## Everything stateful lives in Rust: `prim session` (the supervisor process) starts and
+## keeps the room daemon and voice and survives Godot; `PrimClient` (prim-client's room
+## model) holds status, names, chat, the default-name rule and the pending-request
+## table. This node (1) makes sure a session is running, (2) turns button presses into
+## session requests and PrimClient calls, and (3) maps `PrimClient.room_view()` plus the
+## session status onto the phases the menu draws. It never spawns or kills a process.
+##
+## phase: connecting -> choose (no room; see `error`) | pending (starting, or joining
+##        and nobody has answered yet) | in_room | removed (the room removed me)
+## Closing the window leaves the session running only when a tray is live (`tray_live`) or
+## PRIM_CLOSE_KEEPS_SESSION=1; otherwise it leaves the room and quits. Killing Godot never
+## touches the session. `quit_prim()` ends everything.
 
 signal changed
 
-const PROFILE_VERSION := 1
-const ATTACH_WAIT_S := 2.0
-const JOIN_TIMEOUT_S := 45.0
+const POLL_S := 0.15
+const SESSION_POLL_S := 1.0
+const CONNECT_WAIT_S := 3.0
 
 var client: PrimClient
 var socket := ""
-var prim_bin := ""
-var extra_args: PackedStringArray = [] # daemon args: --relay, --bind, --peer-addr ...
+var extra_args: PackedStringArray = [] # daemon args for the next create/join: --relay, --bind, --peer-addr ...
 var phase := "connecting"
 var error := ""
-var attached := false # true when the daemon was already running (not started by us)
+var attached := false # true when the room was already running when the session came up
 var me := ""
 var lifecycle := "dead"
+var room_name := ""
 var members := {} # key -> {online, connected}
-var names := {} # key -> display name (from member/*/profile)
+var names := {} # key -> display name
 var invite := ""
-var daemon_pid := -1
-var daemon_log := ""
+var daemon_pid := -1 # always -1: Godot does not own the daemon (kept for older tests)
 var max_members_seen := 0
 var removed_members: Array = [] # keys the daemon told us were removed
-var _sub_profile := -1
-var _profile_snapshot := false
-var _wanted_name := ""
-var _written_name := "\u0000"
-var _invite_req := -1
+var starting_kind := ""
+var voice := {} # last session voice state: running, wanted, mic, deaf, state, detail, pid, starts
+var session_ready := false
+var tray_live := false # the session has a tray icon (round T1); false until then
 var _t := 0.0
 var _poll := 0.0
-var _started_at := 0.0
-var _starting_kind := ""
-var _explicit_name := false
+var _session_poll := 0.0
+var _pending_name := ""
+var _last := ""
+var _cancelling := false
+var _starting := false
+var _reviving := false
+var _session_room := "none"
+var _session_error := ""
+var _calls := {} # session request id -> Callable(data)
 
 
 func setup(c: PrimClient, sock: String, default_name: String) -> void:
 	client = c
 	socket = sock if sock != "" else c.default_socket_path()
-	_wanted_name = default_name
-	prim_bin = _find_prim()
 	var env_args := OS.get_environment("PRIM_DAEMON_ARGS").strip_edges()
 	if env_args != "":
 		extra_args = PackedStringArray(env_args.split(" ", false))
-	client.connected.connect(_on_connected)
-	client.disconnected.connect(_emit)
-	client.reply.connect(_on_reply)
-	client.state_value.connect(_on_state_value)
-	client.snapshot_done.connect(_on_snapshot_done)
-	client.state_reset.connect(_on_state_reset)
+	# The session spawns `prim` itself; point it at a dev build when there is one.
+	if OS.get_environment("PRIM_BIN") == "":
+		var dev := ProjectSettings.globalize_path("res://../target/debug/prim")
+		if FileAccess.file_exists(dev):
+			OS.set_environment("PRIM_BIN", dev)
+	# The name a member gets when it has none is written by PrimClient (prim-client).
+	client.set_default_name(default_name)
+	client.session_reply.connect(_on_session_reply)
 	client.member_event.connect(_on_member_event)
 	client.removed.connect(_on_removed)
 	client.connect_to(socket)
-	_sub_profile = client.subscribe("member/*/profile")
-
-
-func _find_prim() -> String:
-	var e := OS.get_environment("PRIM_BIN")
-	if e != "":
-		return e
-	var dev := ProjectSettings.globalize_path("res://../target/debug/prim")
-	if FileAccess.file_exists(dev):
-		return dev
-	return "prim"
-
-
-func _emit() -> void:
-	changed.emit()
-
-
-func display_name() -> String:
-	return names.get(me, "")
+	# No session running: start one. One running: adopt it (nothing is restarted).
+	_request("ensure", "", [], func(d):
+		session_ready = d.get("ok", false)
+		if not session_ready:
+			_session_error = "Could not start the Prim session: %s" % d.get("error", "unknown error")
+		_apply_session(d))
 
 
 func short(key: String) -> String:
 	return key.left(8)
 
 
-## Actions the menu calls ----------------------------------------------------------
+func display_name() -> String:
+	return names.get(me, "")
 
-func host_room() -> void:
-	_spawn(["room", "found", "--meta", "godot"], "host")
+
+# ---- actions the menu calls. Each is one session request or one PrimClient call; the
+# ---- same list is `prim ctl session ...` / `prim ctl ...` from a shell. -------------
+
+func host_room(room_label := "") -> void:
+	_start("create", room_label, "found")
 
 
 func join_room(token: String) -> void:
@@ -95,20 +97,17 @@ func join_room(token: String) -> void:
 	if not token.begins_with("prim1"):
 		_fail("That is not an invite (it should start with prim1).")
 		return
-	_spawn(["room", "join", token], "join")
+	_start("join", token, "join")
 
 
-func make_invite(expiry_ms := 3600000) -> void:
+func make_invite(expiry_ms := 0) -> void:
 	invite = ""
-	_invite_req = client.create_invite(expiry_ms)
-	if _invite_req < 0:
-		_fail("Not connected to the room daemon.")
+	client.make_invite(expiry_ms)
 
 
 func set_display_name(n: String) -> void:
-	_explicit_name = true
-	_wanted_name = n.strip_edges()
-	_write_profile()
+	_pending_name = n.strip_edges()
+	_send_name()
 
 
 func revoke(key: String) -> void:
@@ -116,47 +115,114 @@ func revoke(key: String) -> void:
 
 
 func leave_room() -> void:
-	client.leave()
+	_request("leave", "", [], _apply_session)
 
 
 func cancel_start() -> void:
-	if daemon_pid > 0:
-		OS.kill(daemon_pid)
-		daemon_pid = -1
-	phase = "choose"
-	error = ""
-	_emit()
+	_request("cancel", "", [], _apply_session)
 
 
-func stop_daemon() -> void:
-	## Only the process this client started.
-	if daemon_pid > 0 and OS.is_process_running(daemon_pid):
-		OS.kill(daemon_pid)
-	daemon_pid = -1
+func set_mic(on: bool) -> void:
+	_request("mic_on" if on else "mic_off", "", [], _apply_session)
+
+
+func set_deafen(on: bool) -> void:
+	_request("deafen_on" if on else "deafen_off", "", [], _apply_session)
+
+
+func set_voice(on: bool) -> void:
+	_request("voice_on" if on else "voice_off", "", [], _apply_session)
+
+
+func send_chat(text: String) -> void:
+	client.chat_send(text)
+
+
+## Close Godot, leaving the session, room and voice running (what the window's X does
+## when a tray is live, or when PRIM_CLOSE_KEEPS_SESSION=1 / --keep-session is given).
+func close_window() -> void:
+	get_tree().quit()
+
+
+## The window's close request. With no tray there would be a live microphone and nothing
+## visible, so close means leave the room and stop everything; with a tray (or the
+## override) it only closes Godot.
+func on_close_request() -> void:
+	if tray_live or OS.get_environment("PRIM_CLOSE_KEEPS_SESSION") == "1" \
+			or "--keep-session" in OS.get_cmdline_user_args():
+		close_window()
+	else:
+		leave_and_quit()
+
+
+## Leave the room (so friends see it), then stop the session, room daemon and voice.
+func leave_and_quit() -> void:
+	_request("leave", "", [], func(_d): quit_prim())
+
+
+## Stop everything (voice, the room daemon, the session), then close Godot.
+func quit_prim() -> void:
+	_request("quit", "", [], func(_d): get_tree().quit())
+
+
+## Stop the session without closing Godot (tests clean up with this).
+func quit_session(done := Callable()) -> void:
+	_request("quit", "", [], func(d):
+		if done.is_valid():
+			done.call(d))
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_WM_CLOSE_REQUEST:
+		on_close_request()
 
 
 # ---- internals -------------------------------------------------------------------
 
-func _spawn(args: Array, kind: String) -> void:
-	if phase in ["pending", "in_room"] and daemon_pid > 0:
-		return
+func _start(op: String, arg: String, kind: String) -> void:
 	error = ""
-	var sock_dir := socket.get_base_dir()
-	DirAccess.make_dir_recursive_absolute(sock_dir)
-	daemon_log = sock_dir.path_join("godot-daemon-%d.log" % Time.get_ticks_msec())
-	var full: Array = [prim_bin] + args
-	full += ["--socket", socket, "--rt-socket", sock_dir.path_join("rt.sock")]
-	full += Array(extra_args)
-	# sh -c 'exec "$@" >log 2>&1' LOG prim ...: the daemon owns its output file.
-	var sh_args: Array = ["-c", 'log="$1"; shift; exec "$@" >"$log" 2>&1', "sh", daemon_log] + full
-	daemon_pid = OS.create_process("/bin/sh", PackedStringArray(sh_args))
-	if daemon_pid <= 0:
-		_fail("Could not start the room daemon (%s)." % prim_bin)
-		return
+	_cancelling = false
+	_starting = true
+	starting_kind = kind
 	phase = "pending"
-	_starting_kind = kind
-	_started_at = _t
-	attached = false
+	_emit()
+	_request(op, arg, extra_args, func(d):
+		_starting = false
+		if not d.get("ok", false):
+			_fail(str(d.get("error", "Could not start the room.")))
+		_apply_session(d))
+
+
+func _request(op: String, arg: String, extra, cb: Callable) -> void:
+	var id := client.session_request(op, arg, PackedStringArray(extra))
+	_calls[id] = cb
+
+
+func _on_session_reply(id: int, data: Dictionary) -> void:
+	var cb: Callable = _calls.get(id, Callable())
+	_calls.erase(id)
+	if cb.is_valid():
+		cb.call(data)
+
+
+func _apply_session(d: Dictionary) -> void:
+	if not d.get("ok", false):
+		# The session went away (killed, crashed): bring one back, it adopts what is running.
+		if session_ready and not _reviving:
+			session_ready = false
+			_reviving = true
+			_request("ensure", "", [], func(r):
+				_reviving = false
+				session_ready = r.get("ok", false)
+				if session_ready:
+					_apply_session(r))
+		return
+	voice = d.get("voice", {})
+	tray_live = d.get("tray_live", false)
+	_session_room = d.get("room", "none")
+	attached = d.get("kind", "") == "attached"
+	if _session_room == "failed" and error == "":
+		error = str(d.get("error", ""))
 	_emit()
 
 
@@ -167,97 +233,92 @@ func _fail(msg: String) -> void:
 	_emit()
 
 
-func _log_tail() -> String:
-	if daemon_log == "" or not FileAccess.file_exists(daemon_log):
-		return ""
-	var lines := FileAccess.get_file_as_string(daemon_log).strip_edges().split("\n")
-	return lines[lines.size() - 1] if lines.size() > 0 else ""
+func _emit() -> void:
+	changed.emit()
+
+
+func _send_name() -> void:
+	if _pending_name != "" and me != "" and lifecycle == "open":
+		client.set_display_name(_pending_name)
+		_pending_name = ""
 
 
 func _process(dt: float) -> void:
 	_t += dt
 	if client == null:
 		return
-	if phase == "connecting" and _t > ATTACH_WAIT_S and not client.is_daemon_connected():
-		phase = "choose"
-		_emit()
 	_poll -= dt
 	if _poll <= 0.0:
-		_poll = 0.5
-		if client.is_daemon_connected():
-			client.request_status()
-	if phase == "pending" and daemon_pid > 0:
-		if not OS.is_process_running(daemon_pid) and not client.is_daemon_connected():
-			var tail := _log_tail()
-			daemon_pid = -1
-			phase = "choose"
-			error = ("The room could not be %s: %s" % ["joined" if _starting_kind == "join" else "started", tail]) \
-				if tail != "" else "The room daemon exited."
-			_emit()
-		elif _t - _started_at > JOIN_TIMEOUT_S and lifecycle != "open":
-			stop_daemon()
-			phase = "choose"
-			error = "Not admitted: nobody in that room accepted this invite (it may be used up, expired, revoked or the host is offline)."
-			_emit()
+		_poll = POLL_S
+		_refresh()
+	_session_poll -= dt
+	if _session_poll <= 0.0:
+		_session_poll = SESSION_POLL_S
+		if session_ready:
+			_request("status", "", [], _apply_session)
 
 
-func _on_connected() -> void:
-	if phase == "connecting" or phase == "choose":
-		attached = daemon_pid <= 0
-		phase = "pending"
-	_emit()
+func _s(v: Dictionary, key: String, fallback := ""):
+	var x = v.get(key, null)
+	return fallback if x == null else x
 
 
-func _on_reply(req: int, data: Dictionary) -> void:
-	var kind: String = data.get("kind", "")
-	if kind == "status":
-		_apply_status(data["status"])
-	elif req == _invite_req:
-		_invite_req = -1
-		if kind == "invite":
-			invite = data.get("token", "")
-		else:
-			error = "Could not make an invite: %s" % data.get("code", kind)
-		_emit()
-
-
-func _apply_status(st: Dictionary) -> void:
-	me = st.get("me", "")
-	lifecycle = st.get("lifecycle", "dead")
+func _refresh() -> void:
+	var v: Dictionary = client.room_view()
+	me = _s(v, "me")
+	lifecycle = _s(v, "lifecycle", "dead")
+	room_name = _s(v, "room_name")
 	var seen := {}
-	for m in st.get("members", []):
-		seen[m["key"]] = {"online": m.get("online", false), "connected": m.get("connected", false)}
+	var nm := {}
+	for m in v.get("members", []):
+		seen[m["key"]] = {"online": m.get("presence", "") == "online", "connected": true}
+		var n: String = m.get("name", "")
+		nm[m["key"]] = "" if n == m["key"].left(8) else n
 	members = seen
+	names = nm
 	max_members_seen = maxi(max_members_seen, seen.size())
-	if lifecycle in ["open", "closed"] and phase in ["pending", "connecting", "choose"]:
+	var inv: String = _s(v, "invite")
+	if inv != "":
+		invite = inv
+	var daemon_up: bool = v.get("attached", false)
+	if v.get("removed", false):
+		phase = "removed"
+		error = "You were removed from the room."
+	elif v.get("in_room", false) and daemon_up:
 		phase = "in_room"
-	_write_profile()
-	_emit()
-
-
-func _on_state_value(sub: int, path: String, _writer: String, _live: bool, value: PackedByteArray) -> void:
-	if sub != _sub_profile:
-		return
-	var parts := path.split("/")
-	if parts.size() != 3 or parts[2] != "profile":
-		return
-	var parsed = JSON.parse_string(value.get_string_from_utf8())
-	if parsed is Dictionary:
-		names[parts[1]] = str(parsed.get("name", ""))
+		_send_name()
+	elif _s(v, "join", "none") == "refused":
+		if error == "":
+			error = _refusal_text(str(_s(v, "join_refused")))
+		phase = "choose"
+		if not _cancelling:
+			_cancelling = true
+			cancel_start() # stop the daemon so the person can try another invite
+	elif daemon_up or _starting or _session_room == "starting":
+		phase = "pending"
+	elif not session_ready and _t < CONNECT_WAIT_S and phase == "connecting":
+		pass
+	else:
+		phase = "choose"
+		if _session_error != "" and error == "":
+			error = _session_error
+	var sig := JSON.stringify([phase, error, me, lifecycle, room_name, members, names, invite, voice])
+	if sig != _last:
+		_last = sig
 		_emit()
 
 
-func _on_snapshot_done(sub: int) -> void:
-	if sub == _sub_profile:
-		_profile_snapshot = true
-		_write_profile()
-
-
-func _on_state_reset(sub: int) -> void:
-	if sub == _sub_profile:
-		names.clear()
-		_profile_snapshot = false
-		_written_name = "\u0000"
+func _refusal_text(why: String) -> String:
+	match why:
+		"invite_invalid", "not_member":
+			return "Not admitted: that invite was already used, expired or revoked."
+		"closed":
+			return "That room is closed."
+		"revoked":
+			return "You were removed from that room."
+		"wrong_room", "version", "unsupported":
+			return "Could not join: that room runs an incompatible version."
+	return "Not admitted (%s)." % why
 
 
 func _on_member_event(key: String, what: String) -> void:
@@ -270,18 +331,3 @@ func _on_removed() -> void:
 	phase = "removed"
 	error = "You were removed from the room."
 	_emit()
-
-
-## Write the profile once the snapshot is in, so a name already on the room (a rejoin,
-## or `prim ui`'s) isn't overwritten by our default. An explicit set_name always writes.
-func _write_profile() -> void:
-	if me == "" or lifecycle != "open" or not _profile_snapshot or _wanted_name == "":
-		return
-	if _wanted_name == _written_name:
-		return
-	if _written_name == "\u0000" and names.get(me, "") != "" and not _explicit_name:
-		_written_name = names[me]
-		return
-	_written_name = _wanted_name
-	var body := JSON.stringify({"v": PROFILE_VERSION, "name": _wanted_name})
-	client.write_state("member", "profile", false, true, body.to_utf8_buffer())

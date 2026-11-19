@@ -1,10 +1,10 @@
-//! Starting and watching local programs: the room daemon, `prim voice`, and the launch
-//! table of other clients. Unix only, like the daemon itself.
-//!
-//! Everything we spawn gets its own process group and is not killed when the window
-//! closes: closing the window keeps you in the room.
+//! What the dev window still does by itself: launch other clients (`prim watch`) and short
+//! audio helpers. The room daemon and `prim voice` are the session supervisor's
+//! (`prim session`, crate `prim-session`); [`start_daemon`], [`stop_daemon`] and [`Voice`]
+//! here only send it requests. Unix only, like the daemon itself.
 
 use std::collections::VecDeque;
+use prim_client::session::{SessionClient, SessionRequest};
 use std::fs::File;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 
 /// The `prim` binary to spawn: this one, or `PRIM_UI_EXE` (tests run from another binary).
 pub fn exe() -> PathBuf {
@@ -35,10 +35,7 @@ pub fn log_dir() -> PathBuf {
 }
 
 pub fn socket_path() -> PathBuf {
-    std::env::var_os("PRIM_SOCKET")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(prim_room::local::default_socket_path)
+    prim_client::paths::room_socket()
 }
 
 pub fn rt_socket_path(socket: &Path) -> PathBuf {
@@ -98,127 +95,30 @@ pub enum StartMode {
     Resume(String),
 }
 
-/// Start `prim room ...` for `mode` and wait until its socket answers. Extra daemon
-/// arguments (relay, bind) come from `PRIM_UI_DAEMON_ARGS`, split on spaces.
+/// Ask the session (starting it if none runs) to start the room daemon for `mode`.
 pub fn start_daemon(mode: &StartMode, socket: &Path) -> Result<()> {
-    if daemon_alive(socket) {
-        bail!("a daemon is already running on {}", socket.display());
-    }
-    let mut args: Vec<String> = vec!["room".into()];
-    match mode {
-        StartMode::Found { meta } => {
-            args.push("found".into());
-            if !meta.trim().is_empty() {
-                args.push(format!("--meta={}", meta.trim()));
-            }
-        }
-        StartMode::Join(t) => args.extend(["join".into(), t.trim().to_string()]),
-        StartMode::Resume(h) => args.extend(["resume".into(), h.clone()]),
-    }
-    args.push(format!("--socket={}", socket.display()));
-    args.push(format!("--rt-socket={}", rt_socket_path(socket).display()));
-    if let Ok(extra) = std::env::var("PRIM_UI_DAEMON_ARGS") {
-        args.extend(extra.split_whitespace().map(str::to_string));
-    }
-    let mut child = command(&args, "daemon.log")?.spawn().context("spawn prim room")?;
-    let deadline = Instant::now() + Duration::from_secs(25);
-    loop {
-        if daemon_alive(socket) {
-            return Ok(());
-        }
-        if let Some(st) = child.try_wait()? {
-            bail!("prim room exited ({st}): {}", last_log_line("daemon.log"));
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            bail!("prim room did not start in time: {}", last_log_line("daemon.log"));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Process ids of running `prim <sub>` programs (same binary name as this one) whose
-/// `--<sock_flag>` value, or the default, equals `socket`.
-pub fn find_procs(sub: &str, sock_flag: &str, socket: &Path) -> Vec<i32> {
-    let me = std::process::id() as i32;
-    let our_name = exe()
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut out = vec![];
-    let Ok(rd) = std::fs::read_dir("/proc") else {
-        return out;
+    let sc = SessionClient::new(socket);
+    sc.ensure_running(socket)?;
+    let req = match mode {
+        StartMode::Found { meta } => SessionRequest::Create { name: meta.trim().to_string(), args: vec![] },
+        StartMode::Join(t) => SessionRequest::Join { token: t.trim().to_string(), args: vec![] },
+        StartMode::Resume(h) => SessionRequest::Resume { room: h.clone(), args: vec![] },
     };
-    for e in rd.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let Ok(raw) = std::fs::read(e.path().join("cmdline")) else {
-            continue;
-        };
-        let argv: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        let name = argv
-            .first()
-            .and_then(|a| Path::new(a).file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name != our_name || argv.get(1).map(String::as_str) != Some(sub) {
-            continue;
-        }
-        let flag = format!("--{sock_flag}");
-        let given = argv.iter().enumerate().find_map(|(i, a)| {
-            if let Some(v) = a.strip_prefix(&format!("{flag}=")) {
-                Some(v.to_string())
-            } else if *a == flag {
-                argv.get(i + 1).cloned()
-            } else {
-                None
-            }
-        });
-        let matches = match given {
-            Some(v) => Path::new(&v) == socket || Path::new(&v) == rt_socket_path(socket),
-            None => sock_flag == "socket" && socket == prim_room::local::default_socket_path(),
-        };
-        if matches {
-            out.push(pid);
-        }
-    }
-    out
+    sc.call(&req).map(|_| ()).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 pub fn terminate(pid: i32) {
-    // SAFETY: plain signal to a pid we found ourselves.
+    // SAFETY: plain signal to a pid we started ourselves.
     unsafe {
         libc::kill(pid, libc::SIGTERM);
     }
 }
 
-/// Stop the daemon on `socket` (found by scanning /proc; the local API has no shutdown).
+/// Leave the room and stop the daemon (and voice), through the session.
 pub fn stop_daemon(socket: &Path) -> bool {
-    let pids = find_procs("room", "socket", socket);
-    for p in &pids {
-        terminate(*p);
-    }
-    let wait = |secs: u64| {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        while daemon_alive(socket) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    wait(5);
-    if daemon_alive(socket) {
-        for p in &pids {
-            // SAFETY: plain signal to a pid we found ourselves.
-            unsafe { libc::kill(*p, libc::SIGKILL) };
-        }
-        wait(2);
+    let sc = SessionClient::new(socket);
+    if sc.alive() {
+        let _ = sc.call(&SessionRequest::Leave);
     }
     !daemon_alive(socket)
 }
@@ -332,47 +232,39 @@ impl Supervised {
     }
 }
 
-/// `prim voice` with the window's mic and deafen choices.
+/// The session's voice client as the window sees it: it asks, the session does.
 pub struct Voice {
-    pub sup: Supervised,
+    pub sup: VoiceView,
     pub mic: bool,
     pub deaf: bool,
     socket: PathBuf,
-    /// Private-sink mode for tests and screenshots (`PRIM_UI_VOICE_TEST=1`): a tone
-    /// "microphone" and a null output, never real devices.
     test: bool,
+    last: Instant,
+}
+
+/// Running state of the session's voice client.
+pub struct VoiceView {
+    pub state: ProcState,
+    running: bool,
+}
+
+impl VoiceView {
+    pub fn running(&self) -> bool {
+        self.running
+    }
 }
 
 impl Voice {
     pub fn new(socket: &Path) -> Self {
         Self {
-            sup: Supervised::new("voice"),
-            // The mic starts muted: being in the room without talking is the default.
+            sup: VoiceView { state: ProcState::Off, running: false },
             mic: false,
             deaf: false,
             socket: socket.to_path_buf(),
-            test: std::env::var_os("PRIM_UI_VOICE_TEST").is_some(),
+            test: std::env::var_os("PRIM_UI_VOICE_TEST").is_some()
+                || std::env::var_os("PRIM_SESSION_VOICE_TEST").is_some(),
+            last: Instant::now() - Duration::from_secs(10),
         }
-    }
-
-    fn args(&self, takeover: bool) -> Vec<String> {
-        let mut a = vec![
-            "voice".to_string(),
-            format!("--rt-socket={}", rt_socket_path(&self.socket).display()),
-        ];
-        let capture = match (self.mic, self.test) {
-            (false, _) => "none",
-            (true, true) => "tone:auto",
-            (true, false) => "device",
-        };
-        let output = if self.deaf || self.test { "null" } else { "device" };
-        a.push(format!("--levels={}", voice_levels_path(&self.socket).display()));
-        a.push(format!("--capture={capture}"));
-        a.push(format!("--output={output}"));
-        if takeover {
-            a.push("--takeover".into());
-        }
-        a
     }
 
     /// Tone microphone and null speakers instead of real devices.
@@ -380,39 +272,50 @@ impl Voice {
         self.test
     }
 
-    pub fn start(&mut self, takeover: bool) {
-        let args = self.args(takeover);
-        if let Err(e) = self.sup.start(&args) {
-            self.sup.state = ProcState::Failed(e.to_string());
+    fn ask(&mut self, req: SessionRequest) {
+        let sc = SessionClient::new(&self.socket);
+        match sc.ensure_running(&self.socket).and_then(|_| sc.call(&req)) {
+            Ok(st) => self.apply(&st),
+            Err(e) => self.sup.state = ProcState::Failed(e.to_string()),
         }
+    }
+
+    fn apply(&mut self, st: &prim_client::session::SessionStatus) {
+        let v = &st.voice;
+        self.mic = v.mic;
+        self.deaf = v.deaf;
+        self.sup.running = v.running;
+        self.sup.state = match v.state.as_str() {
+            "running" => ProcState::Running,
+            "restarting" => ProcState::Restarting(v.detail.clone()),
+            "busy" => ProcState::Busy,
+            "failed" => ProcState::Failed(v.detail.clone()),
+            _ => ProcState::Off,
+        };
+    }
+
+    /// Turn voice on (muted, hearing). `takeover`: the session replaces another program's.
+    pub fn start(&mut self, _takeover: bool) {
+        self.ask(SessionRequest::Voice { on: true });
     }
 
     pub fn stop(&mut self) {
-        self.sup.stop();
-        // Next time voice is turned on it starts muted and hearing, as documented.
-        self.mic = false;
-        self.deaf = false;
-        // A voice client from an earlier window.
-        for p in find_procs("voice", "rt-socket", &self.socket) {
-            terminate(p);
-        }
+        self.ask(SessionRequest::Voice { on: false });
     }
 
-    /// Mic or deafen changed: voice has no runtime control, so replace the client.
-    /// The new one takes the lease over; the old one is told so by the daemon.
     pub fn restart_with(&mut self, mic: bool, deaf: bool) {
-        self.mic = mic;
-        self.deaf = deaf;
-        for p in find_procs("voice", "rt-socket", &self.socket) {
-            terminate(p);
-        }
-        self.sup.stop();
-        self.start(true);
+        self.ask(SessionRequest::SetMic { on: mic });
+        self.ask(SessionRequest::SetDeafen { on: deaf });
     }
 
+    /// Refresh from the session about twice a second.
     pub fn tick(&mut self) {
-        if self.sup.poll(true) {
-            self.start(true);
+        if self.last.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last = Instant::now();
+        if let Ok(st) = SessionClient::new(&self.socket).status() {
+            self.apply(&st);
         }
     }
 }

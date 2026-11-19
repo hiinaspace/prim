@@ -85,6 +85,8 @@ pub enum Request {
     },
     /// The voice client's last reported state.
     VoiceStatus { req: u64 },
+    /// Stop the daemon (it replies Ok, saves state and exits).
+    Shutdown { req: u64 },
     Drain {
         sub: u32,
         #[serde(default = "default_drain_max")]
@@ -102,7 +104,7 @@ pub enum ReplyJson {
     Ok,
     Error { code: String },
     Sending { msg_id: u64, targets: Vec<String> },
-    /// Status is surfaced as raw JSON: its shape is the daemon's to grow.
+    /// Raw JSON, so older callers keep indexing it; [`StatusJson::from_value`] types it.
     Status { status: serde_json::Value },
     Invite { token: String },
     Voice { voice: VoiceStatus },
@@ -219,4 +221,100 @@ pub fn read_raw<R: Read>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut body = vec![0u8; n];
     r.read_exact(&mut body)?;
     Ok(Some(body))
+}
+
+// ---- typed status -------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MemberJson {
+    pub key: String,
+    pub keyholder: bool,
+    pub inviter: bool,
+    pub connected: bool,
+    pub online: bool,
+    pub since_ms: Option<u64>,
+    pub fresh: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct CoordinatorJson {
+    pub generation: u32,
+    pub term: u32,
+    pub holder: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RouteJson {
+    pub peer: String,
+    pub conn: u64,
+    pub outbound: bool,
+    pub path: String,
+    pub max_datagram_size: Option<usize>,
+    pub rtt_ms: Option<u64>,
+    pub datagrams_sent: u64,
+    pub datagrams_dropped_age: u64,
+    pub datagrams_dropped_queue: u64,
+    pub datagrams_dropped_transport: u64,
+    pub datagrams_too_large: u64,
+    pub datagrams_dropped_in: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct HolderJson {
+    pub role: String,
+    pub session: u64,
+    pub incarnation: u32,
+}
+
+/// The realtime lane's summary. `drops` and the histograms stay raw JSON.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct RtJson {
+    #[serde(default)]
+    pub holders: Vec<HolderJson>,
+    #[serde(default)]
+    pub queue_depth: usize,
+    #[serde(default)]
+    pub sent: u64,
+    #[serde(default)]
+    pub received: u64,
+    #[serde(default)]
+    pub stalls: u64,
+    #[serde(default)]
+    pub drops: serde_json::Value,
+}
+
+impl StatusJson {
+    pub fn from_value(v: &serde_json::Value) -> Option<StatusJson> {
+        serde_json::from_value(v.clone()).ok()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct StatusJson {
+    /// "none", "pending" (dialing the inviter) or "refused" (see `join_refused`).
+    #[serde(default)]
+    pub join: String,
+    /// `not_member`, `invite_invalid`, `closed`, `revoked`, `wrong_room`, `version`, `unsupported`.
+    #[serde(default)]
+    pub join_refused: Option<String>,
+    /// The room's name (`found --meta`), when it is text.
+    #[serde(default)]
+    pub name: Option<String>,
+    pub room: Option<String>,
+    pub me: String,
+    /// "dead", "open" or "closed".
+    pub lifecycle: String,
+    pub generation: Option<u32>,
+    pub coordinator: Option<CoordinatorJson>,
+    pub members: Vec<MemberJson>,
+    #[serde(default)]
+    pub records: usize,
+    #[serde(default)]
+    pub durable_bytes_room: usize,
+    #[serde(default)]
+    pub durable_bytes_mine: usize,
+    #[serde(default)]
+    pub routes: Vec<RouteJson>,
+    #[serde(default)]
+    pub rt: Option<RtJson>,
 }

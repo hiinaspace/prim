@@ -367,8 +367,24 @@ pub struct MemberInfo {
     pub fresh: bool,
 }
 
+/// Progress of joining a room with an invite token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JoinState {
+    /// Not joining: founded, resumed, or already admitted.
+    None,
+    /// Dialing the inviter(s); nobody has answered with the room yet.
+    Pending,
+    /// A peer said no. The string names why: `not_member`, `invite_invalid`, `closed`,
+    /// `revoked`, `wrong_room`, `version` or `unsupported`.
+    Refused(&'static str),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Status {
+    /// Where an invite redemption stands. `None` unless this node was started by joining.
+    pub join: JoinState,
+    /// The room's name: the genesis metadata, when it is UTF-8 text (`found --meta`).
+    pub name: Option<String>,
     pub room: Option<RoomId>,
     pub me: Key,
     pub lifecycle: crate::grants::Lifecycle,

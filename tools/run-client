@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Run the Godot desktop client against a Prim session (round A1).
+#
+#   tools/run-client [--build] [-- godot args after --]
+#
+# The client does not own the room: it starts `prim session` if none runs, or adopts the
+# one that does. Close it and the session, the room and your voice keep going; reopen it
+# and you are the same person in the same room. `prim ctl session quit` ends it all.
+#
+# What this does, so you do not have to remember it:
+#   1. finds the engine: $PRIM_GODOT, <repo>/.local/godot/bin/godot, ~/code/prim-gw/.local/godot/bin/godot, `godot`
+#   2. stages target/debug/libprim_native.so into client/bin/linux/ (and `prim` is found via PRIM_BIN)
+#   3. off NixOS only: points Vulkan at the Mesa radeon ICD (VK_DRIVER_FILES) and turns the
+#      implicit layers off, which is what the iGPU desktop needs; NixOS needs neither
+#   4. starts the client with --desktop (use --xr to try VR instead)
+# GPU work stays short on purpose: the iGPU also drives the desktop (long compute
+# submissions reset the ring), so this never adds headless render loops or capture.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+
+build=0 xr=0
+godot_args=()
+while (( $# )); do
+    case $1 in
+        --build) build=1 ;;
+        --xr) xr=1 ;;
+        --help|-h) sed -n '2,19p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --) shift; godot_args+=("$@"); break ;;
+        *) godot_args+=("$1") ;;
+    esac
+    shift
+done
+
+# 1. engine
+godot=${PRIM_GODOT:-}
+if [[ -z $godot || ! -x $godot ]]; then
+    godot=
+    for c in "$root/.local/godot/bin/godot" "$HOME/code/prim-gw/.local/godot/bin/godot" "$(command -v godot || true)"; do
+        if [[ -n $c && -x $c ]]; then godot=$c; break; fi
+    done
+fi
+[[ -n $godot ]] || { echo "run-client: no Godot engine found (set PRIM_GODOT, or build .local/godot with build.sh)" >&2; exit 1; }
+
+# 2. native library and the `prim` binary the session spawns
+if (( build )) || [[ ! -f target/debug/libprim_native.so || ! -x target/debug/prim ]]; then
+    if [[ ${PRIM_LOCAL_DEV_SHELL:-} != 1 ]] && command -v nix >/dev/null; then
+        nix develop "$root" --command cargo build -p prim -p prim_native
+    else
+        cargo build -p prim -p prim_native
+    fi
+fi
+mkdir -p client/bin/linux
+cp -f target/debug/libprim_native.so client/bin/linux/libprim_native.so
+export PRIM_BIN=${PRIM_BIN:-$root/target/debug/prim}
+
+# A fresh checkout has no .godot/ (class cache, extension list): import once, headless.
+if [[ ! -f client/.godot/extension_list.cfg ]]; then
+    "$godot" --headless --path client --import >/dev/null 2>&1 || true
+fi
+
+# 3. Vulkan: only when not on NixOS
+if ! grep -qs '^ID=nixos' /etc/os-release; then
+    mesa=${PRIM_MESA:-$root/.local/mesa}
+    [[ -d $mesa ]] || mesa=$HOME/code/prim-gw/.local/mesa
+    icd=$mesa/share/vulkan/icd.d/radeon_icd.x86_64.json
+    if [[ -f $icd ]]; then
+        export VK_DRIVER_FILES=$icd
+        export VK_LOADER_LAYERS_DISABLE='~implicit~'
+    else
+        echo "run-client: Mesa ICD not found at $icd; using the system Vulkan driver" >&2
+    fi
+fi
+
+# 4. go
+if [[ -z ${DISPLAY:-} && -z ${WAYLAND_DISPLAY:-} && -S /tmp/.X11-unix/X0 ]]; then export DISPLAY=:0; fi
+mode=(--desktop)
+(( xr )) && mode=()
+exec "$godot" --path client -- "${mode[@]}" "${godot_args[@]}"

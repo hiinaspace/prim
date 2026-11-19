@@ -231,3 +231,58 @@ async fn resume_keeps_room_and_bumps_incarnation() {
     b.daemon.shutdown().await;
     let _ = Duration::from_secs(0);
 }
+
+/// Round A1's local-API completions: the room's readable name, a join that has not been
+/// answered or was refused (the front end used to guess from a 45 s timer), and the
+/// `shutdown` request that replaces killing the daemon from outside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn name_join_state_and_shutdown() {
+    let fleet = Fleet::mem();
+    let mut a = fleet
+        .start("a", Start::Found { meta: b"  Friday night  ".to_vec() })
+        .await;
+    let s = a.status().await;
+    assert_eq!(s.name.as_deref(), Some("Friday night"), "name is the trimmed founding meta");
+    assert_eq!(s.join, "none");
+    assert!(s.join_refused.is_none());
+
+    let first = a.invite().await;
+    let mut b = fleet.start("b", Start::Join(first.clone())).await;
+    eventually!(15, "b joined", members_connected(&mut b, 2).await);
+    let sb = b.status().await;
+    assert_eq!(sb.name.as_deref(), Some("Friday night"), "a joiner reads the same name");
+    assert_eq!(sb.join, "none");
+
+    // The same one-time invite again is refused, and the status says so.
+    let mut c = fleet.start("c", Start::Join(first)).await;
+    eventually!(15, "reuse refused", {
+        let s = c.status().await;
+        s.join == "refused" && s.join_refused.is_some()
+    });
+    let sc = c.status().await;
+    assert!(sc.room.is_none() || sc.lifecycle != "open", "refused join is not in the room: {sc:?}");
+
+    // An invite whose inviter (alone in its room) has gone away stays pending: nobody
+    // answered, nobody refused.
+    let mut x = fleet.start("x", Start::Found { meta: b"gone".to_vec() }).await;
+    let second = x.invite().await;
+    x.daemon.shutdown().await;
+    drop(x.client);
+    let mut d = fleet.start("d", Start::Join(second)).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let sd = d.status().await;
+    assert_eq!(sd.join, "pending", "{sd:?}");
+    assert!(sd.join_refused.is_none());
+
+    // Shutdown over the socket makes the daemon's quit signal fire (what `prim room` waits on).
+    let quit = d.daemon.quit.clone();
+    d.ok(|req| Request::Shutdown { req }).await;
+    tokio::time::timeout(Duration::from_secs(5), quit.notified())
+        .await
+        .expect("shutdown request did not fire the quit signal");
+
+    c.daemon.shutdown().await;
+    b.daemon.shutdown().await;
+    a.daemon.shutdown().await;
+    d.daemon.shutdown().await;
+}

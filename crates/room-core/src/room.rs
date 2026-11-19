@@ -12,7 +12,7 @@ use crate::frame::{
 };
 use crate::grants::{AdmitError, Epoch, GrantSet, InsertError, Lifecycle};
 use crate::ids::{Entropy, Identity, Key, Now, RecordId, RoomId};
-use crate::record::{build, Kind, Record};
+use crate::record::{build, Body, Kind, Record};
 use crate::state::{is_presence, Insert, PresView, Slot, Store, Vis};
 use crate::staterec::{
     valid_name, Class, Lifetime, Presence, Scope, StateRecord, Version, DURABLE_VALUE_CAP,
@@ -184,6 +184,8 @@ pub struct Room {
     room: RoomId,
     grants: Option<GrantSet>,
     joining: Option<Joining>,
+    /// A peer rejected our redemption (reason name); cleared never: the token is spent.
+    join_refused: Option<&'static str>,
     out: VecDeque<Output>,
     conns: BTreeMap<ConnId, Conn>,
     by_peer: BTreeMap<Key, ConnId>,
@@ -242,6 +244,20 @@ fn cmd_req(cmd: &LocalCommand) -> Option<ReqId> {
     }
 }
 
+/// Reasons a peer gives when it turns down a join, as the names the local API reports.
+fn refusal_name(r: Reason) -> Option<&'static str> {
+    Some(match r {
+        Reason::NotMember => "not_member",
+        Reason::InviteInvalid => "invite_invalid",
+        Reason::Closed => "closed",
+        Reason::Revoked => "revoked",
+        Reason::WrongRoom => "wrong_room",
+        Reason::Version => "version",
+        Reason::Unsupported => "unsupported",
+        _ => return None,
+    })
+}
+
 fn admit_reason(e: AdmitError) -> Reason {
     match e {
         AdmitError::NotMember | AdmitError::Expired => Reason::NotMember,
@@ -279,6 +295,7 @@ impl Room {
             room,
             grants: None,
             joining: None,
+            join_refused: None,
             out: VecDeque::new(),
             conns: BTreeMap::new(),
             by_peer: BTreeMap::new(),
@@ -545,6 +562,8 @@ impl Room {
     pub fn status(&self, now: Now) -> Status {
         let Some(g) = &self.grants else {
             return Status {
+                join: self.join_state(),
+                name: None,
                 room: None,
                 me: self.my_key,
                 lifecycle: Lifecycle::Dead,
@@ -573,6 +592,15 @@ impl Room {
             })
             .collect();
         Status {
+            join: JoinState::None,
+            name: match &g.genesis().body {
+                Body::Genesis { meta, .. } => std::str::from_utf8(meta)
+                    .ok()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_string),
+                _ => None,
+            },
             room: Some(self.room),
             me: self.my_key,
             lifecycle: g.lifecycle(),
@@ -581,6 +609,14 @@ impl Room {
             records: g.len(),
             durable_bytes_room: self.store.usage(Scope::Room, Key::ZERO).bytes,
             durable_bytes_mine: self.store.usage(Scope::Member, self.my_key).bytes,
+        }
+    }
+
+    fn join_state(&self) -> JoinState {
+        match (&self.grants, &self.joining, self.join_refused) {
+            (None, Some(_), Some(why)) => JoinState::Refused(why),
+            (None, Some(_), None) => JoinState::Pending,
+            _ => JoinState::None,
         }
     }
 
@@ -1009,7 +1045,10 @@ impl Room {
         };
         match frame {
             Frame::Hello(hello) => self.on_hello(conn, hello),
-            Frame::Reject { .. } => {
+            Frame::Reject { reason, .. } => {
+                if self.grants.is_none() && self.joining.is_some() {
+                    self.join_refused = refusal_name(reason).or(self.join_refused);
+                }
                 self.close_conn(conn, Reason::Shutdown);
             }
             Frame::Goodbye { .. } => {
@@ -1225,6 +1264,7 @@ impl Room {
         }
         if !g.is_member(&self.my_key) {
             // The peer that sent this did not admit us.
+            self.join_refused = Some("not_member");
             return self.close_conn(conn, Reason::NotMember);
         }
         self.grants = Some(g);

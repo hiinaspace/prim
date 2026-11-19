@@ -271,9 +271,7 @@ impl App {
         }
         if !self.adopted && self.handle.as_ref().is_some_and(|h| h.lock().in_room()) {
             self.adopted = true;
-            if !self.voice.sup.running() && !supervise::find_procs("voice", "rt-socket", &self.socket).is_empty() {
-                self.voice.restart_with(false, false);
-            }
+            // A voice client the session already runs shows up through `voice.tick()`.
         }
         if self.handle.as_ref().is_some_and(|h| h.lock().in_room()) {
             if let Some(d) = self.demo.take() {
@@ -423,7 +421,7 @@ pub(crate) struct Snapshot {
     pub(crate) am_keyholder: bool,
     pub(crate) chat: Vec<client::ChatLine>,
     pub(crate) names: std::collections::BTreeMap<String, String>,
-    pub(crate) status: Option<prim_room::local::StatusJson>,
+    pub(crate) status: Option<prim_client::wire::StatusJson>,
     pub(crate) keys: Vec<(String, client::KeyEntry)>,
     pub(crate) notice: Option<String>,
     pub(crate) removed: bool,

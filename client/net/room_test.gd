@@ -3,6 +3,10 @@ extends Node
 ## own daemon, started and driven through the same buttons a person uses.
 ##   attach   (tools/test-room-attach.py) a room that `prim ui` already started: attach, keep
 ##            the name `prim ui` gave this member, mint an invite, see a joiner, rename
+##   reattach1 / reattach2 (tools/test-session-survive.py) round A1's property: the first
+##            hosts, names itself, unmutes and is then killed with SIGKILL by the driver; the
+##            second starts later against the same session and must be the same member with
+##            the same name and mute state, without voice restarting
 ##   host     hosts, names itself, mints invites, sees the guest, then revokes it
 ##   guest    pastes the host's invite, must be in the room and see the host's name
 ##   forged   a token with one character changed: must be refused
@@ -21,6 +25,8 @@ var dir := ""
 var role := ""
 var checks: Array = []
 var fault := OS.get_environment("ROOM_TEST_FAULT")
+# Roles that started their own session and end it; attach/reattach leave it to the driver.
+const ROLES_THAT_OWN_SESSION := ["host", "guest", "forged", "forgedsig", "replay", "expired"]
 
 
 func run(main, r: String, d: String) -> void:
@@ -77,6 +83,9 @@ func _read(name: String, secs: float) -> Dictionary:
 func _go() -> void:
 	match role:
 		"attach": await _attach()
+		"reattach1": await _reattach1()
+		"reattach2": await _reattach2()
+		"closer": await _closer()
 		"host": await _host()
 		"guest": await _guest()
 		"forged", "forgedsig", "replay", "expired": await _intruder()
@@ -91,8 +100,8 @@ func _set_name_and_wait(n: String) -> void:
 
 func _attach() -> void:
 	var ok: bool = await _wait(func(): return session.phase == "in_room" and session.me != "", 30.0)
-	_check("attach: found the running room without hosting or joining", ok and session.attached and session.daemon_pid < 0,
-		{"phase": session.phase, "attached": session.attached})
+	_check("attach: found the running room without hosting or joining", ok and session.starting_kind == "" and session.daemon_pid < 0,
+		{"phase": session.phase, "hosted_or_joined_here": session.starting_kind})
 	await _wait(func(): return session.display_name() != "", 10.0)
 	var want := OS.get_environment("ROOM_TEST_EXPECT_NAME")
 	_check("attach: shows the name prim ui gave this member (not overwritten by --name)",
@@ -107,6 +116,55 @@ func _attach() -> void:
 	menu.name_button.pressed.emit()
 	await _wait(func(): return session.display_name() == "Gody", 10.0)
 	_check("attach: rename writes member/<id>/profile", session.display_name() == "Gody")
+
+
+func _reattach1() -> void:
+	await _wait(func(): return session.phase == "choose", 20.0)
+	menu.name_edit.text = "Survivor"
+	menu.host_button.pressed.emit()
+	var ok: bool = await _wait(func(): return session.phase == "in_room" and session.me != "", 40.0)
+	_check("reattach1: founded a room", ok, {"phase": session.phase})
+	await _set_name_and_wait("Survivor")
+	await _wait(func(): return session.voice.get("running", false), 30.0)
+	session.set_mic(true)
+	var mic: bool = await _wait(func(): return session.voice.get("mic", false) and session.voice.get("running", false), 30.0)
+	_check("reattach1: voice running with the mic on", mic, session.voice)
+	menu.invite_button.pressed.emit()
+	await _wait(func(): return menu.invite_edit.text.begins_with("prim1"), 10.0)
+	_drop("reattach1.json", {"key": session.me, "token": menu.invite_edit.text, "name": session.display_name(),
+		"voice": session.voice})
+	# The driver kills this process with SIGKILL; nothing after this line runs.
+	await get_tree().create_timer(600.0).timeout
+
+
+func _reattach2() -> void:
+	var ok: bool = await _wait(func(): return session.phase == "in_room" and session.me != "" and session.display_name() != "", 20.0)
+	_check("reattach2: back in the room without choosing anything", ok, {"phase": session.phase})
+	await _wait(func(): return not session.voice.is_empty(), 10.0)
+	var want_me := OS.get_environment("ROOM_TEST_EXPECT_ME")
+	var want_name := OS.get_environment("ROOM_TEST_EXPECT_NAME")
+	if fault == "restart-on-attach":
+		# What a client that re-applied its own state on startup would do.
+		session.set_deafen(true)
+		await get_tree().create_timer(1.0).timeout
+		session.set_deafen(false)
+		await get_tree().create_timer(3.0).timeout
+	await get_tree().create_timer(2.0).timeout # let a session status poll land
+	_check("reattach2: same member id", session.me == want_me and want_me != "", {"me": session.me, "want": want_me})
+	_check("reattach2: same display name", session.display_name() == want_name and want_name != "", {"name": session.display_name()})
+	_check("reattach2: mic still on", session.voice.get("mic", false) and session.voice.get("running", false), session.voice)
+	_check("reattach2: talking to the running session", session.session_ready, {})
+	_drop("reattach2.json", {"key": session.me, "name": session.display_name(), "voice": session.voice,
+		"members": session.members.size()})
+
+
+## Window-close request, as the X button sends it (tools/test-session-survive.py).
+func _closer() -> void:
+	await _wait(func(): return session.phase == "in_room" and not session.voice.is_empty(), 20.0)
+	await get_tree().create_timer(1.5).timeout # a session status poll with tray_live
+	_drop("closer.json", {"tray_live": session.tray_live})
+	session.on_close_request()
+	await get_tree().create_timer(30.0).timeout
 
 
 func _host() -> void:
@@ -126,7 +184,7 @@ func _host() -> void:
 	_check("host: invite minted and shown", tok.begins_with("prim1"), {"len": tok.length()})
 	# A short-lived invite: the 'expired' role uses it after it has lapsed.
 	var short_tok := ""
-	session._invite_req = session.client.create_invite(1500)
+	session.make_invite(1500)
 	await _wait(func(): return session.invite != tok and session.invite != "", 10.0)
 	short_tok = session.invite
 	_drop("host.json", {"key": session.me, "token": tok, "short_token": short_tok,
@@ -218,5 +276,7 @@ func _finish() -> void:
 	f.store_string(JSON.stringify({"role": role, "checks": checks, "failures": failures,
 		"me": session.me, "phase": session.phase}, "  "))
 	f.close()
-	session.stop_daemon()
-	get_tree().quit(1 if failures else 0)
+	if role in ROLES_THAT_OWN_SESSION:
+		session.quit_session(func(_d): get_tree().quit(1 if failures else 0))
+	else:
+		get_tree().quit(1 if failures else 0)

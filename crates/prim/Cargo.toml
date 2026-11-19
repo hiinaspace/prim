@@ -17,7 +17,9 @@ ui = ["prim-ui/gui"]
 
 [dependencies]
 anyhow = "1"
+prim-client = { path = "../prim-client" }
 prim-room = { path = "../prim-room" }
+prim-session = { path = "../prim-session" }
 prim-ui = { path = "../prim-ui", default-features = false }
 prim-voice = { path = "../prim-voice" }
 prim-watch = { path = "../prim-watch" }

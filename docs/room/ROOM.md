@@ -218,6 +218,28 @@ every subscription gets `Reset`, then the snapshot.
 receive age is `arrival_ms − send_ms` minus the per-peer minimum of that
 delta. The sender passes `max_age` through to the driver.
 
+## Local API additions (round A1)
+
+Additive; nothing in CONTRACTS.md sections 4-6 changes. Same framing as the rest of the
+local API (`u32 LE length || JSON`, requests carry `req`).
+
+- **`{"op":"shutdown","req":N}`**: replies `ok`, then the daemon saves state and exits
+  as if it had received SIGTERM (`prim room` waits on it). The supervisor and
+  `prim ctl shutdown` use this instead of finding the process in `/proc`.
+- **`status.name`**: the room's readable name, the founding `--meta` as trimmed UTF-8
+  (`null` when empty or not text). Joiners read it from the genesis record, so they see the
+  same name once admitted.
+- **`status.join`**: `"none"` (not joining, or already admitted), `"pending"` (we dialled with an
+  invite and nobody has answered) or `"refused"` with **`status.join_refused`** set to a
+  short reason (`not_member`, `invite_invalid`, `closed`, `revoked`, `wrong_room`,
+  `version`, `unsupported`), taken from the peer's `reject` frame. A join nobody answers
+  stays `pending` for ever; giving up is the front end's call (`session cancel`).
+- **Typed status**: `prim_client::wire::StatusJson` mirrors the status object (members,
+  coordinator, routes, `rt.holders`, counters); `ReplyJson::Status` still carries the raw
+  JSON so older readers (`prim watch`) are unaffected.
+
+The session supervisor that uses these is described in [SESSION.md](SESSION.md).
+
 ## Simulator (`room_core::sim`)
 
 - A seeded N-node scheduler drives `Room`s through an in-memory network. Each

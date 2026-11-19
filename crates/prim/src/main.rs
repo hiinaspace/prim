@@ -4,6 +4,7 @@
 
 mod ctl;
 mod room;
+mod session;
 mod voice;
 mod watch;
 
@@ -15,7 +16,8 @@ fn usage() -> ExitCode {
          prim ctl [--socket PATH] <status|invite|grant|revoke|retire|close|reopen|leave|write|sub|send|listen> ...\n\
          prim voice [track] [options]\n       \
          prim watch [URL-or-file]   cowatch a video in mpv\n\
-         prim ui                    the room window\n\
+         prim session [--socket PATH] [--no-voice]   the supervisor: keeps the room daemon and voice running\n\
+         prim ui                    the room window (dev tool)\n\
          \n\
          run `prim room --help`, `prim ctl --help` or `prim voice --help` for the options"
     );
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
         "ctl" => rt.block_on(ctl::run(rest)),
         "voice" => voice::run(rest),
         "watch" => watch::run(rest),
+        "session" => session::run(rest),
         "ui" => run_ui(rest),
         _ => return usage(),
     };
