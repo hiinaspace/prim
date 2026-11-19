@@ -10,6 +10,24 @@ second daemon join with it, and renames itself. Needs `prim` built with the ui f
 import json, os, shutil, socket, subprocess, sys, time
 from pathlib import Path
 
+
+def kill_daemons_under(path):
+    """Stop `prim room` daemons this run started (they outlive their parent on purpose):
+    those whose command line mentions our private output directory."""
+    me = os.getpid()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == me:
+            continue
+        try:
+            cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if " room " in cmd and str(path) in cmd and "prim" in cmd.split(" room ")[0]:
+            try:
+                os.kill(int(d.name), 15)
+            except OSError:
+                pass
+
 ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/prim-room-attach")
 shutil.rmtree(OUT, ignore_errors=True)
@@ -66,6 +84,7 @@ finally:
             p.terminate()
             try: p.wait(5)
             except subprocess.TimeoutExpired: p.kill()
+kill_daemons_under(OUT)
 rp = OUT / "attach.report.json"
 bad = 1
 if rp.exists():

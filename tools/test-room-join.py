@@ -26,6 +26,24 @@ import sys
 import time
 from pathlib import Path
 
+
+def kill_daemons_under(path):
+    """Stop `prim room` daemons this run started (they outlive their parent on purpose):
+    those whose command line mentions our private output directory."""
+    me = os.getpid()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == me:
+            continue
+        try:
+            cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            continue
+        if " room " in cmd and str(path) in cmd and "prim" in cmd.split(" room ")[0]:
+            try:
+                os.kill(int(d.name), 15)
+            except OSError:
+                pass
+
 ROOT = Path(__file__).resolve().parents[1]
 ap = argparse.ArgumentParser()
 ap.add_argument("--fault", choices=["no-revoke", "valid-token"])
@@ -126,6 +144,7 @@ finally:
     for l in logs:
         l.close()
 
+kill_daemons_under(OUT)
 bad = 0
 for role in roles:
     rp = OUT / f"{role}.report.json"
