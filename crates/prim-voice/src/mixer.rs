@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::clock::mono_us;
 use crate::seats::local_direction;
-use crate::shared::{Shared, BLOCK, BLOCKS_AHEAD, SAMPLE_RATE};
+use crate::shared::{blocks_ahead, Shared, BLOCK, SAMPLE_RATE};
 use crate::tone::Goertzel;
 
 /// CIPIC subject 124 baked by prim-hrtf (attribution: crates/prim-voice/README.md).
@@ -350,8 +350,8 @@ pub fn spawn(sh: Arc<Shared>) -> std::thread::JoinHandle<()> {
         .name("voice-mixer".into())
         .spawn(move || {
             let mut m = Mixer::new();
-            let ahead = BLOCKS_AHEAD * BLOCK;
             while !sh.is_shutdown() {
+                let ahead = blocks_ahead(sh.out_burst.load(Ordering::Relaxed)) * BLOCK;
                 let fill = sh.out_ring.len() / 2;
                 if fill >= ahead {
                     std::thread::sleep(Duration::from_millis(1));
@@ -377,6 +377,21 @@ pub fn spawn(sh: Arc<Shared>) -> std::thread::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_depth_covers_the_devices_pull() {
+        use crate::shared::blocks_ahead as b;
+        assert_eq!(b(0), 2); // nothing seen yet
+        assert_eq!(b(256), 2);
+        assert_eq!(b(512), 2); // the default 512 quantum keeps R0's depth
+        assert_eq!(b(960), 3); // two blocks would leave no margin at all
+        assert_eq!(b(1024), 3); // quantum 1024: 1440 frames for a 1024 pull
+        assert_eq!(b(2048), 6);
+        assert_eq!(b(100_000), 8);
+        for burst in [512usize, 1024, 1536, 2048] {
+            assert!(b(burst) * BLOCK >= burst + BLOCK / 4 || b(burst) == 8, "{burst}");
+        }
+    }
 
     #[test]
     fn level_match_is_minus_4_7_db_on_top_of_the_distance_law() {

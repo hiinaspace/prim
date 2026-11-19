@@ -131,6 +131,8 @@ pub fn snapshot(sh: &Shared) -> Value {
             "peer_blocks_rendered": c("mixer_peer_blocks_rendered"),
             "peer_blocks_tail": c("mixer_peer_blocks_tail"),
             "peer_blocks_skipped": c("mixer_peer_blocks_skipped"),
+            "out_burst_frames": sh.out_burst.load(std::sync::atomic::Ordering::Relaxed),
+            "ring_ahead_frames": crate::shared::blocks_ahead(sh.out_burst.load(std::sync::atomic::Ordering::Relaxed)) * crate::shared::BLOCK,
         },
     });
     if sh.cfg.stats_tone {

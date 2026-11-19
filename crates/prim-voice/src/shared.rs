@@ -1,7 +1,7 @@
 //! State shared between the threads. Device callbacks touch only atomics and rings.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 use room_core::ids::Key;
@@ -20,6 +20,16 @@ pub const BLOCK: usize = 480;
 pub const SAMPLE_RATE: u32 = 48_000;
 /// The mixer keeps this many blocks ahead of the output.
 pub const BLOCKS_AHEAD: usize = 2;
+/// ...and never more than this many, whatever the device asks for.
+pub const BLOCKS_AHEAD_MAX: usize = 8;
+
+/// Blocks the mixer keeps rendered ahead of an output device that pulls `burst` frames at once.
+/// The ring must hold a whole pull, or the device gets a partial buffer and zeros: a 1024-frame
+/// quantum (two callbacks of 512 back to back, or one of 1024) underran every other pull with
+/// the fixed two blocks (960 frames).
+pub fn blocks_ahead(burst: usize) -> usize {
+    (burst * 5 / 4).div_ceil(BLOCK).clamp(BLOCKS_AHEAD, BLOCKS_AHEAD_MAX)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitReason {
@@ -189,6 +199,9 @@ pub struct Shared {
     pub gen: GenSync,
     /// The mixer has filled the output ring once; before that, shortfalls aren't underruns.
     pub primed: AtomicBool,
+    /// The most frames the output device has asked for in one burst (callbacks less than 2 ms
+    /// apart add up). The mixer keeps at least this much (plus a quarter) rendered ahead.
+    pub out_burst: AtomicUsize,
     pub last_send_us: AtomicU64,
 }
 

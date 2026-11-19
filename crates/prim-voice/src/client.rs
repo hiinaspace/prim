@@ -1,7 +1,7 @@
 //! The voice client: handshake, then the reader, encoder, capture, mixer, output,
 //! device-manager and stats threads.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,6 +73,7 @@ impl Client {
                 in_cb_us: AtomicU64::new(0),
             },
             primed: AtomicBool::new(false),
+            out_burst: AtomicUsize::new(0),
             last_send_us: AtomicU64::new(mono_us()),
             cfg,
         });
