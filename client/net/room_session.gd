@@ -12,7 +12,7 @@ signal changed
 
 const PROFILE_VERSION := 1
 const ATTACH_WAIT_S := 2.0
-const JOIN_TIMEOUT_S := 25.0
+const JOIN_TIMEOUT_S := 45.0
 
 var client: PrimClient
 var socket := ""

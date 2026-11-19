@@ -29,9 +29,13 @@ func setup(s) -> void:
 	session = s
 	layer = 10
 	panel = PanelContainer.new()
-	panel.position = Vector2(16, 16)
-	panel.custom_minimum_size = Vector2(440, 0)
 	add_child(panel)
+	# Top right: the loop's own roster label (room_view.gd) owns the top left.
+	panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	panel.offset_left = -456
+	panel.offset_right = -16
+	panel.offset_top = 16
+	panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
 	var root := VBoxContainer.new()
 	root.add_theme_constant_override("separation", 8)
 	panel.add_child(root)

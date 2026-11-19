@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""C1 oracle: five headless Godot clients, each with its own real `prim room` daemon.
+"""C1 oracle: six headless Godot clients, each with its own real `prim room` daemon.
 
 host     founds a room from the Godot screen, names itself, mints invites, revokes the guest
 guest    pastes the host's invite: must be in the room, see the host's name, and be removed
          when the host revokes it
 forged   a token with one character changed: must be refused
+forgedsig a well-formed token with a random ephemeral secret (tools/forge-token.py): refused
 replay   the guest's already-used token: must be refused
 expired  an invite used after its 1.5 s lifetime: must be refused
 
@@ -29,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ap = argparse.ArgumentParser()
 ap.add_argument("--fault", choices=["no-revoke", "valid-token"])
 ap.add_argument("--godot")
+ap.add_argument("--shots", help="DIR: run with a private headless weston and save screenshots here (uses the GPU: hold the shared GPU lock)")
 ap.add_argument("--no-build", action="store_true")
 ap.add_argument("--out", default=None)
 ap.add_argument("--timeout", type=int, default=200)
@@ -60,7 +62,25 @@ s.bind(("127.0.0.1", 0))
 port = s.getsockname()[1]
 s.close()
 
-roles = ["host", "guest", "forged", "replay", "expired"]
+weston = None
+if a.shots:
+    shots = Path(a.shots).resolve()
+    shots.mkdir(parents=True, exist_ok=True)
+    wl = OUT / "wl"
+    wl.mkdir()
+    wbin = os.environ.get("WESTON") or str(Path.home() / "code/xrprobe/.local/weston/bin/weston")
+    wenv = {k: v for k, v in os.environ.items() if k not in ("WAYLAND_DISPLAY", "DISPLAY")} | {"XDG_RUNTIME_DIR": str(wl)}
+    weston = subprocess.Popen([wbin, "--backend=headless", "--renderer=gl", "--socket=c1", "--width=1280",
+                               "--height=720", "--idle-time=0"], env=wenv, stdout=open(OUT / "weston.log", "w"),
+                              stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(100):
+        if (wl / "c1").exists():
+            break
+        time.sleep(0.1)
+    else:
+        sys.exit("headless weston did not start")
+
+roles = ["host", "guest", "forged", "forgedsig", "replay", "expired"]
 procs, logs = {}, []
 try:
     for role in roles:
@@ -81,7 +101,9 @@ try:
             env["ROOM_TEST_FAULT"] = a.fault
         log = open(OUT / f"{role}.log", "w")
         logs.append(log)
-        cmd = [godot, "--headless", "--path", str(ROOT / "client"), "--xr-mode", "off", "--",
+        if a.shots:
+            env.update(WAYLAND_DISPLAY=str(OUT / "wl/c1"), ROOM_TEST_SHOTS=str(shots))
+        cmd = [godot, *([] if a.shots else ["--headless"]), *(["--display-driver", "wayland"] if a.shots else []), "--path", str(ROOT / "client"), "--xr-mode", "off", "--",
                "--desktop", "--role", role, "--test-dir", str(OUT), "--socket", str(rd / "room.sock")]
         procs[role] = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     deadline = time.time() + a.timeout
@@ -92,6 +114,8 @@ try:
         except subprocess.TimeoutExpired:
             codes[role] = "timeout"
 finally:
+    if weston:
+        weston.terminate()
     for p in procs.values():
         if p.poll() is None:
             p.terminate()
