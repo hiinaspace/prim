@@ -119,6 +119,20 @@ pub struct Mixer {
     blocks_this_second: u32,
     seconds: u64,
     tail_blocks: u32,
+    /// Output gain of the deafen fade: 1 hearing, 0 deaf.
+    deaf_gain: f32,
+    deaf_flushed: bool,
+}
+
+/// Scale a stereo block by a gain that moves linearly from `g0` to `g1` across it (one
+/// block, 10 ms: the deafen and undeafen fade).
+pub fn apply_gain_ramp(left: &mut [f32], right: &mut [f32], g0: f32, g1: f32) {
+    let n = left.len();
+    for i in 0..n {
+        let g = g0 + (g1 - g0) * (i + 1) as f32 / n as f32;
+        left[i] *= g;
+        right[i] *= g;
+    }
 }
 
 impl Default for Mixer {
@@ -149,6 +163,8 @@ impl Mixer {
             blocks_this_second: 0,
             seconds: 0,
             tail_blocks,
+            deaf_gain: 1.0,
+            deaf_flushed: false,
         }
     }
 
@@ -156,6 +172,27 @@ impl Mixer {
     /// of the block (lock waits, pull/decode, HRTF, sum) go to the stats histograms.
     pub fn render_block(&mut self, sh: &Shared) -> &[f32] {
         let now = mono_us();
+        // The control version this block honours (read first, stored last).
+        let ctl_version = sh.ctl.version.load(Ordering::SeqCst);
+        let deaf_target = sh.ctl.deaf.load(Ordering::SeqCst);
+        let goal = if deaf_target { 0.0 } else { 1.0 };
+        let g0 = self.deaf_gain;
+        let g1 = goal;
+        // Fully deaf (and staying so): keep draining and pulling so the playout cursors stay
+        // current, but spend nothing on HRTF.
+        let skip_render = g0 == 0.0 && g1 == 0.0;
+        if skip_render && !self.deaf_flushed {
+            // Rendering stops here: forget every source's filter history once, so the first
+            // block after undeafening starts clean (the fade-in hides the restart).
+            for (i, s) in self.slots.iter().enumerate() {
+                if s.is_some() {
+                    self.renderer.reset_source(i);
+                }
+            }
+            self.deaf_flushed = true;
+        } else if !skip_render {
+            self.deaf_flushed = false;
+        }
         let (mut lock_ns, mut pull_ns, mut hrtf_ns) = (0u64, 0u64, 0u64);
         self.left.fill(0.0);
         self.right.fill(0.0);
@@ -266,6 +303,9 @@ impl Mixer {
             pull_ns += t_pull.elapsed().as_nanos() as u64;
             drop(p);
             hold_ns.push(t_hold.elapsed().as_micros() as u64);
+            if skip_render {
+                continue;
+            }
 
             let seat = timed(&sh.seats, &mut lock_ns).position(&key);
             let (dir, dist) = local_direction(lpos, lrot, seat);
@@ -284,6 +324,10 @@ impl Mixer {
         }
 
         let t_sum = Instant::now();
+        if g0 != 1.0 || g1 != 1.0 {
+            apply_gain_ramp(&mut self.left, &mut self.right, g0, g1);
+        }
+        self.deaf_gain = g1;
         for i in 0..BLOCK {
             self.inter[2 * i] = self.left[i];
             self.inter[2 * i + 1] = self.right[i];
@@ -304,6 +348,7 @@ impl Mixer {
         *g.counters.entry("mixer_peer_blocks_tail").or_insert(0) += tail;
         *g.counters.entry("mixer_peer_blocks_skipped").or_insert(0) += skipped;
         drop(g);
+        sh.ctl.mix_seen.store(ctl_version, Ordering::SeqCst);
         &self.inter
     }
 
@@ -384,6 +429,23 @@ pub fn spawn(sh: Arc<Shared>) -> std::thread::JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deafen_ramp_is_linear_over_one_block() {
+        let mut l = vec![1.0f32; BLOCK];
+        let mut r = vec![-0.5f32; BLOCK];
+        apply_gain_ramp(&mut l, &mut r, 1.0, 0.0);
+        assert!((l[0] - (1.0 - 1.0 / BLOCK as f32)).abs() < 1e-6);
+        assert_eq!(l[BLOCK - 1], 0.0, "silent at the block end");
+        assert!((r[BLOCK / 2 - 1] + 0.5 * 0.5).abs() < 2e-3);
+        let worst = l.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst <= 1.0 / BLOCK as f32 + 1e-6, "step {worst}");
+        // Back up the other way.
+        let mut l = vec![1.0f32; BLOCK];
+        let mut r = vec![1.0f32; BLOCK];
+        apply_gain_ramp(&mut l, &mut r, 0.0, 1.0);
+        assert!((l[BLOCK - 1] - 1.0).abs() < 1e-6 && l[0] < 0.01);
+    }
 
     #[test]
     fn ring_depth_covers_the_devices_pull() {

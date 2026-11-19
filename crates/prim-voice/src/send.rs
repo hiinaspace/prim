@@ -83,6 +83,142 @@ pub fn drain_encoder<F: FnMut(VoicePacket) -> bool>(
     true
 }
 
+/// Mutes the microphone between capture and encoder. Capture keeps running; samples are cut
+/// into 20 ms frames, and at each frame boundary the gate reads the target. Going muted fades
+/// the first frame out over 10 ms; once the gain is 0 the following frames are not encoded at
+/// all (`Gated::Muted`), so the encoder sends nothing and the caller keeps the packet clock
+/// moving. Going live fades the first frame in over 10 ms.
+pub struct MicGate {
+    frame: usize,
+    step: f32,
+    pub gain: f32,
+    buf: Vec<f32>,
+    out: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gated {
+    /// `MicGate::frame()` holds the frame to encode.
+    Frame,
+    /// A whole frame was dropped (gain 0 and the target is still off).
+    Muted,
+}
+
+impl MicGate {
+    pub fn new(rate: u32, gain: f32) -> MicGate {
+        let frame = (rate as usize / 50).max(1);
+        MicGate {
+            frame,
+            step: 1.0 / (rate as usize / 100).max(1) as f32,
+            gain,
+            buf: Vec::with_capacity(frame * 4),
+            out: Vec::with_capacity(frame),
+        }
+    }
+
+    pub fn push(&mut self, pcm: &[f32]) {
+        self.buf.extend_from_slice(pcm);
+    }
+
+    pub fn frame(&self) -> &[f32] {
+        &self.out
+    }
+
+    /// The next whole frame, judged against `live` as of now. `fade` false is the seeded
+    /// test fault: the gain jumps, which clicks.
+    pub fn next(&mut self, live: bool, fade: bool) -> Option<Gated> {
+        if self.buf.len() < self.frame {
+            return None;
+        }
+        self.out.clear();
+        self.out.extend(self.buf.drain(..self.frame));
+        if !live && self.gain <= 0.0 {
+            return Some(Gated::Muted);
+        }
+        if live && self.gain >= 1.0 {
+            return Some(Gated::Frame);
+        }
+        let goal = if live { 1.0 } else { 0.0 };
+        if !fade {
+            self.gain = goal;
+            if !live {
+                self.out.fill(0.0);
+            }
+            return Some(Gated::Frame);
+        }
+        for v in self.out.iter_mut() {
+            self.gain = if live {
+                (self.gain + self.step).min(1.0)
+            } else {
+                (self.gain - self.step).max(0.0)
+            };
+            *v *= self.gain;
+        }
+        Some(Gated::Frame)
+    }
+}
+
+/// Counts of what `feed_gated` did, for stats.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct GateCounts {
+    pub muted_frames: u64,
+    pub end_markers: u64,
+}
+
+/// Push `pcm` through the gate into the encoder, handing every packet to `emit`. A muted frame
+/// ends the talkspurt (once) and advances the media clock by one frame, so the first packet
+/// after unmuting carries a timestamp that counts the silence. Seq numbers do not move.
+/// `false` when `emit` said stop.
+#[allow(clippy::too_many_arguments)]
+pub fn feed_gated<F: FnMut(VoicePacket) -> bool>(
+    enc: &mut VoiceEncoder,
+    gate: &mut MicGate,
+    pcm: &[f32],
+    mut live: impl FnMut() -> bool,
+    fade: bool,
+    stats: Option<&crate::shared::Stats>,
+    counts: &mut GateCounts,
+    mut emit: F,
+) -> bool {
+    gate.push(pcm);
+    while let Some(g) = gate.next(live(), fade) {
+        match g {
+            Gated::Frame => {
+                enc.push_pcm(gate.frame());
+                let budget = poll_budget(gate.frame().len(), gate_rate(gate));
+                if !drain_encoder(enc, budget, stats, &mut emit) {
+                    return false;
+                }
+            }
+            Gated::Muted => {
+                counts.muted_frames += 1;
+                // Encode what is still queued (the tail of the fade, held back by the
+                // resampler at non-48 kHz capture) before the END marker.
+                let tail = enc.finish_talkspurt_flushed().unwrap_or_else(|_| {
+                    if let Some(st) = stats {
+                        st.bump("encode_errors");
+                    }
+                    enc.finish_talkspurt().into_iter().collect()
+                });
+                for p in tail {
+                    if p.payload.is_empty() {
+                        counts.end_markers += 1;
+                    }
+                    if !emit(p) {
+                        return false;
+                    }
+                }
+                enc.advance_dropped_frames(1);
+            }
+        }
+    }
+    true
+}
+
+fn gate_rate(g: &MicGate) -> u32 {
+    (g.frame * 50) as u32
+}
+
 /// Put one encoder packet through the test-only fault stage, then on the wire. `false`
 /// when the socket is closed and the loop must end.
 fn send_packet(sh: &Shared, fault: &mut FaultState, p: VoicePacket, sent: &mut u64) -> bool {
@@ -106,7 +242,11 @@ fn send_now(sh: &Shared, p: &VoicePacket, sent: &mut u64) -> bool {
     let env = envelope(p, sh.incarnation, *sent);
     let bytes = env.payload.len() as u64;
     let now = mono_us();
-    match sh.conn.send(&RtMsg::VoiceOut {
+    if !sh.link.is_up() {
+        sh.stats.bump("drop_no_link");
+        return true;
+    }
+    match sh.link.send(&RtMsg::VoiceOut {
         sent_mono_us: now,
         env,
     }) {
@@ -122,8 +262,16 @@ fn send_now(sh: &Shared, p: &VoicePacket, sent: &mut u64) -> bool {
             true
         }
         SendOutcome::Closed => {
-            sh.stop(crate::shared::ExitReason::SocketClosed);
-            false
+            if sh.cfg.rt_socket.is_some() {
+                // The reader reconnects; media sent meanwhile is dropped and counted.
+                // Link::send already marked the link down, if this was still the
+                // current connection.
+                sh.stats.bump("drop_no_link");
+                true
+            } else {
+                sh.stop(crate::shared::ExitReason::SocketClosed);
+                false
+            }
         }
     }
 }
@@ -149,7 +297,14 @@ fn encoder_loop(sh: &Shared) {
         reorder: sh.cfg.test_reorder,
     });
     let mut tmp = vec![0f32; 4096];
+    let mut gate: Option<MicGate> = None;
+    let mut gate_gain = if sh.ctl.mic_live.load(Ordering::SeqCst) { 1.0 } else { 0.0 };
+    let mut counts = GateCounts::default();
+    let fade = !sh.cfg.test_no_fade;
     while !sh.is_shutdown() {
+        // The control version this pass will honour: read before the frame boundaries it
+        // covers, so "seen" means "every frame from here on used the new target".
+        let ctl_version = sh.ctl.version.load(Ordering::SeqCst);
         let g = sh.gen.device_gen.load(Ordering::SeqCst);
         if g != my_gen {
             // Device change: drop the half-built frame and every stale mic sample, but
@@ -164,6 +319,9 @@ fn encoder_loop(sh: &Shared) {
                 }
                 pending = Some((e.packet_clock(), ended));
             }
+            if let Some(old) = gate.take() {
+                gate_gain = old.gain;
+            }
             sh.cap_ring.clear();
             my_gen = g;
             sh.gen.ack.store(g, Ordering::SeqCst);
@@ -171,6 +329,7 @@ fn encoder_loop(sh: &Shared) {
         }
         let n = sh.cap_ring.pop(&mut tmp);
         if n == 0 && enc.is_none() {
+            sh.ctl.enc_seen.store(ctl_version, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(2));
             continue;
         }
@@ -189,13 +348,29 @@ fn encoder_loop(sh: &Shared) {
         }
         let rate = sh.gen.capture_rate.load(Ordering::SeqCst).max(8000);
         let enc = enc.as_mut().unwrap();
-        if n > 0 {
-            enc.push_pcm(&tmp[..n]);
-        }
-        let ok = drain_encoder(enc, poll_budget(n, rate), Some(&sh.stats), |p| {
+        let gate = gate.get_or_insert_with(|| MicGate::new(rate, gate_gain));
+        let before = counts;
+        let ok = feed_gated(
+            enc,
+            gate,
+            &tmp[..n],
+            || sh.ctl.mic_live.load(Ordering::SeqCst),
+            fade,
+            Some(&sh.stats),
+            &mut counts,
+            |p| {
+                last_frame_end_us = mono_us();
+                send_packet(sh, &mut fault, p, &mut sent)
+            },
+        );
+        if counts.muted_frames > before.muted_frames {
             last_frame_end_us = mono_us();
-            send_packet(sh, &mut fault, p, &mut sent)
-        });
+            sh.stats.add("mic_muted_frames", counts.muted_frames - before.muted_frames);
+        }
+        if counts.end_markers > before.end_markers {
+            sh.stats.add("mic_end_markers", counts.end_markers - before.end_markers);
+        }
+        sh.ctl.enc_seen.store(ctl_version, Ordering::SeqCst);
         if !ok {
             return;
         }
@@ -305,6 +480,124 @@ mod tests {
         assert!(
             err <= 40 * 48,
             "first voiced packet {err} samples from real time"
+        );
+    }
+
+
+    fn tone_at(rate: u32, n: usize, start: usize) -> Vec<f32> {
+        (0..n)
+            .map(|k| 0.5 * (std::f32::consts::TAU * 440.0 * (start + k) as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    #[test]
+    fn mute_fades_over_ten_ms_then_drops_whole_frames() {
+        let mut g = MicGate::new(48_000, 1.0);
+        let pcm = vec![0.5f32; 960 * 3];
+        g.push(&pcm);
+        // First frame after the target goes off: faded to 0 across 480 samples, then zeros.
+        assert_eq!(g.next(false, true), Some(Gated::Frame));
+        let f = g.frame().to_vec();
+        assert!(f[0] > 0.49 && f[0] < 0.5, "starts at nearly full level: {}", f[0]);
+        assert_eq!(f[479], 0.0, "silent after exactly 10 ms");
+        assert!(f[480..].iter().all(|v| *v == 0.0));
+        let worst = f.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst <= 0.5 / 480.0 + 1e-6, "largest step {worst}");
+        // Then whole frames are dropped.
+        assert_eq!(g.next(false, true), Some(Gated::Muted));
+        assert_eq!(g.next(false, true), Some(Gated::Muted));
+        assert_eq!(g.next(false, true), None, "needs a full frame");
+        // Unmute: fades in over 10 ms and then passes through untouched.
+        g.push(&vec![0.5f32; 960 * 2]);
+        assert_eq!(g.next(true, true), Some(Gated::Frame));
+        let f = g.frame().to_vec();
+        assert!(f[0] < 0.01 && (f[479] - 0.5).abs() < 1e-6 && f[960 - 1] == 0.5);
+        assert_eq!(g.next(true, true), Some(Gated::Frame));
+        assert!(g.frame().iter().all(|v| *v == 0.5));
+    }
+
+    #[test]
+    fn without_the_fade_the_cut_is_a_step() {
+        let mut g = MicGate::new(48_000, 1.0);
+        g.push(&vec![0.5f32; 960]);
+        assert_eq!(g.next(false, false), Some(Gated::Frame));
+        assert!(g.frame().iter().all(|v| *v == 0.0), "hard cut at the frame start");
+    }
+
+    /// Voiced audio, a mute, voiced again: sequence numbers stay contiguous (the END marker
+    /// takes one), the timestamp counts the muted time, and the encoder is never rebuilt.
+    #[test]
+    fn the_packet_clock_runs_across_a_mute() {
+        packet_clock_across_mute(48_000);
+    }
+
+    #[test]
+    fn the_packet_clock_runs_across_a_mute_at_44k1() {
+        packet_clock_across_mute(44_100);
+    }
+
+    #[test]
+    fn the_packet_clock_runs_across_a_mute_at_16k() {
+        packet_clock_across_mute(16_000);
+    }
+
+    fn packet_clock_across_mute(rate: u32) {
+        let frame = (rate / 50) as usize;
+        let mut enc = VoiceEncoder::new(VoiceEncoderConfig {
+            input_sample_rate: rate,
+            enable_dtx: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut gate = MicGate::new(rate, 1.0);
+        let mut counts = GateCounts::default();
+        let mut pkts: Vec<VoicePacket> = Vec::new();
+        let mut pos = 0usize;
+        let mut feed = |live: bool, frames: usize, pos: &mut usize, pkts: &mut Vec<VoicePacket>| {
+            for _ in 0..frames {
+                let pcm = tone_at(rate, frame, *pos);
+                *pos += frame;
+                feed_gated(&mut enc, &mut gate, &pcm, || live, true, None, &mut counts, |p| {
+                    pkts.push(p);
+                    true
+                });
+            }
+        };
+        feed(true, 10, &mut pos, &mut pkts);
+        let live_before = pkts.len();
+        assert!(live_before >= 9);
+        feed(false, 25, &mut pos, &mut pkts);
+        feed(true, 10, &mut pos, &mut pkts);
+        // Contiguous sequence numbers all the way through.
+        for w in pkts.windows(2) {
+            assert_eq!(w[1].seq, w[0].seq.wrapping_add(1), "seq gap {:?} -> {:?}", w[0].seq, w[1].seq);
+        }
+        // Exactly one END, empty, right after the faded frame's packet.
+        let ends: Vec<usize> = pkts
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.payload.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(ends.len(), 1, "one END marker, got {ends:?}");
+        assert_eq!(counts.end_markers, 1);
+        // The faded frame is encoded, not discarded with the resampler's backlog: all
+        // 10 voiced frames plus the faded one are on the wire before the END.
+        let voiced_before_end = pkts[..ends[0]].iter().filter(|p| !p.payload.is_empty()).count();
+        assert_eq!(voiced_before_end, 11, "fade tail encoded at {rate} Hz");
+        // END carries the capture clock at that point (11 frames), not a slipped one.
+        assert_eq!(pkts[ends[0]].timestamp, 11 * 960, "END timestamp at {rate} Hz");
+        // 24 frames muted after the fade frame (25 fed, the first goes through faded).
+        assert_eq!(counts.muted_frames, 24);
+        // First packet after the mute is a new talkspurt whose timestamp skipped the gap:
+        // sent frames (10 + 1 faded) + 24 muted + n voiced = wall frames elapsed.
+        let first_after = &pkts[ends[0] + 1];
+        assert!(first_after.flags.bits() & PacketFlags::START_OF_TALKSPURT != 0);
+        let wall_frames = 10 + 25; // frames fed before the unmute
+        assert_eq!(
+            first_after.timestamp,
+            (wall_frames as u32) * 960,
+            "timestamp counts the muted time"
         );
     }
 

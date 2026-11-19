@@ -107,6 +107,14 @@ impl RtConn {
         }
     }
 
+    /// Half-close both directions so the peer sees the end and local senders fail.
+    pub fn shutdown(&self) {
+        // SAFETY: shutdown on an fd we own; errors (already closed) are irrelevant.
+        unsafe {
+            libc::shutdown(self.fd.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
+
     pub fn send(&self, m: &RtMsg) -> SendOutcome {
         let b = m.encode();
         // SAFETY: `b` is valid for `b.len()` bytes for the duration of the call.
@@ -270,5 +278,122 @@ pub fn handshake(
             },
             Err(e) => return Err(HandshakeError::Io(e)),
         }
+    }
+}
+
+/// The client's connection to the daemon, replaceable while the process runs: after a lost
+/// lease the reader connects again and swaps the new socket in. While the link is down,
+/// sends report `Full` (the caller counts a drop) and nothing is queued.
+pub struct Link {
+    /// The current connection and its generation. A send that fails on generation N may
+    /// only mark the link down while N is still current: an error on a stale socket
+    /// (a sender that took the old connection just before the swap) must not take down
+    /// the new one.
+    cur: std::sync::Mutex<(std::sync::Arc<RtConn>, u64)>,
+    up: std::sync::atomic::AtomicBool,
+}
+
+impl Link {
+    pub fn new(conn: RtConn) -> Link {
+        Link {
+            cur: std::sync::Mutex::new((std::sync::Arc::new(conn), 0)),
+            up: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    pub fn get(&self) -> std::sync::Arc<RtConn> {
+        self.cur.lock().unwrap().0.clone()
+    }
+
+    /// The current connection's generation (tests, stats).
+    pub fn generation(&self) -> u64 {
+        self.cur.lock().unwrap().1
+    }
+
+    /// Swap in a freshly handshaken connection and mark the link up. The old socket is shut
+    /// down so the daemon sees it close at once and any straggling sender fails fast.
+    pub fn replace(&self, conn: RtConn) {
+        let old = {
+            let mut g = self.cur.lock().unwrap();
+            let old = std::mem::replace(&mut g.0, std::sync::Arc::new(conn));
+            g.1 += 1;
+            old
+        };
+        old.shutdown();
+        self.set_up(true);
+    }
+
+    pub fn is_up(&self) -> bool {
+        self.up.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_up(&self, up: bool) {
+        self.up.store(up, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Mark the link down only if `gen` is still the current generation.
+    fn down_if_current(&self, gen: u64) {
+        let g = self.cur.lock().unwrap();
+        if g.1 == gen {
+            self.set_up(false);
+        }
+    }
+
+    /// Send on the current connection. A closed socket marks the link down (so the reader
+    /// reconnects), but only if it is still the connection that failed.
+    pub fn send(&self, m: &RtMsg) -> SendOutcome {
+        if !self.is_up() {
+            return SendOutcome::Full;
+        }
+        let (conn, gen) = {
+            let g = self.cur.lock().unwrap();
+            (g.0.clone(), g.1)
+        };
+        self.send_on(&conn, gen, m)
+    }
+
+    /// `send` on a connection obtained earlier (`snapshot`), as a slow sender holding the
+    /// pre-swap socket would.
+    pub fn snapshot(&self) -> (std::sync::Arc<RtConn>, u64) {
+        let g = self.cur.lock().unwrap();
+        (g.0.clone(), g.1)
+    }
+
+    pub fn send_on(&self, conn: &RtConn, gen: u64, m: &RtMsg) -> SendOutcome {
+        let r = conn.send(m);
+        if r == SendOutcome::Closed {
+            self.down_if_current(gen);
+        }
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sender that took the old socket just before the swap fails on it afterwards. That
+    /// failure belongs to the old connection: the new link stays up (otherwise the reader
+    /// would reconnect again and hit BUSY against its own live session).
+    #[test]
+    fn a_stale_send_error_does_not_take_down_the_new_link() {
+        let (a, _a_peer) = RtConn::pair().unwrap();
+        let (b, _b_peer) = RtConn::pair().unwrap();
+        let link = Link::new(a);
+        let (stale, gen) = link.snapshot();
+        link.replace(b);
+        assert_eq!(link.generation(), gen + 1);
+        assert_eq!(
+            link.send_on(&stale, gen, &RtMsg::Keepalive),
+            SendOutcome::Closed,
+            "the replaced socket was shut down"
+        );
+        assert!(link.is_up(), "stale failure must not mark the new link down");
+        assert_eq!(link.send(&RtMsg::Keepalive), SendOutcome::Sent);
+        // A failure on the current connection still does.
+        let (cur, g) = link.snapshot();
+        cur.shutdown();
+        assert_eq!(link.send_on(&cur, g, &RtMsg::Keepalive), SendOutcome::Closed);
+        assert!(!link.is_up());
     }
 }

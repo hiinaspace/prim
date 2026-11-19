@@ -72,6 +72,19 @@ pub enum Request {
     Close { req: u64 },
     Reopen { req: u64 },
     Leave { req: u64 },
+    /// Change the voice client's state and wait for its acknowledging report. `mic: true`
+    /// is a live microphone, `deaf: true` deafened; fields left out are unchanged.
+    VoiceControl {
+        req: u64,
+        #[serde(default)]
+        mic: Option<bool>,
+        #[serde(default)]
+        deaf: Option<bool>,
+        #[serde(default)]
+        tray_live: Option<bool>,
+    },
+    /// The voice client's last reported state.
+    VoiceStatus { req: u64 },
     Drain {
         sub: u32,
         #[serde(default = "default_drain_max")]
@@ -92,6 +105,26 @@ pub enum ReplyJson {
     /// Status is surfaced as raw JSON: its shape is the daemon's to grow.
     Status { status: serde_json::Value },
     Invite { token: String },
+    Voice { voice: VoiceStatus },
+}
+
+/// The voice client's own report (mirrors `prim_room::rt::VoiceStatusJson`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct VoiceStatus {
+    /// A voice client holds the lease; false: every other field but `tracking_held` is zero.
+    pub voice_running: bool,
+    pub session: u64,
+    /// What peers see in `member/<id>/voice`.
+    pub incarnation: u32,
+    /// Not deafened (wire flag bit0).
+    pub listening: bool,
+    /// The microphone is actually live (wire flag bit1).
+    pub mic: bool,
+    pub muted: bool,
+    pub deaf: bool,
+    pub tray_live: bool,
+    pub reported: bool,
+    pub tracking_held: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

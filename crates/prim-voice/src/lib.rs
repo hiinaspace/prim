@@ -10,6 +10,7 @@ pub mod capture;
 pub mod client;
 pub mod clock;
 pub mod config;
+pub mod control;
 pub mod device;
 pub mod hist;
 pub mod mixer;
@@ -40,7 +41,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 /// Exit codes: 0 normal, 1 failure, 2 usage, 3 lease refused (busy), 4 lease revoked,
-/// 5 the daemon went away.
+/// 5 the daemon went away. A lost lease (expiry, a closed socket) is retried inside the
+/// process with the same incarnation; 4 now means a takeover or a policy revoke.
 pub fn run(f: &dyn Flags) -> Result<ExitCode> {
     if f.has("help") {
         eprint!("{HELP}");
@@ -81,6 +83,11 @@ pub fn run(f: &dyn Flags) -> Result<ExitCode> {
                     rate_hz: rate,
                     sweep_deg_per_s: sweep,
                     takeover: f.has("takeover"),
+                    fixed_yaw_deg: f
+                        .value("yaw")
+                        .map(str::parse)
+                        .transpose()
+                        .context("--yaw")?,
                     duration,
                 },
             )?;
@@ -106,6 +113,7 @@ fn run_client(
     let mut cfg = Config::from_flags(f)?;
     let audio = audio::from_flags(f)?;
     cfg.audio = Some(audio.clone());
+    cfg.rt_socket = Some(socket.to_path_buf());
     let levels_stop = Arc::new(AtomicBool::new(false));
     audio::spawn_levels_writer(audio, f.value("levels").map(PathBuf::from), levels_stop.clone());
     let conn =
@@ -156,6 +164,10 @@ fn run_client(
         ExitReason::SocketClosed => {
             eprintln!("prim voice: the daemon closed the realtime socket");
             ExitCode::from(5)
+        }
+        ExitReason::Refused(r) => {
+            eprintln!("prim voice: lease refused while reconnecting (reason {r})");
+            ExitCode::from(3)
         }
     })
 }

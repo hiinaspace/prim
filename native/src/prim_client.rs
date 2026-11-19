@@ -302,6 +302,43 @@ impl PrimClient {
             .map_or(-1, |r| r as i64)
     }
 
+    /// Change the voice client's state without restarting it. `mic`: 1 live (unmute),
+    /// 0 muted, -1 unchanged; `deaf`: 1 deafened, 0 hearing, -1 unchanged; `tray_live`:
+    /// 1 / 0 / -1 (a lost tracking lease mutes the mic unless 1). The answer is a `reply`
+    /// whose data is `{"kind": "voice", "voice": {mic, muted, deaf, listening, tray_live,
+    /// incarnation, voice_running, ...}}`: what the voice process reported after applying
+    /// the change, or `{"kind": "error", "code": "voice_not_running" | "voice_reconnecting" | "voice_no_ack"}`.
+    /// Show that, not what you asked for. Returns the request id (-1: not connected).
+    #[func]
+    fn voice_control(&mut self, mic: i64, deaf: i64, tray_live: i64) -> i64 {
+        let tri = |v: i64| (v >= 0).then_some(v != 0);
+        self.client
+            .as_ref()
+            .and_then(|c| {
+                c.request(|req| prim_client::wire::Request::VoiceControl {
+                    req,
+                    mic: tri(mic),
+                    deaf: tri(deaf),
+                    tray_live: tri(tray_live),
+                })
+                .ok()
+            })
+            .map_or(-1, |r| r as i64)
+    }
+
+    /// Ask what the voice client is doing now (same `reply` shape as `voice_control`).
+    /// Call it after (re)connecting: voice keeps its state across Godot restarts.
+    #[func]
+    fn voice_status(&mut self) -> i64 {
+        self.client
+            .as_ref()
+            .and_then(|c| {
+                c.request(|req| prim_client::wire::Request::VoiceStatus { req })
+                    .ok()
+            })
+            .map_or(-1, |r| r as i64)
+    }
+
     fn emit_client_event(&mut self, e: ClientEvent) {
         let mut b = self.base_mut();
         match e {

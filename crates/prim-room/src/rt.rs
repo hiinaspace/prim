@@ -25,14 +25,16 @@ use std::time::Duration;
 use room_core::api::{ConnId, LocalCommand, LocalEvent, Update};
 use room_core::frame::{datagram_kind, dgram_kind, Datagram};
 use room_core::ids::Key;
-use room_core::rt::{peer_flags, refuse, revoke, Role, RtMsg, RT_MAX_MESSAGE, RT_PROTO};
+use room_core::rt::{
+    peer_flags, refuse, report_bits, revoke, Role, RtMsg, RT_MAX_MESSAGE, RT_PROTO,
+};
 use room_core::staterec::{Class, Lifetime, Scope};
 use room_core::voice::{
     voice_state, Fence, IncarnationFence, VoiceEnvelope, VoiceState, VOICE_KEY,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Instant;
 
 use crate::driver::{DgramQueue, DriverHandle};
@@ -54,6 +56,22 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOSE_GRACE: Duration = Duration::from_millis(200);
 const RESERVOIR: usize = 32768;
 const HEARTBEAT: Duration = Duration::from_millis(10);
+/// How long a control request waits for the voice client's acknowledging report.
+pub const VOICE_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+/// After a voice lease ends, controls fail `voice_reconnecting` for this long: long enough
+/// for the client's backoff and a BUSY retry, short enough that a voice that really exited
+/// reads as `voice_not_running`.
+pub const VOICE_RECONNECT_GRACE: Duration = Duration::from_secs(4);
+
+/// A request from outside the lane thread.
+enum LaneCmd {
+    Control {
+        mic: Option<bool>,
+        deaf: Option<bool>,
+        tray_live: Option<bool>,
+        reply: oneshot::Sender<Result<VoiceStatusJson, &'static str>>,
+    },
+}
 
 // ---- clock ------------------------------------------------------------------------
 
@@ -428,9 +446,40 @@ pub struct HolderJson {
     pub incarnation: u32,
 }
 
+/// What the daemon knows about the voice client: the last state the client itself reported
+/// (`SetState` + `VoiceReport`), never a guess from what was asked for. `prim ctl voice
+/// status`, the local API's `voice_status` and the PrimClient return this.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct VoiceStatusJson {
+    /// A voice client holds the `voice` lease. When false every other field but
+    /// `tracking_held` is zero/false.
+    pub voice_running: bool,
+    /// The lease session id (changes when the client reconnects).
+    pub session: u64,
+    /// The stream incarnation the client reported (what peers see in `member/<id>/voice`).
+    pub incarnation: u32,
+    /// `member/<id>/voice` bit0: not deafened, lease held.
+    pub listening: bool,
+    /// `member/<id>/voice` bit1: the microphone is actually live and sending.
+    pub mic: bool,
+    /// The user's mute state (`mic` is false when muted, but also without a capture source).
+    pub muted: bool,
+    pub deaf: bool,
+    /// A tracking-lease loss will not mute the mic.
+    pub tray_live: bool,
+    /// The client has sent a `VoiceReport` on this session (before it, `muted`/`deaf` are
+    /// derived from the wire flags and `tray_live` is false).
+    pub reported: bool,
+    /// A `tracking_source` lease is held.
+    pub tracking_held: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct RtJson {
     pub holders: Vec<HolderJson>,
+    /// The voice client's reported state (same as `voice_status`).
+    #[serde(default)]
+    pub voice: VoiceStatusJson,
     /// Messages waiting for the voice holder.
     pub queue_depth: usize,
     /// `VoiceOut` accepted from the voice holder.
@@ -509,6 +558,9 @@ struct Shared {
     /// Test hook: no per-sender token buckets (floods from tests exceed real rates).
     no_rate_limits: std::sync::atomic::AtomicBool,
     holders: Mutex<Vec<HolderJson>>,
+    voice_info: Mutex<VoiceStatusJson>,
+    lane_tx: mpsc::UnboundedSender<LaneCmd>,
+    lane_rx: Mutex<Option<mpsc::UnboundedReceiver<LaneCmd>>>,
     out_hop: Mutex<Hist>,
     in_queue: Mutex<Hist>,
     pose_hop: Mutex<Hist>,
@@ -532,6 +584,7 @@ impl RtShared {
     pub fn new(clock_offset_us: i64) -> RtShared {
         let (ingress_tx, ingress_rx) = mpsc::channel(INGRESS_CAP);
         let (view_tx, view_rx) = mpsc::unbounded_channel();
+        let (lane_tx, lane_rx) = mpsc::unbounded_channel();
         RtShared(Arc::new(Shared {
             view: RwLock::new(HashMap::new()),
             ingress_tx,
@@ -541,6 +594,9 @@ impl RtShared {
             counters: Counters::default(),
             no_rate_limits: Default::default(),
             holders: Mutex::new(Vec::new()),
+            voice_info: Mutex::new(VoiceStatusJson::default()),
+            lane_tx,
+            lane_rx: Mutex::new(Some(lane_rx)),
             out_hop: Mutex::new(Hist::new()),
             in_queue: Mutex::new(Hist::new()),
             pose_hop: Mutex::new(Hist::new()),
@@ -601,12 +657,47 @@ impl RtShared {
         self.0.no_rate_limits.store(true, Ordering::Relaxed);
     }
 
+    /// The voice client's last reported state (a copy; no trip through the lane).
+    pub fn voice_status(&self) -> VoiceStatusJson {
+        self.0.voice_info.lock().unwrap().clone()
+    }
+
+    /// Ask the voice client to change `mic` (`Some(true)` = live), `deaf` and `tray_live`,
+    /// and wait for its acknowledging report. Errors: `"voice_not_running"` (no lease
+    /// holder, or it went away while waiting) `"voice_reconnecting"` (the holder was lost less than [`VOICE_RECONNECT_GRACE`] ago, or while
+    /// the request waited: it may or may not have been applied; retry, do not restart voice)
+    /// and `"voice_no_ack"` (nothing within
+    /// [`VOICE_ACK_TIMEOUT`]). The change is not remembered if nobody is there to take it.
+    pub async fn voice_control(
+        &self,
+        mic: Option<bool>,
+        deaf: Option<bool>,
+        tray_live: Option<bool>,
+    ) -> Result<VoiceStatusJson, &'static str> {
+        let (reply, rx) = oneshot::channel();
+        self.0
+            .lane_tx
+            .send(LaneCmd::Control {
+                mic,
+                deaf,
+                tray_live,
+                reply,
+            })
+            .map_err(|_| "voice_not_running")?;
+        match tokio::time::timeout(VOICE_ACK_TIMEOUT, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("voice_reconnecting"),
+            Err(_) => Err("voice_no_ack"),
+        }
+    }
+
     pub fn snapshot(&self) -> RtJson {
         let s = &self.0;
         let c = &s.counters;
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         RtJson {
             holders: s.holders.lock().unwrap().clone(),
+            voice: s.voice_info.lock().unwrap().clone(),
             queue_depth: c.depth.load(Ordering::Relaxed),
             sent: g(&c.sent),
             datagrams_enqueued: g(&c.enqueued),
@@ -695,6 +786,7 @@ pub fn start(shared: RtShared, driver: DriverHandle, opts: RtOptions) -> io::Res
         .take()
         .ok_or_else(|| io::Error::other("rt lane already started"))?;
     let view_rx = shared.0.view_rx.lock().unwrap().take().unwrap();
+    let lane_rx = shared.0.lane_rx.lock().unwrap().take().unwrap();
     let stop = Arc::new(Notify::new());
     let stop2 = stop.clone();
     let socket = opts.socket.clone();
@@ -715,6 +807,7 @@ pub fn start(shared: RtShared, driver: DriverHandle, opts: RtOptions) -> io::Res
                     listener_fd,
                     ingress_rx,
                     view_rx,
+                    lane_rx,
                     stop2,
                 ),
             );
@@ -736,6 +829,10 @@ struct Core {
     self_key: Key,
     ttl: Duration,
     next_session: u64,
+    next_voice_req: u32,
+    /// When the last voice lease ended. Within [`VOICE_RECONNECT_GRACE`] of that, a control
+    /// request fails `voice_reconnecting` instead of `voice_not_running`.
+    voice_lost_at: Option<Instant>,
     voice: Option<Rc<Session>>,
     tracking: Option<Rc<Session>>,
     peers: BTreeMap<Key, PeerEntry>,
@@ -766,6 +863,7 @@ async fn lane_main(
     listener_fd: OwnedFd,
     mut ingress_rx: mpsc::Receiver<Ingress>,
     mut view_rx: mpsc::UnboundedReceiver<()>,
+    mut lane_rx: mpsc::UnboundedReceiver<LaneCmd>,
     stop: Arc<Notify>,
 ) {
     let listener = match AsyncFd::new(listener_fd) {
@@ -789,6 +887,8 @@ async fn lane_main(
         self_key: opts.self_key,
         ttl: Duration::from_millis(opts.lease_ttl_ms as u64),
         next_session: 1,
+        next_voice_req: 1,
+        voice_lost_at: None,
         voice: None,
         tracking: None,
         peers: BTreeMap::new(),
@@ -818,6 +918,10 @@ async fn lane_main(
                 None => break,
             },
             _ = beat.tick() => core.borrow_mut().on_beat(),
+            cmd = lane_rx.recv() => match cmd {
+                Some(cmd) => core.borrow_mut().on_lane_cmd(cmd),
+                None => break,
+            },
             v = view_rx.recv() => {
                 if v.is_none() { break; }
                 while view_rx.try_recv().is_ok() {}
@@ -971,6 +1075,85 @@ impl Core {
             }
         }
         *self.shared.holders.lock().unwrap() = h;
+        *self.shared.voice_info.lock().unwrap() = self.voice_json();
+    }
+
+    fn voice_json(&self) -> VoiceStatusJson {
+        let tracking_held = self.tracking.is_some();
+        let Some(v) = &self.voice else {
+            return VoiceStatusJson {
+                tracking_held,
+                ..Default::default()
+            };
+        };
+        let flags = v.flags.get();
+        let report = v.report.get();
+        VoiceStatusJson {
+            voice_running: true,
+            session: v.id,
+            incarnation: v.incarnation.get(),
+            listening: flags & voice_state::LISTENING != 0,
+            mic: flags & voice_state::MIC != 0,
+            muted: match report {
+                Some(r) => r & report_bits::MUTED != 0,
+                None => flags & voice_state::MIC == 0,
+            },
+            deaf: match report {
+                Some(r) => r & report_bits::DEAF != 0,
+                None => flags & voice_state::LISTENING == 0,
+            },
+            tray_live: report.is_some_and(|r| r & report_bits::TRAY_LIVE != 0),
+            reported: report.is_some(),
+            tracking_held,
+        }
+    }
+
+    /// Tell the voice client whether a tracking lease is held (and drop a pose queued from
+    /// a holder that is gone).
+    fn tell_voice_tracking(&self) {
+        if let Some(v) = &self.voice {
+            let held = self.tracking.is_some();
+            let mut out = v.out.borrow_mut();
+            if !held {
+                out.pose = None;
+            }
+            out.ctl.push_back(RtMsg::TrackingLease { held });
+            drop(out);
+            v.wake.notify_one();
+        }
+    }
+
+    fn on_lane_cmd(&mut self, cmd: LaneCmd) {
+        match cmd {
+            LaneCmd::Control {
+                mic,
+                deaf,
+                tray_live,
+                reply,
+            } => {
+                let Some(v) = self.voice.clone().filter(|v| v.close_by.get().is_none()) else {
+                    let recent = self
+                        .voice_lost_at
+                        .is_some_and(|t| t.elapsed() < VOICE_RECONNECT_GRACE);
+                    let _ = reply.send(Err(if recent {
+                        "voice_reconnecting"
+                    } else {
+                        "voice_not_running"
+                    }));
+                    return;
+                };
+                let req = self.next_voice_req;
+                self.next_voice_req = self.next_voice_req.wrapping_add(1).max(1);
+                v.waiters.borrow_mut().insert(req, reply);
+                v.out.borrow_mut().ctl.push_back(RtMsg::VoiceControl {
+                    req,
+                    mic,
+                    deaf,
+                    tray_live,
+                });
+                v.wake.notify_one();
+            }
+        }
     }
 
     /// Write the wanted voice key again if the last write was refused or the room reset.
@@ -1048,13 +1231,19 @@ impl Core {
         match role {
             Role::Voice => {
                 self.voice = Some(s.clone());
+                self.voice_lost_at = None;
                 self.shared.counters.depth.store(0, Ordering::Relaxed);
                 // Session fencing: nothing of an older stream survives.
                 self.fence_outbound(incarnation);
                 self.write_voice_key(Self::voice_state_of(&s));
                 self.refresh_peers();
+                // The new client learns whether a tracking lease is held right now.
+                self.tell_voice_tracking();
             }
-            Role::TrackingSource => self.tracking = Some(s.clone()),
+            Role::TrackingSource => {
+                self.tracking = Some(s.clone());
+                self.tell_voice_tracking();
+            }
         }
         self.publish_holders();
         Ok(s)
@@ -1070,10 +1259,18 @@ impl Core {
             *slot = None;
             if s.role == Role::Voice {
                 self.shared.counters.depth.store(0, Ordering::Relaxed);
+                // The requests still waiting may or may not have been applied before the
+                // link dropped; the client announces its state when it reconnects.
+                self.voice_lost_at = Some(Instant::now());
+                for (_, w) in s.waiters.borrow_mut().drain() {
+                    let _ = w.send(Err("voice_reconnecting"));
+                }
                 self.write_voice_key(VoiceState {
                     flags: 0,
                     incarnation: 0,
                 });
+            } else {
+                self.tell_voice_tracking();
             }
             self.publish_holders();
         }
@@ -1275,6 +1472,22 @@ impl Core {
         self.write_voice_key(Self::voice_state_of(s));
         self.publish_holders();
     }
+
+    /// The voice client's own account of what it is doing, after `SetState` (same socket,
+    /// so in order). Answers the control request `ack`, if one waits.
+    fn on_voice_report(&mut self, s: &Rc<Session>, ack: u32, state: u8) {
+        if !self.is_holder(s) || s.role != Role::Voice {
+            bump(&self.shared.counters.bad_role);
+            return;
+        }
+        s.report.set(Some(state));
+        self.publish_holders();
+        if ack != 0 {
+            if let Some(w) = s.waiters.borrow_mut().remove(&ack) {
+                let _ = w.send(Ok(self.voice_json()));
+            }
+        }
+    }
 }
 
 fn peer_tuple(p: &PeerEntry) -> (u8, u32) {
@@ -1323,6 +1536,9 @@ struct Session {
     close_by: Cell<Option<Instant>>,
     out: RefCell<Out>,
     wake: Notify,
+    /// Voice: the last `VoiceReport` state, and the control requests waiting for theirs.
+    report: Cell<Option<u8>>,
+    waiters: RefCell<HashMap<u32, oneshot::Sender<Result<VoiceStatusJson, &'static str>>>>,
 }
 
 /// What `candidate` picked: the bytes, and where to remove it from once sent.
@@ -1353,6 +1569,8 @@ impl Session {
             close_by: Cell::new(None),
             out: RefCell::new(Out::default()),
             wake: Notify::new(),
+            report: Cell::new(None),
+            waiters: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1587,6 +1805,7 @@ fn on_client_msg(core: &CoreRef, sess: &Rc<Session>, m: RtMsg) {
             pose,
         } => c.on_pose(sess, source_mono_us, seq, pose),
         RtMsg::SetState { flags, incarnation } => c.on_set_state(sess, flags, incarnation),
+        RtMsg::VoiceReport { ack, state } => c.on_voice_report(sess, ack, state),
         RtMsg::Keepalive => {}
         // A second hello, or a daemon-to-client message: ignored (but it renewed the lease).
         _ => bump(&c.shared.counters.decode),

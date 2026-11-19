@@ -445,6 +445,7 @@ recovered or rotated in v1. The UI must say so.
 | client session | u64, per local API connection | provisional local API |
 | voice stream incarnation | u32, random nonzero | one voice stream (a voice client start); in the voice envelope, visemes and `member/<id>/voice` |
 | local lease session | u64, per realtime-socket session | provisional local API (VOICE.md) |
+| voice stream incarnation across a reconnect | unchanged | a lost lease reconnects inside the same process with the same incarnation (VOICE.md, "Reconnect inside one process") |
 | coordinator epoch | `(generation u32, term u32)` | per claim |
 
 Time:

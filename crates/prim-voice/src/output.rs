@@ -50,6 +50,8 @@ pub fn spawn_pacer(sh: Arc<Shared>) -> Result<std::thread::JoinHandle<()>> {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let t0 = mono_us();
+            // Lets a harness place output sample k at t0 + k/48000 on CLOCK_MONOTONIC.
+            sh.stats.add("out_t0_mono_us", t0);
             let mut consumed: u64 = 0;
             let mut last = 0u64;
             let mut buf = vec![0f32; 2 * 4800];

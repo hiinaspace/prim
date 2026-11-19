@@ -12,7 +12,8 @@ use voice_core::PlayoutReceiver;
 use crate::config::Config;
 use crate::hist::{AtomicHist, Hist};
 use crate::ring::Ring;
-use crate::rtio::RtConn;
+use crate::control::Control;
+use crate::rtio::Link;
 use crate::seats::Seats;
 
 /// Frames per mixer block (10 ms at 48 kHz).
@@ -87,6 +88,8 @@ pub enum ExitReason {
     Revoked(u8),
     /// The realtime socket closed.
     SocketClosed,
+    /// The lease was refused when reconnecting (another client holds the role).
+    Refused(u8),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -285,7 +288,10 @@ pub struct GenSync {
 
 pub struct Shared {
     pub cfg: Config,
-    pub conn: RtConn,
+    pub link: Link,
+    pub ctl: Control,
+    /// Commands for the control thread (the reader and the safety rules send on it).
+    pub ctl_tx: Mutex<std::sync::mpsc::Sender<crate::control::Cmd>>,
     pub self_key: Key,
     pub incarnation: u32,
     pub start_us: u64,
@@ -316,6 +322,10 @@ impl Shared {
         }
         self.shutdown
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn send_cmd(&self, c: crate::control::Cmd) {
+        let _ = self.ctl_tx.lock().unwrap().send(c);
     }
 
     pub fn is_shutdown(&self) -> bool {

@@ -50,6 +50,16 @@ A lease is a role held by one realtime-socket session. Roles: `voice` and
   (`listening`, `mic`, `incarnation`); on end, `flags = 0, incarnation = 0`.
 - **No lease, no voice.** Without a `voice` holder the daemon drops arriving voice
   datagrams (counted `voice_no_lease`) and sends none.
+- **Reconnect inside one process (round VC).** Losing the lease to expiry or a closed
+  socket does not end `prim voice`: it connects again with `Hello` carrying the **same
+  incarnation** and its current mic/listening flags, backing off 50 ms, 100 ms ... 1 s.
+  Because the incarnation is unchanged, the daemon's outbound fence keeps the stream and
+  peers see no new stream (no receiver reset). The room key `member/<id>/voice` flickers to
+  flags 0 for the instant between release and the new acquire. `Revoked{takeover}`,
+  `Revoked{policy}` (3) and any unknown reason are final (exit 4). `Refused{busy}` while
+  reconnecting is retried for 3 s, then exit 3. Media sent while the link is down is dropped
+  and counted (`drop_no_link`). Without `rt_socket` in the config (library tests over a
+  socket pair) a lost lease still ends the client as before.
 - **Session fencing.** On a new session (restart or takeover) the daemon discards
   everything queued for or from the old session: the inbound queue and any queued
   outbound datagrams whose incarnation isn't the new session's. A `VoiceOut` whose
@@ -164,6 +174,60 @@ rate (90 Hz in tests). The daemon forwards each one to the voice holder at once 
 network pose timer. `prim-voice` uses the newest pose at each render block and
 records `listener_age = render_mono_us − source_mono_us`.
 
+## Runtime control (round VC)
+
+Mute and deafen without restarting `prim voice`. The client owns the truth.
+
+```
+Godot PrimClient / prim ctl / supervisor --room.sock--> daemon --rt VoiceControl--> voice
+voice --SetState (peers)--> daemon       voice --VoiceReport{ack,state}--> daemon --> the requester
+```
+
+- **Local API** (`room.sock`, JSON): `voice_control {req, mic?, deaf?, tray_live?}` (`mic: true`
+  = microphone live) and `voice_status {req}`. Both answer `{"kind":"voice","voice":{voice_running,
+  session, incarnation, listening, mic, muted, deaf, tray_live, reported, tracking_held}}`;
+  errors are `voice_not_running`, `voice_reconnecting`, `voice_no_ack` (no `VoiceReport`
+  within 1 s) and `bad_request` (nothing to change). A request with no voice client is **not
+  remembered**. `voice_reconnecting` means a voice lease ended less than 4 s ago, or ended
+  while the request waited (so it may or may not have been applied): the process is
+  reconnecting in place. **Do not restart voice on it** (a second launch would be refused
+  BUSY or fight the first); wait a moment and repeat the command (controls are idempotent) or
+  read `voice_status`. Only `voice_not_running` after the grace means start voice.
+- **rt messages.** `VoiceControl{req u32 != 0, mic, deaf, tray_live}` (0x87, daemon to
+  client; each field is one byte: 0 leave, 1 false, 2 true). `VoiceReport{ack u32, state u8}`
+  (0x06, client to daemon; `state` bits: 1 muted, 2 deaf, 4 tray_live; `ack` is the request it
+  answers, 0 for a change the client made itself). `TrackingLease{held}` (0x88, daemon to
+  client; sent on voice acquire with the current state and on every tracking acquire/release).
+  The client sends `SetState` (the `member/<id>/voice` flags) and then `VoiceReport`.
+- **Mute** drops frames before the encoder; capture keeps running (so the OS microphone
+  indicator stays on while muted). The gate cuts capture into 20 ms frames and reads the target
+  at each frame boundary: the first muted frame fades out over 10 ms, then whole frames are
+  dropped. The first muted frame ends the talkspurt (END marker, consumes a seq with the
+  timestamp of that frame); every dropped frame advances only the timestamp by 960, so seq is
+  contiguous and the timestamp counts the muted time. Unmuting fades in over 10 ms and the
+  first packet carries START. The incarnation and the encoder are never replaced. Worst-case
+  effect latency is one frame (20 ms) plus the 10 ms fade.
+- **Deafen** ramps the final mix to zero over one 10 ms block. When fully deaf the mixer still
+  drains inboxes and pulls each sender (cursors stay current) but renders no HRTF, and resets
+  the sources once. The outgoing stream is untouched. The `listening` bit goes to 0, and the
+  other daemons stop sending to a member that is not listening (their `listening()` check), so
+  inbound traffic stops and returns only after the new flag has propagated: undeafening is
+  audible after about one key propagation, not instantly.
+- **Safety default.** On a *held to released* transition of the tracking lease (seen by voice,
+  not on an initial "not held") the client mutes unless `tray_live` is set (`--tray-live` or
+  `voice_control tray_live`). It keeps listening. A later explicit unmute is not undone.
+- **Listener cleared.** On the same transition the stored head pose is dropped: the mixer falls
+  back to the seat/origin pose (default head, identity rotation) at once. The daemon also drops
+  its stale forwarded pose.
+- **Start flags:** `--start-muted`, `--start-deaf`, `--tray-live`. A supervisor should start
+  voice with `--capture device --output device --start-muted` and control it afterwards.
+- **Acknowledgement.** The control thread sets the targets, waits up to 100 ms until the
+  encoder and the mixer have each passed a frame boundary under the new version, then reports
+  (`control_ack_timeouts` counts a miss). The rt reader never waits for it.
+- **CLI:** `prim ctl voice mute|unmute|deafen|undeafen|tray-live|no-tray|status` prints the
+  client's report as JSON (exit 1 with `voice not running` or `no ack`).
+- **Oracles:** `tools/r0/oracles.py vc` (see "Oracles (R0)").
+
 ## `prim-voice`
 
 Threads; the device callbacks only copy between preallocated ring buffers:
@@ -191,7 +255,8 @@ Threads; the device callbacks only copy between preallocated ring buffers:
   device generation increments, the capture ring is flushed (stale mic samples are
   discarded), the encoder advances its timestamp over the gap, and the incarnation
   stays.
-- **Restart:** a new process draws a new incarnation. Nothing of the old stream
+- **Restart:** a new process draws a new incarnation (a lost lease inside a running process
+  does not restart anything; see "Reconnect inside one process"). Nothing of the old stream
   survives it: its daemon queues are discarded (session fencing) and receivers fence
   its late packets.
 
@@ -304,7 +369,7 @@ is still the last Frame measurement.
 
 `prim voice` knobs for the harness, never set in normal use: `--test-drop-burst N,M` (drop M
 of every N packets), `--test-reorder K,D` (hold every Kth packet back D packets),
-`--test-no-idle-skip`, and R0's `--test-drop-every`. They act on the talker after encoding, so
+`--test-no-idle-skip`, `--test-no-fade` (mute and unmute without the fade, so the click oracle can be shown to fail), and R0's `--test-drop-every`. They act on the talker after encoding, so
 the receiver sees real network faults. A clean exit flushes held packets and sends the END
 marker, so receivers go idle at once instead of concealing for 120 ms.
 
@@ -428,3 +493,19 @@ itself has a hole, which is what a loaded host does to the recorder.
 Not built here: the Godot GDExtension (`gdext`) and `voice-mesh-bench` do not compile against the
 current `voice-core` API (they still use the removed `VoiceReceiver` and `PacketArrival`, see `gdext/src/stream.rs`). Nothing in `prim` depends
 on them.
+
+### Runtime control (`oracles.py vc`, round VC)
+
+WAV sinks, no PipeWire; the sink's start on CLOCK_MONOTONIC comes from the stats
+(`control.out_t0_mono_us`). 1: 20 mic toggles in 10 s (the last four through `prim ctl`); silence
+< -60 dB while muted, no click (max sample step <= 2x the plain tone's), one incarnation and one
+listener-side new stream, `member/<id>/voice` mic bit within 200 ms, `ctl status` equals the client's
+stats. 2: 20 deafens: silent < -60 dB, the other end hears the deaf client's tone with no gap,
+listening bit within 200 ms, no HRTF blocks while deaf. 3: a relay between voice and the daemon cuts
+the connection or delivers `Revoked{expired}` five times (client alive, back in <= 1.5 s, same
+incarnation, deaf/tray-live re-applied, audio back); `Revoked{takeover}` and `{policy}` exit 4.
+4: killing the tracker mutes (mic bit off within 200 ms, still listening) unless `--tray-live` or
+`tray-live` was set. 5: killing the tracker brings the ear level difference back to the seat-pose
+scene's. Each has a failing proof in the same run: `--test-no-fade` (click), restart-based mute,
+deafen and reconnect (incarnation, listener streams), safety with `--tray-live`, and a tracker that
+is not killed.

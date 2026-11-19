@@ -242,7 +242,7 @@ async fn roster_chat_voice_and_non_members() {
         .unwrap();
     a.win.wait_until(5, "lease released in status", || !a.win.lock().voice_lease_held()).await.unwrap();
 
-    // The lease expires when the client is frozen; the supervisor relaunches it.
+    // The lease expires when the client is frozen; the client reconnects itself.
     let mut voice = Voice::new(&a.socket);
     voice.start(false);
     b.win.wait_until(10, "voice back", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
@@ -250,19 +250,29 @@ async fn roster_chat_voice_and_non_members() {
     assert_eq!(pids.len(), 1, "one voice client: {pids:?}");
     // SAFETY: signalling our own child.
     unsafe { libc::kill(pids[0], libc::SIGSTOP) };
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    // The lease must really expire while the process is frozen (TTL 2 s): watch the
+    // daemon's holder go away, so a pass cannot mean "the freeze was too short to matter".
+    let mut expired = false;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        expired |= !a.win.lock().voice_lease_held();
+    }
+    assert!(expired, "the frozen client's lease never expired");
     unsafe { libc::kill(pids[0], libc::SIGCONT) };
-    let mut relaunched = false;
-    for _ in 0..100 {
+    // Round VC: a lost lease no longer ends the client. It reconnects inside the same
+    // process (same pid, same incarnation), so nothing is relaunched.
+    for _ in 0..30 {
         voice.tick();
-        let now = supervise::find_procs("voice", "rt-socket", &a.socket);
-        if matches!(voice.sup.state, ProcState::Running) && now.len() == 1 && now[0] != pids[0] {
-            relaunched = true;
-            break;
-        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(relaunched, "voice was not relaunched after lease expiry: {:?}", voice.sup.state);
+    let now = supervise::find_procs("voice", "rt-socket", &a.socket);
+    assert!(
+        matches!(voice.sup.state, ProcState::Running) && now == pids,
+        "voice should have reconnected in place after lease expiry: {:?} {now:?} vs {pids:?}",
+        voice.sup.state
+    );
+    // ... and the same process took the lease again.
+    a.win.wait_until(5, "lease held again", || a.win.lock().voice_lease_held()).await.unwrap();
     b.win.wait_until(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     voice.stop();
 
