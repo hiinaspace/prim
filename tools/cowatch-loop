@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""cowatch-loop: one command to be in the Prim room with a bot peer.
+
+  tools/cowatch-loop --desktop           window on this machine
+  tools/cowatch-loop --vr                your headset, through the system Monado
+  tools/cowatch-loop --verify [--desktop] [--fault NAME]
+                                          agent oracles: exits non-zero unless they pass
+
+It starts two `prim room` daemons in a private two-member room (loopback, no relay), a bot
+peer on the second daemon (writes a moving member/<id>/pose live record), and the Godot room
+attached to the first daemon. Edit anything under client/room/ and the room view reloads
+without dropping the daemon connection. Every component appends lifecycle events to one
+JSONL file (prim-events); the cold-start time is read from it.
+
+--verify runs the room under xrprobe-run (private Monado + headless Weston, so no window or
+headset is touched). Oracles: roster shows 2 members; the bot marker moves in the last 3 s;
+VR: per-eye captures are non-black and render views == scene views.
+Faults (red-before-green): --fault views1 (probe sees 1 render view vs 2 scene views),
+--fault kill-bot-daemon (bot's daemon dies mid-run).
+
+GPU safety (NVIDIA hosts): Xid baseline at start, re-checked during and after; any new Xid aborts
+the run (exit 3). Needs >= 8 GiB VRAM free. VR modes refuse to start while any client is on
+the real Monado socket (S's own session), unless --allow-busy.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HOME = Path.home()
+UID = os.getuid()
+MIN_FREE_MIB = 8192
+
+
+def now_us() -> int:
+    return time.monotonic_ns() // 1000  # CLOCK_MONOTONIC, same clock as prim-events
+
+
+class Events:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def emit(self, ev: str, **fields) -> None:
+        rec = {"t_mono_us": now_us(), "t_unix_ms": int(time.time() * 1000), "src": "loop", "ev": ev}
+        rec |= fields
+        with self.path.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def load(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        out = []
+        for line in self.path.read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return out
+
+    def first(self, src: str, ev: str) -> int | None:
+        for r in self.load():
+            if r["src"] == src and r["ev"] == ev:
+                return r["t_mono_us"]
+        return None
+
+
+# ---- GPU gates -----------------------------------------------------------------------
+
+
+def xid_count() -> int:
+    r = subprocess.run(["journalctl", "-k", "-b", "--no-pager"], capture_output=True, text=True)
+    return sum(1 for ln in r.stdout.splitlines() if "Xid" in ln)
+
+
+def vram_free_mib() -> int | None:
+    if not shutil.which("nvidia-smi"):
+        return None
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    try:
+        used, total = (int(x) for x in r.stdout.strip().split(","))
+        return total - used
+    except ValueError:
+        return None
+
+
+def real_monado_clients() -> int:
+    sock = f"/run/user/{UID}/monado_comp_ipc"
+    r = subprocess.run(["ss", "-xH", "state", "connected"], capture_output=True, text=True)
+    return sum(1 for ln in r.stdout.splitlines() if sock in ln)
+
+
+class Gates:
+    """Xid baseline and VRAM checks; active only where an NVIDIA GPU is present."""
+
+    def __init__(self, vr: bool, allow_busy: bool):
+        self.gpu = shutil.which("nvidia-smi") is not None
+        self.baseline = 0
+        self.vr = vr
+        self.allow_busy = allow_busy
+
+    def pre(self) -> None:
+        if not self.gpu:
+            print("gates: no NVIDIA GPU here; Xid/VRAM gates skipped")
+            return
+        self.baseline = xid_count()
+        free = vram_free_mib()
+        print(f"gates: Xid baseline {self.baseline}; VRAM free {free} MiB")
+        if self.baseline:
+            print("gates: WARNING Xid lines already in this boot's log; only new ones abort")
+        if free is not None and free < MIN_FREE_MIB:
+            sys.exit(f"gates: refusing to start: {free} MiB VRAM free < {MIN_FREE_MIB}")
+        if self.vr:
+            n = real_monado_clients()
+            if n and not self.allow_busy:
+                sys.exit(
+                    f"gates: refusing to start: {n} client(s) on the real Monado socket "
+                    "(a VR session is running); close it or pass --allow-busy"
+                )
+
+    def new_xid(self) -> bool:
+        return self.gpu and xid_count() > self.baseline
+
+
+# ---- processes -----------------------------------------------------------------------
+
+
+class Procs:
+    def __init__(self):
+        self.list: list[tuple[str, subprocess.Popen]] = []
+
+    def start(self, name: str, argv: list[str], log: Path, env=None, **kw) -> subprocess.Popen:
+        f = log.open("w")
+        p = subprocess.Popen(
+            argv, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            env=env, start_new_session=True, **kw,
+        )  # fmt: skip
+        self.list.append((name, p))
+        return p
+
+    def stop(self, name: str) -> None:
+        for n, p in self.list:
+            if n == name and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+    def kill(self, name: str) -> None:
+        for n, p in self.list:
+            if n == name and p.poll() is None:
+                p.kill()
+                p.wait()
+
+    def stop_all(self) -> None:
+        # Godot first (it ends its own XR session), then the bot, then the daemons.
+        for name in ("godot", "xrprobe", "bot", "daemon-b", "daemon-a"):
+            self.stop(name)
+
+
+def wait_for_line(p: subprocess.Popen, log: Path, pattern: str, timeout: float) -> str:
+    end = time.time() + timeout
+    rx = re.compile(pattern, re.M)
+    while time.time() < end:
+        m = rx.search(log.read_text(errors="replace"))
+        if m:
+            return m.group(0)
+        if p.poll() is not None:
+            sys.exit(f"{log.name}: exited early (rc={p.returncode}); see {log}")
+        time.sleep(0.05)
+    sys.exit(f"{log.name}: timed out waiting for {pattern!r}; see {log}")
+
+
+def ctl_invite(prim: Path, sock: Path) -> str:
+    r = subprocess.run(
+        [prim, "ctl", "--socket", sock, "invite", "--expiry", "1h"], capture_output=True, text=True
+    )  # fmt: skip
+    tok = r.stdout.strip().split()[-1] if r.stdout.strip() else ""
+    if r.returncode or not tok:
+        sys.exit(f"prim ctl invite failed: {r.stdout} {r.stderr}")
+    return tok
+
+
+# ---- main ----------------------------------------------------------------------------
+
+
+def build(no_build: bool) -> None:
+    t = time.time()
+    if no_build:
+        link_lib()
+        return
+    cmd = ["cargo", "build", "--locked", "-q", "-p", "prim", "-p", "prim-client", "-p", "prim_native"]
+    if not shutil.which("cargo"):
+        cmd = ["nix", "develop", str(REPO), "--command", *cmd]
+    r = subprocess.run(cmd + ["--target-dir", str(REPO / "target")], cwd=REPO)
+    if r.returncode:
+        sys.exit("cargo build failed")
+    link_lib()
+    print(f"build: {time.time() - t:.1f}s")
+
+
+def link_lib() -> None:
+    lib = REPO / "target/debug/libprim_native.so"
+    dst = REPO / "client/bin/linux/libprim_native.so"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.symlink_to(lib)
+
+
+def find_godot(arg: str | None) -> str:
+    for c in (arg, os.environ.get("PRIM_GODOT"), str(REPO / ".local/godot/bin/godot"), shutil.which("godot")):
+        if c and Path(c).exists():
+            return c
+    sys.exit("no Godot binary: pass --godot, set PRIM_GODOT, or run ./tools/build-godot.sh")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--desktop", action="store_true", help="desktop window (default unless --vr)")
+    ap.add_argument("--vr", action="store_true", help="headset via the system Monado")
+    ap.add_argument("--verify", action="store_true", help="agent oracles under xrprobe-run; exit code is the verdict")
+    ap.add_argument("--fault", choices=["views1", "kill-bot-daemon"], help="inject a fault (with --verify)")
+    ap.add_argument("--hold", type=float, default=8.0, help="verify: seconds to hold after the bot is seen")
+    ap.add_argument("--godot", help="Godot binary")
+    ap.add_argument("--xrprobe", default=os.environ.get("XRPROBE", str(HOME / "code/xrprobe")))
+    ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--no-godot", action="store_true", help="debug: daemons + bot only, print what daemon A sees")
+    ap.add_argument("--allow-busy", action="store_true", help="start VR even if the real Monado has clients")
+    ap.add_argument("--out", type=Path, help="run directory (default ~/.local/state/prim-loop/runs/<ts>)")
+    a = ap.parse_args()
+    if a.fault and not a.verify:
+        ap.error("--fault needs --verify")
+    vr = a.vr or (a.verify and not a.desktop)
+    if a.vr and a.desktop:
+        ap.error("--vr and --desktop are exclusive")
+
+    run = a.out or HOME / ".local/state/prim-loop/runs" / time.strftime("%Y%m%d-%H%M%S")
+    run.mkdir(parents=True, exist_ok=True)
+    rt = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/prim-{UID}") / f"prim-loop-{os.getpid()}"
+    rt.mkdir(parents=True, exist_ok=True)
+    events = Events(run / "events.jsonl")
+    events.emit("spawn", what="loop", mode=("verify-" if a.verify else "") + ("vr" if vr else "desktop"))
+    print(f"run dir: {run}")
+
+    gates = Gates(vr=vr, allow_busy=a.allow_busy)
+    gates.pre()
+    build(a.no_build)
+    prim = REPO / "target/debug/prim"
+    bot = REPO / "target/debug/prim-bot"
+    godot = find_godot(a.godot)
+    events.emit("build_done")
+
+    procs = Procs()
+    rc = 1
+    try:
+        # Daemon A (S's / Godot's), then B (the bot's) joined by invite.
+        sa, sb = rt / "a.sock", rt / "b.sock"
+        la = run / "daemon-a.log"
+        pa = procs.start("daemon-a", [str(prim), "room", "found", "--meta", "loop", "--socket", str(sa),
+                                      "--rt-socket", str(rt / "a-rt.sock"), "--state-dir", str(rt / "a-state"),
+                                      "--relay", "none", "--bind", "127.0.0.1:0"], la)  # fmt: skip
+        wait_for_line(pa, la, r"^ready$", 20)
+        events.emit("daemon_ready", which="a")
+        txt = la.read_text()
+        key_a = re.search(r"^member (\w+)$", txt, re.M).group(1)
+        listen_a = re.search(r"^listen (\S+)$", txt, re.M).group(1)
+        token = ctl_invite(prim, sa)
+        lb = run / "daemon-b.log"
+        pb = procs.start("daemon-b", [str(prim), "room", "join", token, "--socket", str(sb),
+                                      "--rt-socket", str(rt / "b-rt.sock"), "--state-dir", str(rt / "b-state"),
+                                      "--relay", "none", "--bind", "127.0.0.1:0",
+                                      "--peer-addr", f"{key_a}={listen_a}"], lb)  # fmt: skip
+        wait_for_line(pb, lb, r"^ready$", 20)
+        events.emit("daemon_ready", which="b")
+
+        env = os.environ | {"PRIM_EVENT_LOG": str(events.path), "PRIM_SOCKET": str(sa)}
+        procs.start("bot", [str(bot), "--socket", str(sb), "--events", str(events.path)], run / "bot.log", env=env)
+
+        if a.no_godot:
+            time.sleep(3)
+            for cmd in (["status"], ["sub", "member/*/pose", "--count", "4", "--timeout", "10"]):
+                r = subprocess.run([str(prim), "ctl", "--socket", str(sa), *cmd], capture_output=True, text=True)
+                print(r.stdout, r.stderr)
+            return 0
+
+        report = run / "godot-report.json"
+        shot = run / "desktop.png"
+        app_args = ["--socket", str(sa)]
+        if not vr:
+            app_args.append("--desktop")
+        if a.verify:
+            app_args += ["--verify", "--hold", str(a.hold), "--report", str(report), "--screenshot", str(shot)]
+        genv = env | ({"PRIM_FAULT": a.fault} if a.fault == "views1" else {})
+        godot_log = run / "godot.log"
+
+        if a.verify:
+            xp = Path(a.xrprobe)
+            if not xp.exists():
+                sys.exit(f"xrprobe not found at {xp}; pass --xrprobe or set XRPROBE")
+            monado = xp / ".local/monado-5b133708"
+            xenv = genv | ({"MONADO": str(monado)} if monado.exists() and "MONADO" not in os.environ else {})
+            godot_args = [] if vr else ["--xr-mode", "off"]
+            xr_out = run / "xrprobe"
+            cmd = ["uv", "run", "--project", str(xp), "xrprobe-run", "--project", str(REPO / "client"),
+                   "--godot", godot, "--timeout", "150", "--out", str(xr_out),
+                   *[x for k, v in genv.items() if k in ("PRIM_EVENT_LOG", "PRIM_SOCKET", "PRIM_FAULT") for x in ("--env", f"{k}={v}")],
+                   "--", *godot_args, "--", *app_args]  # fmt: skip
+            p = procs.start("xrprobe", cmd, godot_log, env=xenv, cwd=xp)
+            if a.fault == "kill-bot-daemon":
+                end = time.time() + 120
+                while time.time() < end and events.first("godot", "joined") is None and p.poll() is None:
+                    time.sleep(0.1)
+                time.sleep(2.0)
+                procs.kill("daemon-b")
+                events.emit("fault", what="kill-bot-daemon")
+            while p.poll() is None:
+                if gates.new_xid():
+                    try:
+                        os.killpg(p.pid, signal.SIGTERM)  # whole group: godot, monado, weston
+                    except ProcessLookupError:
+                        pass
+                    print("ABORT: new Xid appeared during the run. Stop and tell S.")
+                    return 3
+                time.sleep(1.0)
+            rc = p.returncode
+        else:
+            godot_args = [] if vr else ["--xr-mode", "off"]
+            p = procs.start("godot", [godot, "--path", str(REPO / "client"), *godot_args, "--", *app_args],
+                            godot_log, env=genv)  # fmt: skip
+            print(f"\nIn the room. Edit client/room/* to hot reload. Ctrl-C to stop. Logs: {run}")
+            while p.poll() is None:
+                if gates.new_xid():
+                    print("ABORT: new Xid appeared during the run. Stop and tell S.")
+                    procs.stop("godot")
+                    return 3
+                time.sleep(1.0)
+            rc = p.returncode or 0
+    except KeyboardInterrupt:
+        rc = 0
+    finally:
+        procs.stop_all()
+        shutil.rmtree(rt, ignore_errors=True)
+
+    if gates.new_xid():
+        print("ABORT: new Xid after the run. Stop and tell S.")
+        return 3
+    return summarize(events, run, a, vr, rc)
+
+
+def summarize(events: Events, run: Path, a, vr: bool, rc: int) -> int:
+    t0 = events.first("loop", "spawn")
+    rows = []
+    for label, src, ev in [("daemon A ready", "loop", "daemon_ready"), ("godot first frame", "godot", "first_frame"),
+                           ("godot joined (2 members)", "godot", "joined"), ("first bot pose seen", "godot", "peer_pose")]:  # fmt: skip
+        t = events.first(src, ev)
+        rows.append((label, None if t is None or t0 is None else (t - t0) / 1000))
+    print("\ncold start (ms from loop spawn):")
+    for label, ms in rows:
+        print(f"  {label:28s} {'-' if ms is None else f'{ms:8.0f}'}")
+    b = events.first("loop", "build_done")
+    p = events.first("godot", "peer_pose")
+    if b and p:
+        print(f"  in room, build excluded      {(p - b) / 1000:8.0f}")
+    rep = run / "godot-report.json"
+    if a.verify and rep.exists():
+        r = json.loads(rep.read_text())
+        print("\noracles:")
+        if r["failures"]:
+            rc = rc or 1
+        for c in r["checks"]:
+            print(f"  {'PASS' if c['pass'] else 'FAIL'}  {c['name']}  {json.dumps(c['detail'])}")
+    elif a.verify:
+        print("\nno godot report written: the app never finished its checks")
+        rc = rc or 1
+    print(f"\nresult: {'PASS' if rc == 0 else 'FAIL'} (exit {rc}); run dir {run}")
+    return rc
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    sys.exit(main())

@@ -4058,10 +4058,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "prim-client"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "prim-events",
+ "prim-room",
+ "room-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "prim-cowatch"
 version = "0.1.0"
 dependencies = [
  "room-core",
+]
+
+[[package]]
+name = "prim-events"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
 ]
 
 [[package]]
@@ -4136,6 +4158,8 @@ dependencies = [
  "libloading 0.9.0",
  "ort",
  "pkarr",
+ "prim-client",
+ "prim-events",
  "rustfft",
  "serde",
  "serde_json",

@@ -1,5 +1,6 @@
 mod media;
 mod network;
+mod prim_client;
 mod session;
 mod xr_monitor;
 pub mod viseme;
