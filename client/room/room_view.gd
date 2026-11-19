@@ -3,12 +3,17 @@ extends Node3D
 ## main.gd keeps (roster, bot poses); owns no network state, so reloading this script or
 ## theater.tscn never drops the daemon connection.
 ##
-## What it draws: the theater, a roster on a board above the screen (also a 2D label in
+## What it draws: the world (room/theater.glb, placed by PrimWorld), a roster on a board above the screen (also a 2D label in
 ## desktop mode), and one marker per remote member that follows that member's
 ## `member/<id>/pose` live record.
 
 const MARKER_COLORS := [Color(1.0, 0.45, 0.1), Color(0.2, 0.8, 1.0), Color(0.9, 0.2, 0.9)]
 
+const PrimWorld := preload("res://world/prim_world.gd")
+const WORLD_FILE := "res://room/theater.glb"
+
+var world: Node3D # the loaded PRIM_world glTF (room/theater.glb)
+var placement := {} # PrimWorld.place() result: screen, speakers, spawn
 var model # main.gd's RoomModel
 var board: Label3D
 var markers := {} # member key -> Node3D
@@ -17,11 +22,20 @@ var hud: Label
 
 func setup(m, desktop: bool) -> void:
 	model = m
-	var theater: Node = load("res://room/theater.tscn").instantiate()
-	add_child(theater)
+	var loaded := PrimWorld.load_file(WORLD_FILE)
+	if loaded.root == null:
+		push_error("room_view: world %s failed to load" % WORLD_FILE)
+	else:
+		world = loaded.root
+		placement = loaded.placement
+		add_child(world)
+		for w in placement.warnings:
+			push_warning("PRIM_world: %s" % w)
 	board = Label3D.new()
 	board.name = "RosterBoard"
-	board.position = Vector3(0, 2.6, -1.9)
+	# above the screen (falls back to the old fixed spot without one)
+	board.position = (placement.screen.pos + Vector3(0, 1.45, 0.1)) if placement.get("screen") != null \
+		else Vector3(0, 2.6, -1.9)
 	board.pixel_size = 0.004
 	board.font_size = 56
 	board.outline_size = 12
@@ -91,3 +105,9 @@ func _make_marker(idx: int) -> Node3D:
 	nose.material_override = mat
 	root.add_child(nose)
 	return root
+
+
+## Where a joining member starts: the world's spawn node (identity at the origin if none).
+func spawn_transform() -> Transform3D:
+	var s = placement.get("spawn")
+	return Transform3D(Basis(Vector3.UP, s.yaw), s.pos) if s != null else Transform3D.IDENTITY
