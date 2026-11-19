@@ -2,7 +2,7 @@
 """R0 oracle harness (docs/room/VOICE.md, "Oracles (R0)"). Stdlib only.
 
     uv run --no-project python tools/r0/oracles.py
-        <baseline|bulk|listener|faults|stale|scenes|loss|reorder|drift|quantum|all>
+        <baseline|bulk|listener|faults|stale|scenes|loss|reorder|drift|quantum|idle|vc|all>
         [--prim PATH] [--out DIR] [--scale F] [--clips DIR] [--godot DIR]
 
 Runs on the Linux test host. Everything audible goes to PipeWire null sinks this script
@@ -2226,9 +2226,765 @@ def idle_row(res, name, v):
 
 
 # ---------------------------------------------------------------- main
+# ---------------------------------------------------------------- vc: voice runtime control
+# Mute, deafen, reconnect-in-process, the tray safety mute and the cleared listener
+# (docs/room/VOICE.md, "Runtime control"). Outputs are WAV files (no PipeWire); a wav sink is
+# read after the voice process has exited and finalized it, and the sink's start time on
+# CLOCK_MONOTONIC comes from the voice stats (control.out_t0_mono_us), so a toggle made by this
+# script at time t is looked at in the recording near sample (t - t0) * 48000.
+VC_TOGGLES = 20
+VC_HALF = 0.5          # s per toggle state
+VC_GUARD = 0.20        # s after a toggle before "silent" or "audible" is judged
+VC_FLAG_MS = 200       # a state change must reach the room within this
+VC_SILENT_DB = -60.0
+VC_STEP_RATIO = 2.0    # max sample step vs the plain tone's, like the loss oracles
+
+
+def vc_cli(prim, node, *a):
+    r = subprocess.run([prim, "ctl", "--socket", node.sock, "voice"] + list(a), capture_output=True, text=True, timeout=10)
+    try:
+        j = json.loads(r.stdout) if r.stdout.strip() else None
+    except ValueError:
+        j = None
+    return r.returncode, j, r.stderr.strip()
+
+
+def vc_call(node, **kw):
+    """voice_control through the room socket; returns (t_before, t_after, voice-or-None, reply)."""
+    t0 = mono()
+    r = node.local.call("voice_control", timeout=5, **kw)
+    return t0, mono(), (r.get("voice") if r.get("kind") == "voice" else None), r
+
+
+def vc_wait_running(node, timeout=15):
+    end = mono() + timeout
+    while mono() < end:
+        try:
+            r = node.local.call("voice_status", timeout=3)
+            if r.get("kind") == "voice" and r["voice"]["voice_running"] and r["voice"].get("reported"):
+                return r["voice"]
+        except Exception:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("%s: voice never reported" % node.name)
+
+
+def vc_lr(path):
+    a = read_wav_f32(path)
+    return a[0::2], a[1::2]
+
+
+def vc_i(t, t0):
+    return max(0, int(round((t - t0) * RATE)))
+
+
+def vc_seg(x, t0, ta, tb):
+    return x[vc_i(ta, t0):vc_i(tb, t0)]
+
+
+def vc_amp(x, hz, t0, ta, tb):
+    seg = vc_seg(x, t0, ta, tb)
+    n = len(seg)
+    if n < 480:
+        return 0.0
+    w = 2 * math.pi * hz / RATE
+    c = [math.cos(w * k) for k in range(n)]
+    sn = [math.sin(w * k) for k in range(n)]
+    return 2 * math.hypot(math.sumprod(seg, c), math.sumprod(seg, sn)) / n
+
+
+def vc_max_step(x, t0, ta, tb):
+    seg = vc_seg(x, t0, ta, tb)
+    return max((abs(seg[i + 1] - seg[i]) for i in range(len(seg) - 1)), default=0.0)
+
+
+def vc_hf_db(x, t0, ta, tb):
+    """Level of the first difference (a high-pass) over a window: a click is broadband."""
+    seg = vc_seg(x, t0, ta, tb)
+    d = [seg[i + 1] - seg[i] for i in range(len(seg) - 1)]
+    return rms_db(d)
+
+
+class VcProxy:
+    """A SOCK_SEQPACKET relay between a voice client and a daemon's rt socket, so the script
+    can sever the connection or deliver a Revoked as the daemon would."""
+
+    def __init__(self, path, target):
+        self.path, self.target = path, target
+        self.ls = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.ls.bind(path)
+        self.ls.listen(4)
+        self.pair = None
+        self.sessions = 0
+        self.lock = threading.Lock()
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                c, _ = self.ls.accept()
+            except OSError:
+                return
+            d = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            try:
+                d.connect(self.target)
+            except OSError:
+                c.close()
+                continue
+            with self.lock:
+                self.pair = (c, d)
+                self.sessions += 1
+            for a, b in ((c, d), (d, c)):
+                threading.Thread(target=self._pump, args=(a, b), daemon=True).start()
+
+    @staticmethod
+    def _pump(a, b):
+        try:
+            while True:
+                m = a.recv(70000)
+                if not m:
+                    break
+                b.send(m)
+        except OSError:
+            pass
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def sever(self):
+        with self.lock:
+            p = self.pair
+        for s in p or ():
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def revoke(self, reason):
+        """Deliver Revoked{reason} to the client; the daemon side goes away (it released the lease)."""
+        with self.lock:
+            c, d = self.pair
+        try:
+            c.send(bytes([0x86, reason]))
+        except OSError:
+            pass
+        try:
+            d.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            self.ls.close()
+        except OSError:
+            pass
+        self.sever()
+
+
+def vc_cluster(run, args, audio, name, n=1):
+    cl = mk_cluster(run, args, audio, n=n, name=name, device=False)
+    return cl
+
+
+def vc_start_pair(cl, t_extra=(), l_extra=(), t_cap="tone:440", l_cap="none", seat_deg=0, l_wav=None, t_wav=None):
+    """L listens on a wav sink; T1 sends `t_cap`. Returns once L is hearing T1."""
+    L, T1 = cl.L, cl.T[0]
+    L.start_voice(l_cap, "wav:" + l_wav, extra=["--seat", "%s=%s" % (T1.key[:8], seat_deg)] + list(l_extra))
+    T1.start_voice(t_cap, "wav:" + t_wav if t_wav else "null", extra=list(t_extra))
+    vc_wait_running(T1)
+    vc_wait_running(L)
+    if not cl.wait_flowing():
+        raise RuntimeError("no voice flowing T1 -> L")
+    time.sleep(1.0)
+
+
+def vc_stop_nodes(cl):
+    for n in cl.T + [cl.L]:
+        if n.voice and n.voice.alive():
+            n.voice.term(3.0)
+
+
+def vc_mic_run(args, res, audio, label, mode="live", toggles=VC_TOGGLES, half=VC_HALF):
+    """Toggle T1's microphone `toggles` times. mode: live (voice_control; the last four through
+    prim ctl), nofade (the seeded fault: --test-no-fade), restart (the old way: kill the
+    client and start another one with --takeover and no capture, or with the capture again)."""
+    run = os.path.join(res.run, "vc")
+    os.makedirs(run, exist_ok=True)
+    cl = vc_cluster(run, args, audio, "vc-mic-" + label)
+    out = {"label": label, "mode": mode}
+    try:
+        L, T1 = cl.L, cl.T[0]
+        wav = os.path.join(run, "mic-%s.wav" % label)
+        vc_start_pair(cl, t_extra=(["--test-no-fade"] if mode == "nofade" else []), l_wav=wav)
+        watch = VoiceWatch(L)
+        cl.pollers()
+        inc0 = vc_wait_running(T1)["incarnation"]
+        toggles_log = []  # (t_call, t_ack, want_mic)
+        live = True
+        for i in range(toggles):
+            time.sleep(half)
+            want = not live
+            if mode == "restart":
+                t_call = mono()
+                T1.voice.term(3.0)
+                if want:
+                    T1.start_voice("tone:440", "null", extra=["--takeover"])
+                else:
+                    T1.start_voice("none", "null", extra=["--takeover"])
+                vc_wait_running(T1)
+                t_ack = mono()
+            elif mode != "nofade" and i >= toggles - 4:
+                t_call = mono()
+                rc, j, err = vc_cli(args.prim, T1, "unmute" if want else "mute")
+                t_ack = mono()
+                if rc != 0 or not j or j.get("mic") != want:
+                    out.setdefault("cli_bad", []).append((i, rc, j, err))
+            else:
+                t_call, t_ack, v, _ = vc_call(T1, mic=want)
+                if not v or v.get("mic") != want:
+                    out.setdefault("call_bad", []).append((i, v))
+            toggles_log.append((t_call, t_ack, want))
+            live = want
+        time.sleep(half)
+        # final status: ctl vs the client's own stats
+        rc, j, err = vc_cli(args.prim, T1, "status")
+        out["status_cli"] = (rc, j, err)
+        time.sleep(1.2)  # the stats file is written every second
+        sv = T1.vstats() or {}
+        out["t1_stats"] = sv
+        out["watch_rows"] = [r for r in watch.rows if r[1] == T1.key]
+        out["inc0"] = inc0
+        vc_stop_nodes(cl)
+        lv = L.vstats() or {}
+        out["l_stats"] = lv
+        out["toggles"] = toggles_log
+        out["t0"] = lv.get("control", {}).get("out_t0_mono_us", 0) / 1e6
+        out["peer"] = lv.get("peers", {}).get(T1.key, {})
+        xl, xr = vc_lr(wav)
+        out["xl"] = xl
+        out["wav"] = wav
+        watch.c.close()
+    finally:
+        cl.stop()
+    return out
+
+
+def vc_mic_checks(o):
+    """[(id, name, ok, detail)] for one mic run."""
+    t0, tg = o["t0"], o["toggles"]
+    x = o["xl"]
+    rows = []
+    # the plain tone's level: from windows where the mic was live
+    amps, sil = [], []
+    for k, (tc, ta, want) in enumerate(tg):
+        t_next = tg[k + 1][0] if k + 1 < len(tg) else tc + VC_HALF
+        a, b = tc + VC_GUARD + 0.05, t_next
+        if want:
+            if b - a > 0.05:
+                amps.append(vc_amp(x, 440.0, t0, a, b))
+        else:
+            if b - a > 0.05:
+                sil.append((k, rms_db(vc_seg(x, t0, a, b))))
+    ref = sorted(amps)[len(amps) // 2] if amps else 0.0
+    quiet_worst = max((d for _, d in sil), default=-200.0)
+    audible_min = min(amps, default=0.0)
+    rows.append(("vc-1a", "muted: the listener hears silence (< %d dB) after %d ms; live: the tone is back (>= 50 %% of the median level)" % (VC_SILENT_DB, VC_GUARD * 1000),
+                 len(sil) >= 8 and quiet_worst < VC_SILENT_DB and ref > 0.01 and audible_min >= 0.5 * ref,
+                 "%d muted windows, loudest %.1f dB; %d live windows, tone amp median %.4f, min %.4f" % (len(sil), quiet_worst, len(amps), ref, audible_min)))
+    # clicks: biggest sample step anywhere after the first second vs the plain tone's own
+    start = (o["toggles"][0][0] if tg else t0) - 0.2
+    step = vc_max_step(x, t0, start, tg[-1][0] + 1.0) if tg else 0.0
+    lim = VC_STEP_RATIO * 1.1 * 2 * math.pi * 440.0 / RATE * ref
+    rows.append(("vc-1b", "no click: largest sample step across %d toggles <= %.0fx the plain tone's" % (len(tg), VC_STEP_RATIO), ref > 0.01 and step <= lim,
+                 "max step %.4f, limit %.4f (tone amp %.4f); info: HF level around toggles %s dB" % (
+                     step, lim, ref, ", ".join("%.0f" % vc_hf_db(x, t0, tc - 0.02, tc + 0.12) for tc, _, _ in tg[:6]))))
+    # the stream is the same stream: one incarnation at the source, one new stream at the listener
+    inc_rows = {r[3] for r in o["watch_rows"] if r[3]}
+    pr = o["peer"].get("receiver", {})
+    same = (o["t1_stats"].get("incarnation") == o["inc0"] and len(inc_rows) == 1 and o["peer"].get("new_streams") == 1
+            and pr.get("target_resets") == 0)
+    rows.append(("vc-1c", "one incarnation across the toggles: the listener's fence sees one new stream, its receiver is never reset after creation, the client never restarts", same,
+                 "incarnation %s -> %s, incarnations seen in the room %s, listener new_streams %s, target_resets %s, receiver late %s dup %s rejected %s, plc samples %s" % (
+                     o["inc0"], o["t1_stats"].get("incarnation"), sorted(inc_rows), o["peer"].get("new_streams"), pr.get("target_resets"),
+                     pr.get("late"), pr.get("duplicate"), pr.get("rejected"), pr.get("plc_samples"))))
+    # the room's member/<id>/voice mic bit follows within 200 ms of the request
+    worst, miss = 0.0, []
+    for k, (tc, ta, want) in enumerate(tg):
+        hit = next((r for r in o["watch_rows"] if r[0] >= tc - 0.001 and bool((r[2] or 0) & 2) == want), None)
+        if hit is None:
+            miss.append(k)
+            continue
+        worst = max(worst, hit[0] - tc)
+    rows.append(("vc-1d", "the mic bit in member/<id>/voice follows each request within %d ms" % VC_FLAG_MS, not miss and worst * 1000 <= VC_FLAG_MS,
+                 "worst %.0f ms over %d toggles, missing %s" % (worst * 1000, len(tg), miss)))
+    # ctl status is what the client reports
+    rc, j, err = o["status_cli"]
+    c = o["t1_stats"].get("control", {})
+    last_live = tg[-1][2] if tg else True
+    ok = (rc == 0 and j is not None and j.get("voice_running") and j.get("incarnation") == o["t1_stats"].get("incarnation")
+          and j.get("mic") == last_live and j.get("muted") == (not last_live) and c.get("muted") == (not last_live) and not o.get("cli_bad") and not o.get("call_bad"))
+    rows.append(("vc-1e", "prim ctl voice status agrees with the client's own stats; every request was acknowledged with the state it asked for", ok,
+                 "ctl %s (rc %s %s) vs stats control muted=%s mic_live=%s; bad acks %s %s" % (j and {k: j.get(k) for k in ("voice_running", "mic", "muted", "deaf", "incarnation")}, rc, err, c.get("muted"), c.get("mic_live"), o.get("cli_bad"), o.get("call_bad"))))
+    return rows
+
+
+def vc_record(res, scen, rows, prefix=""):
+    for oid, name, ok, detail in rows:
+        res.oracle(scen, prefix + oid, prefix and ("(expected to fail) " + name) or name, ok, detail)
+
+
+def vc_deaf_run(args, res, audio, label, toggles=VC_TOGGLES, half=VC_HALF, extra_l=(), mode="live"):
+    run = os.path.join(res.run, "vc")
+    os.makedirs(run, exist_ok=True)
+    cl = vc_cluster(run, args, audio, "vc-deaf-" + label)
+    out = {"label": label}
+    try:
+        L, T1 = cl.L, cl.T[0]
+        lw, tw = os.path.join(run, "deaf-%s-L.wav" % label), os.path.join(run, "deaf-%s-T1.wav" % label)
+        vc_start_pair(cl, l_cap="tone:660", t_wav=tw, l_wav=lw, l_extra=extra_l)
+        watch = VoiceWatch(T1)  # T1's daemon sees L's flags
+        inc0 = vc_wait_running(L)["incarnation"]
+        tg, deaf = [], False
+        for i in range(toggles):
+            time.sleep(half)
+            deaf = not deaf
+            if mode == "restart":
+                # the old way: stop the client and start another with the other output
+                t0_ = mono()
+                L.voice.term(3.0)
+                L.start_voice("tone:660", "null" if deaf else "wav:" + lw, extra=["--takeover", "--seat", "%s=0" % T1.key[:8]])
+                v = vc_wait_running(L)
+                v = dict(v, deaf=deaf)
+                tg.append((t0_, mono(), deaf, v))
+                continue
+            t0_, t1_, v, _ = vc_call(L, deaf=deaf)
+            tg.append((t0_, t1_, deaf, v))
+        time.sleep(half)
+        time.sleep(1.2)
+        out["l_stats"] = L.vstats() or {}
+        out["watch_rows"] = [r for r in watch.rows if r[1] == L.key]
+        out["inc0"] = inc0
+        vc_stop_nodes(cl)
+        lv, tv = L.vstats() or {}, T1.vstats() or {}
+        out["l_final"], out["t_final"] = lv, tv
+        out["toggles"] = tg
+        out["t0_l"] = lv.get("control", {}).get("out_t0_mono_us", 0) / 1e6
+        out["t0_t"] = tv.get("control", {}).get("out_t0_mono_us", 0) / 1e6
+        try:
+            out["xl"], _ = vc_lr(lw)
+        except Exception:
+            out["xl"] = []
+        out["xt"], _ = vc_lr(tw)
+        out["peer_at_t"] = tv.get("peers", {}).get(L.key, {})
+        out["peer_at_l"] = lv.get("peers", {}).get(T1.key, {})
+        watch.c.close()
+    finally:
+        cl.stop()
+    return out
+
+
+def vc_deaf_checks(o):
+    tg, t0, x = o["toggles"], o["t0_l"], o["xl"]
+    rows = []
+    sil, amps = [], []
+    for k, (tc, ta, deaf, v) in enumerate(tg):
+        t_next = tg[k + 1][0] if k + 1 < len(tg) else tc + VC_HALF
+        a, b = tc + VC_GUARD, t_next
+        if b - a < 0.05:
+            continue
+        if deaf:
+            sil.append(rms_db(vc_seg(x, t0, a, b)))
+        else:
+            amps.append(vc_amp(x, 440.0, t0, a, b))
+    ref = sorted(amps)[len(amps) // 2] if amps else 0.0
+    worst = max(sil, default=-200.0)
+    rows.append(("vc-2a", "deafened: the listener's output is silent (< %d dB) after %d ms; undeafened: the tone is back (>= 50 %% of the median)" % (VC_SILENT_DB, VC_GUARD * 1000),
+                 len(sil) >= 8 and worst < VC_SILENT_DB and ref > 0.01 and min(amps, default=0) >= 0.5 * ref,
+                 "%d deaf windows, loudest %.1f dB; %d hearing windows, tone amp median %.4f min %.4f" % (len(sil), worst, len(amps), ref, min(amps, default=0))))
+    # deaf is deaf only for me: L's own stream reaches T1 without a gap, and is one stream
+    xt, tt = o["xt"], o["t0_t"]
+    seg_a, seg_b = tg[0][0] - 0.5, tg[-1][0] + 0.5
+    seg = vc_seg(xt, tt, seg_a + 0.0, seg_b)
+    ser = tone_series(list(seg), 660.0, win=480, hop=48)
+    amps_t = sorted(a for _, a in ser)
+    reft = amps_t[int(len(amps_t) * 0.75)] if amps_t else 0.0
+    run_len, silent_run = 0, 0
+    q = 0.01 * reft
+    for v in seg:
+        run_len = run_len + 1 if abs(v) < q else 0
+        silent_run = max(silent_run, run_len)
+    lim = VC_STEP_RATIO * 1.1 * 2 * math.pi * 660.0 / RATE * reft
+    step = max((abs(seg[i + 1] - seg[i]) for i in range(len(seg) - 1)), default=0.0)
+    pr = o["peer_at_t"].get("receiver", {})
+    ok = (reft > 0.01 and silent_run <= SILENT_RUN_MAX and step <= lim and o["peer_at_t"].get("new_streams") == 1
+          and pr.get("target_resets") == 0 and pr.get("plc_samples", 1) == 0 and pr.get("late") == 0 and pr.get("duplicate") == 0)
+    rows.append(("vc-2b", "deafening does not touch the outgoing stream: T1 hears L's 660 Hz tone with no gap or click through %d toggles; one stream, no concealment, nothing late" % len(tg), ok,
+                 "L's tone at T1: amp %.4f, longest near-silent run %d samples (max %d), max step %.4f (limit %.4f); T1's view of L: new_streams %s target_resets %s plc %s late %s dup %s; L incarnation %s -> %s" % (
+                     reft, silent_run, SILENT_RUN_MAX, step, lim, o["peer_at_t"].get("new_streams"), pr.get("target_resets"), pr.get("plc_samples"), pr.get("late"), pr.get("duplicate"),
+                     o["inc0"], o["l_final"].get("incarnation"))))
+    # the listening bit
+    worst_ms, miss = 0.0, []
+    for k, (tc, ta, deaf, v) in enumerate(tg):
+        hit = next((r for r in o["watch_rows"] if r[0] >= tc - 0.001 and bool((r[2] or 0) & 1) == (not deaf)), None)
+        if hit is None:
+            miss.append(k)
+        else:
+            worst_ms = max(worst_ms, (hit[0] - tc) * 1000)
+    cs = o["l_final"].get("control", {})
+    rows.append(("vc-2c", "the listening bit in member/<id>/voice follows each deafen within %d ms, and every request is acknowledged with the state it asked for" % VC_FLAG_MS,
+                 not miss and worst_ms <= VC_FLAG_MS and all(v and v.get("deaf") == d for _, _, d, v in tg),
+                 "worst %.0f ms, missing %s, deafens %s undeafens %s ack_timeouts %s" % (worst_ms, miss, cs.get("deafens"), cs.get("undeafens"), cs.get("ack_timeouts"))))
+    return rows
+
+
+def vc_deaf_cost(args, res, audio):
+    """Deaf costs no HRTF. (The room also stops sending to a deaf member, so the mixer has nothing
+    to render; the check is that the render counters stand still and start again.)"""
+    run = os.path.join(res.run, "vc")
+    cl = vc_cluster(run, args, audio, "vc-deafcost")
+    try:
+        L, T1 = cl.L, cl.T[0]
+        vc_start_pair(cl, l_wav=os.path.join(run, "deafcost-L.wav"))
+        snap = lambda: json.loads(json.dumps(L.vstats() or {}))
+        rc1, j1, _ = vc_cli(args.prim, L, "deafen")
+        time.sleep(1.5)
+        a = snap()
+        time.sleep(3.0)
+        b = snap()
+        rc2, j2, _ = vc_cli(args.prim, L, "undeafen")
+        time.sleep(3.0)
+        c = snap()
+        vc_stop_nodes(cl)
+        return a, b, c, (rc1, j1, rc2, j2)
+    finally:
+        cl.stop()
+
+
+def vc_reconnect_run(args, res, audio, mode="sever"):
+    """T1's voice runs behind a proxy that cuts the rt connection or delivers Revoked."""
+    run = os.path.join(res.run, "vc")
+    os.makedirs(run, exist_ok=True)
+    cl = vc_cluster(run, args, audio, "vc-reconnect-" + mode)
+    out = {"mode": mode}
+    proxy = None
+    try:
+        L, T1 = cl.L, cl.T[0]
+        proxy = VcProxy(os.path.join(cl.rt_dir, "proxy.sock"), T1.rt)
+        real_rt = T1.rt
+        T1.rt = proxy.path
+        wav = os.path.join(run, "reconnect-%s.wav" % mode)
+        L.start_voice("none", "wav:" + wav, extra=["--seat", "%s=0" % T1.key[:8]])
+        T1.start_voice("tone:440", "null", extra=["--tray-live", "--start-deaf"])
+        T1.rt = real_rt
+        vc_wait_running(T1)
+        vc_wait_running(L)
+        if not cl.wait_flowing():
+            raise RuntimeError("no voice")
+        watch = VoiceWatch(L)
+        cl.pollers()
+        time.sleep(1.5)
+        st0 = vc_wait_running(T1)
+        # change a state so the reconnect has something to re-apply: unmute stays, tray_live and deaf set at start
+        cuts = []
+        kinds = ["sever", "expired", "sever", "expired", "sever"] if mode in ("sever", "restart") else []
+        for k in kinds:
+            t_cut = mono()
+            n0 = (T1.vstats() or {}).get("control", {}).get("reconnects", 0)
+            if mode == "restart":
+                # the old way: the client is killed and a new one started
+                T1.voice.kill9()
+                T1.rt = proxy.path
+                T1.start_voice("tone:440", "null", extra=["--tray-live", "--start-deaf"])
+                T1.rt = real_rt
+            elif k == "sever":
+                proxy.sever()
+            else:
+                proxy.revoke(2)
+            # wait for the daemon to see the voice client again
+            end = mono() + 8
+            back = None
+            s_before = proxy.sessions
+            while mono() < end:
+                try:
+                    r = T1.local.call("voice_status", timeout=2)
+                    v = r.get("voice") or {}
+                    if proxy.sessions > s_before and v.get("voice_running") and v.get("reported"):
+                        back = mono()
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.01)
+            cuts.append({"kind": k, "t_cut": t_cut, "down_s": None if back is None else back - t_cut, "alive": T1.voice.alive()})
+            time.sleep(1.5)
+        out["cuts"] = cuts
+        if mode == "takeover":
+            t_cut = mono()
+            proxy.revoke(1)
+            try:
+                rc = T1.voice.p.wait(5)
+            except subprocess.TimeoutExpired:
+                rc = None
+            out["takeover"] = {"exit": rc, "after_s": mono() - t_cut}
+        elif mode == "policy":
+            proxy.revoke(3)
+            try:
+                rc = T1.voice.p.wait(5)
+            except subprocess.TimeoutExpired:
+                rc = None
+            out["takeover"] = {"exit": rc}
+        else:
+            vs = T1.local.call("voice_status", timeout=3).get("voice", {})
+            out["after_status"] = vs
+            out["stats_before_stop"] = T1.vstats() or {}
+            out["watch_rows"] = [r for r in watch.rows if r[1] == T1.key]
+            time.sleep(1.2)
+        out["inc0"] = st0["incarnation"]
+        vc_stop_nodes(cl)
+        lv = L.vstats() or {}
+        out["t0"] = lv.get("control", {}).get("out_t0_mono_us", 0) / 1e6
+        out["peer"] = lv.get("peers", {}).get(T1.key, {})
+        out["t1_final"] = T1.vstats() or {}
+        out["xl"], _ = vc_lr(wav)
+        out["listener_cut_windows"] = None
+        watch.c.close()
+    finally:
+        if proxy:
+            proxy.close()
+        cl.stop()
+    return out
+
+
+def vc_reconnect_checks(o):
+    rows = []
+    cuts = o["cuts"]
+    f = o["t1_final"].get("control", {})
+    st = o["after_status"]
+    inc_rows = {r[3] for r in o["watch_rows"] if r[3]}
+    pr = o["peer"].get("receiver", {})
+    downs = [c["down_s"] for c in cuts]
+    rows.append(("vc-3a", "5 lost leases (3 severed, 2 expired): the client never exits, and the daemon sees it back within 1.5 s each time",
+                 all(c["alive"] for c in cuts) and all(d is not None and d <= 1.5 for d in downs),
+                 "down times %s s, alive %s, reconnects %s attempts %s" % ([None if d is None else round(d, 3) for d in downs], [c["alive"] for c in cuts], f.get("reconnects"), f.get("reconnect_attempts"))))
+    rows.append(("vc-3b", "the incarnation survives every reconnect: unchanged in the client, in the room, and at the listener (one new stream, no receiver reset)",
+                 o["t1_final"].get("incarnation") == o["inc0"] and st.get("incarnation") == o["inc0"] and len(inc_rows) == 1 and o["peer"].get("new_streams") == 1 and pr.get("target_resets") == 0,
+                 "incarnation %s -> %s (daemon %s), room saw %s, listener new_streams %s target_resets %s late %s dup %s" % (
+                     o["inc0"], o["t1_final"].get("incarnation"), st.get("incarnation"), sorted(inc_rows), o["peer"].get("new_streams"), pr.get("target_resets"), pr.get("late"), pr.get("duplicate"))))
+    rows.append(("vc-3c", "the state is re-applied: still deafened and tray-live after the reconnects, as the daemon reports it",
+                 st.get("deaf") is True and st.get("tray_live") is True and st.get("mic") is True and f.get("deaf") is True and f.get("tray_live") is True,
+                 "daemon voice status %s; client control %s" % ({k: st.get(k) for k in ("voice_running", "mic", "deaf", "tray_live", "listening", "incarnation")}, {k: f.get(k) for k in ("deaf", "tray_live", "mic_live", "link_up")})))
+    t0, x = o["t0"], o["xl"]
+    last = cuts[-1]["t_cut"] if cuts else 0
+    amp_after = vc_amp(x, 440.0, t0, last + 2.0, last + 3.0)
+    amp_before = vc_amp(x, 440.0, t0, cuts[0]["t_cut"] - 1.0, cuts[0]["t_cut"] - 0.2) if cuts else 0
+    # longest dropout: quiet stretches (a window under 10 % of the pre-cut tone) around the cuts
+    gaps = []
+    for c in cuts:
+        a = c["t_cut"] - 0.1
+        w = 0.05
+        quiet_s = 0.0
+        t = a
+        while t < min(c["t_cut"] + 3.0, t0 + len(x) / RATE - w):
+            if vc_amp(x, 440.0, t0, t, t + w) < 0.1 * amp_before:
+                quiet_s += w
+            t += w
+        gaps.append(round(quiet_s, 2))
+    rows.append(("vc-3d", "audio resumes at the listener after every reconnect (tone back at >= 50 %% of its earlier level) with a short gap",
+                 amp_before > 0.01 and amp_after >= 0.5 * amp_before and all(g <= 1.5 for g in gaps),
+                 "tone amp before %.4f, after the last cut %.4f; quiet seconds around each cut %s; drop_no_link %s" % (amp_before, amp_after, gaps, f.get("drop_no_link"))))
+    return rows
+
+
+def vc_takeover_checks(o, what):
+    t = o["takeover"]
+    c = o["t1_final"].get("control", {})
+    return [("vc-3e-" + what, "Revoked(%s) is fatal: the client exits with code 4 and does not reconnect" % what, t["exit"] == 4 and c.get("reconnects", 0) == 0,
+             "exit %s, reconnects %s, attempts %s" % (t["exit"], c.get("reconnects"), c.get("reconnect_attempts")))]
+
+
+def vc_safety_run(args, res, audio, label, t_extra=(), ctl_tray=False, kill=True):
+    """T1 sends a tone with a tracking source on its daemon; the tracker is killed. What happens to T1's mic?"""
+    run = os.path.join(res.run, "vc")
+    os.makedirs(run, exist_ok=True)
+    cl = vc_cluster(run, args, audio, "vc-safety-" + label)
+    out = {"label": label}
+    try:
+        L, T1 = cl.L, cl.T[0]
+        wav = os.path.join(run, "safety-%s.wav" % label)
+        vc_start_pair(cl, t_extra=t_extra, l_wav=wav)
+        tracker = Proc("track", [args.prim, "voice", "track", "--rt-socket", T1.rt, "--rate", "60", "--yaw", "0"], os.path.join(cl.logdir, "track.log"))
+        cl.helpers.append(tracker)
+        watch = VoiceWatch(L)
+        time.sleep(1.5)
+        v0 = vc_wait_running(T1)
+        out["before"] = v0
+        if ctl_tray:
+            vc_call(T1, tray_live=True)
+        time.sleep(0.5)
+        t_kill = mono()
+        if kill:
+            tracker.kill9()
+        time.sleep(2.0)
+        out["t_kill"] = t_kill
+        out["after"] = T1.local.call("voice_status", timeout=3).get("voice", {})
+        out["rows"] = [r for r in watch.rows if r[1] == T1.key and r[0] >= t_kill - 0.001]
+        out["stats"] = T1.vstats() or {}
+        # an explicit unmute afterwards works and is not undone
+        t_u0, t_u1, vu, _ = vc_call(T1, mic=True)
+        time.sleep(1.0)
+        out["unmuted_after"] = T1.local.call("voice_status", timeout=3).get("voice", {})
+        time.sleep(1.2)
+        vc_stop_nodes(cl)
+        lv = L.vstats() or {}
+        out["t0"] = lv.get("control", {}).get("out_t0_mono_us", 0) / 1e6
+        out["xl"], _ = vc_lr(wav)
+        out["final"] = T1.vstats() or {}
+        watch.c.close()
+    finally:
+        cl.stop()
+    return out
+
+
+def vc_safety_checks(o):
+    t_kill = o["t_kill"]
+    mic_off = next((r for r in o["rows"] if not ((r[2] or 0) & 2)), None)
+    lat = None if mic_off is None else (mic_off[0] - t_kill) * 1000
+    listening_kept = all(((r[2] or 0) & 1) for r in o["rows"]) and o["after"].get("listening") is True
+    c = o["final"].get("control", {})
+    x, t0 = o["xl"], o["t0"]
+    quiet = rms_db(vc_seg(x, t0, t_kill + 0.5, t_kill + 1.9))
+    rows = [("vc-4a", "tracking lease lost with tray_live off: the mic goes off in the room within 200 ms, the client keeps listening, the listener hears silence",
+             mic_off is not None and lat <= 200 and listening_kept and o["after"].get("muted") is True and quiet < VC_SILENT_DB and c.get("tray_safety_mutes") == 1,
+             "mic bit off after %s ms, listening kept %s, status muted=%s mic=%s, listener level %.1f dB, tray_safety_mutes %s" % (
+                 None if lat is None else round(lat), listening_kept, o["after"].get("muted"), o["after"].get("mic"), quiet, c.get("tray_safety_mutes"))),
+            ("vc-4b", "an explicit unmute after the loss works and is not undone by the rule",
+             o["unmuted_after"].get("mic") is True and c.get("tray_safety_mutes") == 1, "after unmute: %s" % {k: o["unmuted_after"].get(k) for k in ("mic", "muted", "tracking_held")})]
+    return rows
+
+
+def vc_safety_hold_checks(o):
+    """With tray_live the loss changes nothing: the mic stays on and the tone keeps playing."""
+    t_kill = o["t_kill"]
+    off = [r for r in o["rows"] if not ((r[2] or 0) & 2)]
+    c = o["final"].get("control", {})
+    amp = vc_amp(o["xl"], 440.0, o["t0"], o["t_kill"] + 0.8, o["t_kill"] + 1.9)
+    return [("vc-4c", "tray_live: losing the tracking lease changes nothing (mic bit stays on, no safety mute, the tone keeps playing)",
+             not off and o["after"].get("mic") is True and c.get("tray_safety_mutes", 0) == 0 and amp > 0.01 and o["after"].get("tracking_held") is False,
+             "mic-off rows %d, status mic=%s tracking_held=%s, safety mutes %s, tone amp after the kill %.4f" % (len(off), o["after"].get("mic"), o["after"].get("tracking_held"), c.get("tray_safety_mutes"), amp))]
+
+
+def vc_listener_run(args, res, audio, label, kill=True, hz=2000.0, yaw=90.0, tracker=True):
+    run = os.path.join(res.run, "vc")
+    os.makedirs(run, exist_ok=True)
+    cl = vc_cluster(run, args, audio, "vc-listener-" + label)
+    out = {"label": label, "hz": hz}
+    try:
+        L, T1 = cl.L, cl.T[0]
+        wav = os.path.join(run, "listener-%s.wav" % label)
+        trk = None
+        if tracker:
+            trk = Proc("track", [args.prim, "voice", "track", "--rt-socket", L.rt, "--rate", "90", "--yaw", str(yaw)], os.path.join(cl.logdir, "track.log"))
+            cl.helpers.append(trk)
+            time.sleep(0.5)
+        vc_start_pair(cl, t_cap="tone:%g" % hz, l_wav=wav, seat_deg=0)
+        time.sleep(3.0)
+        t_kill = mono()
+        if kill and trk:
+            trk.kill9()
+        time.sleep(4.0)
+        out["t_kill"] = t_kill
+        time.sleep(1.2)
+        vc_stop_nodes(cl)
+        lv = L.vstats() or {}
+        out["l_stats"] = lv
+        out["t0"] = lv.get("control", {}).get("out_t0_mono_us", 0) / 1e6
+        out["xl"], out["xr"] = vc_lr(wav)
+    finally:
+        cl.stop()
+    return out
+
+
+def vc_ild(o, ta, tb):
+    t0 = o["t0"]
+    l, r = vc_amp(o["xl"], o["hz"], t0, ta, tb), vc_amp(o["xr"], o["hz"], t0, ta, tb)
+    return 20 * math.log10(max(l, 1e-9) / max(r, 1e-9)), l, r
+
+
+def vc_listener_checks(o, ref):
+    """`ref`: the same scene with no tracker at all (the seat pose, the level difference between the ears
+    of that source with the default head)."""
+    tk = o["t_kill"]
+    b, bl, br = vc_ild(o, tk - 2.0, tk - 0.3)
+    a, al, ar = vc_ild(o, tk + 1.0, tk + 3.5)
+    c = o["l_stats"].get("control", {})
+    return [("vc-5", "tracker killed: within 1 s the listener is back at the seat pose (L/R difference within 1 dB of the no-tracker scene, having been > 4 dB away from it)",
+             abs(b - ref) > 4.0 and abs(a - ref) < 1.0 and c.get("listener_cleared") == 1,
+             "L/R at %g Hz: seat-pose scene %.1f dB; tracker yaw 90: before the kill %.1f dB (L %.4f R %.4f), 1 to 3.5 s after %.1f dB (L %.4f R %.4f); listener_cleared %s tracking_held %s" % (
+                 o["hz"], ref, b, bl, br, a, al, ar, c.get("listener_cleared"), c.get("tracking_held")))]
+
+
+def scen_vc(args, res, audio):
+    scen = "vc"
+    # 1. microphone
+    live = vc_mic_run(args, res, audio, "live")
+    vc_record(res, scen, vc_mic_checks(live))
+    res.data.setdefault(scen, {})["mic"] = {"toggles": len(live["toggles"]), "peer": live["peer"], "t1_control": live["t1_stats"].get("control")}
+    nofade = vc_mic_run(args, res, audio, "nofade", mode="nofade")
+    rows = vc_mic_checks(nofade)
+    click = [r for r in rows if r[0] == "vc-1b"]
+    res.oracle(scen, "vc-1b-proof-nofade", "(proof) with the seeded --test-no-fade fault the click check fails", all(r[2] is False for r in click), click[0][3])
+    rst = vc_mic_run(args, res, audio, "restart", mode="restart", toggles=6)
+    rows = [r for r in vc_mic_checks(rst) if r[0] == "vc-1c"]
+    res.oracle(scen, "vc-1c-proof-restart", "(proof) restart-based mute (kill and start the client) fails the one-incarnation check", all(r[2] is False for r in rows), rows[0][3])
+    # 2. deafen
+    dv = vc_deaf_run(args, res, audio, "live")
+    vc_record(res, scen, vc_deaf_checks(dv))
+    a, b, c, (rc1, j1, rc2, j2) = vc_deaf_cost(args, res, audio)
+    r = lambda d: d["mixer"]["peer_blocks_rendered"]
+    res.oracle(scen, "vc-2d", "deaf renders nothing: the HRTF render counter stands still for 3 s while deaf and runs again after undeafen; ctl acknowledges both",
+               r(b) == r(a) and r(c) > r(b) + 100 and rc1 == 0 and rc2 == 0 and j1 and j1.get("deaf") is True and j2 and j2.get("deaf") is False,
+               "rendered blocks: %d -> %d while deaf (3 s), %d 3 s after undeafen; voice_in while deaf %d -> %d (the room stops sending to a deaf member); ctl rc %s %s" % (
+                   r(a), r(b), r(c), a["voice_in"], b["voice_in"], rc1, rc2))
+    rd = vc_deaf_run(args, res, audio, "restart", toggles=6, mode="restart")
+    rows = [r for r in vc_deaf_checks(rd) if r[0] == "vc-2b"]
+    res.oracle(scen, "vc-2b-proof-restart", "(proof) restart-based deafen (stop the client, start another with the other output) fails the unbroken-outgoing-stream check", all(r[2] is False for r in rows), rows[0][3])
+    # 3. reconnect
+    rc_run = vc_reconnect_run(args, res, audio, "sever")
+    vc_record(res, scen, vc_reconnect_checks(rc_run))
+    res.data[scen]["reconnect"] = {"cuts": rc_run["cuts"], "control": rc_run["t1_final"].get("control")}
+    tk = vc_reconnect_run(args, res, audio, "takeover")
+    vc_record(res, scen, vc_takeover_checks(tk, "takeover"))
+    po = vc_reconnect_run(args, res, audio, "policy")
+    vc_record(res, scen, vc_takeover_checks(po, "policy"))
+    rr = vc_reconnect_run(args, res, audio, "restart")
+    rows = [r for r in vc_reconnect_checks(rr) if r[0] == "vc-3b"]
+    res.oracle(scen, "vc-3b-proof-restart", "(proof) restarting the client instead of reconnecting fails the same-incarnation check", all(r[2] is False for r in rows), rows[0][3])
+    # 4. safety
+    sa = vc_safety_run(args, res, audio, "default")
+    vc_record(res, scen, vc_safety_checks(sa))
+    sh_ = vc_safety_run(args, res, audio, "flag", t_extra=["--tray-live"])
+    vc_record(res, scen, vc_safety_hold_checks(sh_))
+    sc = vc_safety_run(args, res, audio, "ctl", ctl_tray=True)
+    rows = vc_safety_hold_checks(sc)
+    rows[0] = (rows[0][0] + "-ctl",) + rows[0][1:]
+    vc_record(res, scen, rows)
+    # proofs: the default-rule check run against the tray_live run must fail
+    pf = [r for r in vc_safety_checks(sh_) if r[0] == "vc-4a"]
+    res.oracle(scen, "vc-4a-proof-tray-live", "(proof) with the safety rule off (--tray-live) the vc-4a check fails", all(r[2] is False for r in pf), pf[0][3])
+    # 5. listener
+    ln = vc_listener_run(args, res, audio, "none", kill=False, tracker=False)
+    ref_ild = vc_ild(ln, ln["t_kill"] + 1.0, ln["t_kill"] + 3.5)[0]
+    lk = vc_listener_run(args, res, audio, "killed")
+    vc_record(res, scen, vc_listener_checks(lk, ref_ild))
+    lc = vc_listener_run(args, res, audio, "control", kill=False)
+    pf = vc_listener_checks(lc, ref_ild)
+    res.oracle(scen, "vc-5-proof-control", "(proof) a tracker that is not killed keeps its pose: the vc-5 check fails on the control run", all(r[2] is False for r in pf), pf[0][3])
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "idle", "all"])
+    ap.add_argument("scenario", choices=["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "idle", "vc", "all"])
     ap.add_argument("--prim", default=os.path.join(ROOT, "target/release/prim"))
     ap.add_argument("--out", default=os.path.join(ROOT, ".local/r0-runs"))
     ap.add_argument("--scale", type=float, default=1.0, help="scale the long durations (debug)")
@@ -2265,7 +3021,7 @@ def main():
     env = environment(args.prim)
     env["default_audio_before"] = audio.default_before
     log("run dir", run)
-    todo = ["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "idle"] if args.scenario == "all" else [args.scenario]
+    todo = ["baseline", "bulk", "listener", "faults", "stale", "scenes", "loss", "reorder", "drift", "quantum", "idle", "vc"] if args.scenario == "all" else [args.scenario]
     base = bulk = None
     try:
         for s in todo:
@@ -2294,6 +3050,8 @@ def main():
                     scen_quantum(args, res, audio)
                 elif s == "idle":
                     scen_idle(args, res, audio)
+                elif s == "vc":
+                    scen_vc(args, res, audio)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
