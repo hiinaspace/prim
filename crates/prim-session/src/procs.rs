@@ -32,13 +32,20 @@ pub fn last_log_line(name: &str) -> String {
 /// Run `prim <args>` in its own process group with output to `log`: closing or killing the
 /// session does not touch it.
 pub fn spawn(args: &[String], log: &str) -> std::io::Result<Child> {
-    Command::new(paths::prim_exe())
-        .args(args)
+    let mut c = Command::new(paths::prim_exe());
+    c.args(args)
         .stdin(Stdio::null())
         .stdout(log_file(log)?)
-        .stderr(log_file(log)?)
-        .process_group(0)
-        .spawn()
+        .stderr(log_file(log)?);
+    // SAFETY: setsid is async-signal-safe; own session so nothing that happens to the
+    // launcher (its terminal, scope or process group) reaches this process.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    c.spawn()
 }
 
 pub fn terminate(pid: i32) {

@@ -152,6 +152,14 @@ impl Room {
                     }
                 }
             }
+            Phase::None => {
+                // A daemon that appears without us starting it (we were killed while one
+                // was binding, or something else replaced it): adopt it.
+                if self.probed.elapsed() > Duration::from_secs(5) {
+                    self.probed = Instant::now();
+                    self.adopt(sock);
+                }
+            }
             _ => {}
         }
     }

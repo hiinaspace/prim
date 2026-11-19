@@ -46,6 +46,7 @@ var _pending_name := ""
 var _last := ""
 var _cancelling := false
 var _starting := false
+var _reviving := false
 var _session_room := "none"
 var _session_error := ""
 var _calls := {} # session request id -> Callable(data)
@@ -206,6 +207,15 @@ func _on_session_reply(id: int, data: Dictionary) -> void:
 
 func _apply_session(d: Dictionary) -> void:
 	if not d.get("ok", false):
+		# The session went away (killed, crashed): bring one back, it adopts what is running.
+		if session_ready and not _reviving:
+			session_ready = false
+			_reviving = true
+			_request("ensure", "", [], func(r):
+				_reviving = false
+				session_ready = r.get("ok", false)
+				if session_ready:
+					_apply_session(r))
 		return
 	voice = d.get("voice", {})
 	tray_live = d.get("tray_live", false)

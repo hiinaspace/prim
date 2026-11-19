@@ -175,8 +175,15 @@ pub fn spawn_session(room_socket: &Path) -> std::io::Result<()> {
         .arg(format!("--socket={}", room_socket.display()))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0);
+        .stderr(log);
+    // SAFETY: setsid is async-signal-safe; own session so nothing that happens to the
+    // launcher (its terminal, scope or process group) reaches the session.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
     let mut child = c.spawn()?;
     // Reap it when it exits so a failed start does not leave a zombie in this process.
     std::thread::spawn(move || {

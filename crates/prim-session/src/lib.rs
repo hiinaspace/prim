@@ -91,7 +91,7 @@ impl Control {
         let mut s = self.lock();
         let sock = s.room_socket.clone();
         s.room.leave_and_stop(&sock);
-        s.voice.stop();
+        { let sock = s.room_socket.clone(); s.voice.stop_at(&sock); }
         Ok(status_of(&s))
     }
 
@@ -99,7 +99,7 @@ impl Control {
         let mut s = self.lock();
         let sock = s.room_socket.clone();
         s.room.stop(&sock);
-        s.voice.stop();
+        { let sock = s.room_socket.clone(); s.voice.stop_at(&sock); }
         Ok(status_of(&s))
     }
 
@@ -110,7 +110,7 @@ impl Control {
             s.voice.turn_on(room_up, &sock);
         } else {
             s.voice.wanted = false;
-            s.voice.stop();
+            { let sock = s.room_socket.clone(); s.voice.stop_at(&sock); }
         }
         tick(&mut s);
         Ok(status_of(&s))
@@ -133,7 +133,7 @@ impl Control {
     pub fn quit(&self) -> SessionStatus {
         let mut s = self.lock();
         let sock = s.room_socket.clone();
-        s.voice.stop();
+        { let sock = s.room_socket.clone(); s.voice.stop_at(&sock); }
         s.room.stop(&sock);
         s.quit = true;
         status_of(&s)
@@ -168,6 +168,21 @@ pub fn run(opts: Options) -> Result<()> {
         println!("session already running (pid {}), room {}", st.pid, st.room);
         return Ok(());
     }
+    // One session per socket even when two start at once: whoever holds the lock binds.
+    let _lock = match lock_single(&ctl_path) {
+        Some(l) => l,
+        None => {
+            // Lost the race; the winner is binding. Report it if it answers.
+            for _ in 0..30 {
+                if let Ok(st) = SessionClient::new(&opts.room_socket).status() {
+                    println!("session already running (pid {}), room {}", st.pid, st.room);
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::bail!("another session holds {}.lock but does not answer", ctl_path.display());
+        }
+    };
     let listener = bind(&ctl_path)?;
     let mut room = Room::new();
     let mut voice = Voice::new(opts.voice);
@@ -215,6 +230,22 @@ pub fn run(opts: Options) -> Result<()> {
     }
     let _ = std::fs::remove_file(&ctl_path);
     Ok(())
+}
+
+/// An exclusive advisory lock on `<session.sock>.lock`, held for the life of the process.
+fn lock_single(ctl: &Path) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    if let Some(dir) = ctl.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(ctl.with_extension("sock.lock"))
+        .ok()?;
+    // SAFETY: flock on a descriptor we own.
+    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(f)
 }
 
 fn bind(path: &Path) -> Result<UnixListener> {

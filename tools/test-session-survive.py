@@ -107,6 +107,8 @@ def start_godot(role, log, extra_env=None):
     env = os.environ | {
         "XDG_DATA_HOME": str(OUT / "godot/data"),
         "XDG_STATE_HOME": str(OUT / "a/state"),
+        "XDG_RUNTIME_DIR": str(OUT / "a/run"),
+        "PRIM_SOCKET": str(sock_a),
         "PRIM_BIN": str(prim),
         "PRIM_SESSION_VOICE_TEST": "1",
         "PRIM_DAEMON_ARGS": f"--relay none --bind 127.0.0.1:{pa} --state-dir {OUT}/a/room-state",
@@ -158,7 +160,7 @@ try:
     before = snapshot()
 
     # --- the property: kill the client mid-call -------------------------------------------
-    os.kill(g1.pid, signal.SIGKILL)
+    os.killpg(g1.pid, signal.SIGKILL)  # Godot's whole process group, as closing a terminal would
     g1.wait()
     if args.fault == "quit-on-close":
         ctl(sock_a, "session", "quit")
