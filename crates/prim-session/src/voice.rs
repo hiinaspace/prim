@@ -161,7 +161,6 @@ impl Voice {
     pub fn turn_on(&mut self, room_up: bool, sock: &Path) {
         self.wanted = true;
         if !self.running() && matches!(self.state, "busy" | "failed") {
-            self.restarts.clear();
             self.state = "off";
             self.detail.clear();
             if room_up {
