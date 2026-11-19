@@ -39,7 +39,8 @@ def cleanup():
         try: os.killpg(p.pid, signal.SIGTERM)
         except Exception: pass
     time.sleep(0.5)
-    shutil.rmtree(ROOT, ignore_errors=True)
+    if os.environ.get('KEEP'): print('kept', ROOT)
+    else: shutil.rmtree(ROOT, ignore_errors=True)
 
 # ---- private display: headless sway
 (ROOT / "sway.conf").write_text(f"output HEADLESS-1 resolution {args.size}\ndefault_border none\nfont pango:monospace 1\n")

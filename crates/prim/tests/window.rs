@@ -232,6 +232,9 @@ async fn roster_chat_voice_and_non_members() {
     // Deafen is carried by the window's own `clients` key.
     a.win.send(Cmd::SetClients(Clients { deaf: true, ..Default::default() }));
     b.win.wait_for(5, "alice deafened", |m| m.members().iter().any(|r| r.name == "alice" && r.clients.deaf)).await.unwrap();
+    // Muting again replaces the client; the indicator must follow (live -> muted).
+    voice.restart_with(false, false);
+    b.win.wait_until(10, "alice muted again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
     voice.stop();
     b.win
         .wait_until(10, "alice voice cleared", || voice_of(&b.win, "alice").is_none_or(|(l, m)| !l && !m))

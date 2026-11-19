@@ -108,6 +108,8 @@ pub struct App {
     /// `PRIM_UI_DEMO=voice,mic,deaf`: press those buttons once in a room (screenshot runs
     /// on a display with no pointer). Consumed on first use.
     demo: Option<String>,
+    /// A voice client left over from an earlier window is taken over once, muted.
+    adopted: bool,
     socket: PathBuf,
     handle: Option<Handle>,
     attaching: Option<Receiver<std::io::Result<Handle>>>,
@@ -138,6 +140,7 @@ impl App {
         App {
             rt,
             demo: std::env::var("PRIM_UI_DEMO").ok(),
+            adopted: false,
             voice: Voice::new(&socket),
             socket,
             handle: None,
@@ -214,6 +217,12 @@ impl App {
 
     fn tick(&mut self, ctx: &egui::Context) {
         self.voice.tick();
+        if !self.adopted && self.handle.as_ref().is_some_and(|h| h.lock().in_room()) {
+            self.adopted = true;
+            if !self.voice.sup.running() && !supervise::find_procs("voice", "rt-socket", &self.socket).is_empty() {
+                self.voice.restart_with(false, false);
+            }
+        }
         if self.handle.as_ref().is_some_and(|h| h.lock().in_room()) {
             if let Some(d) = self.demo.take() {
                 if d.contains("voice") {
