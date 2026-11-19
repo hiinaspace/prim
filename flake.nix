@@ -47,7 +47,12 @@
         (python3.withPackages (ps: [ ps.jinja2 ps.mako ])) scons clang lld patchelf binutils ffmpeg libpulseaudio meson zstd nasm vulkan-headers ];
       buildInputs = with pkgs; [ opus openssl alsa-lib ];
       LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.opus ];
+      # winit and glow dlopen these at run time (`prim ui`); NixOS has no global
+      # library path, so the shell provides them. /run/opengl-driver/lib is the
+      # host GPU driver.
+      LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ stdenv.cc.cc.lib opus
+        wayland libxkbcommon libGL xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr xorg.libxcb ])
+        + ":/run/opengl-driver/lib";
     };
   };
 }
