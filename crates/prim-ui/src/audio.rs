@@ -398,6 +398,14 @@ impl Panel {
             }
             self.live = r.is_some() && self.last_seq.1.elapsed() < Duration::from_millis(500);
             self.reading = if self.live { r } else { None };
+            if matches!(self.test_state, TestState::Playing { .. }) {
+                // The microphone is closed during playback: show what is going to the speakers.
+                if let Some(r) = &mut self.reading {
+                    r.peak = r.out_peak;
+                    r.rms = r.out_peak;
+                    self.peak_hold = self.peak_hold.max(r.out_peak);
+                }
+            }
         }
     }
 
@@ -445,6 +453,10 @@ mod gui {
             }
             let hx = x(p.peak_hold);
             pt.line_segment([egui::pos2(hx, rect.top() + 1.0), egui::pos2(hx, rect.bottom() - 1.0)], Stroke::new(2.0, Color32::WHITE));
+        }
+        for db in [-48.0f32, -36.0, -24.0, -12.0, -6.0] {
+            let tx = rect.left() + rect.width() * ((db + 60.0) / 60.0);
+            pt.line_segment([egui::pos2(tx, rect.bottom() - 4.0), egui::pos2(tx, rect.bottom() - 1.0)], Stroke::new(1.0, DIM));
         }
         let clipping = p.clip_until.is_some_and(|t| t > Instant::now());
         let clip = egui::Rect::from_min_size(egui::pos2(rect.right() + 6.0, rect.top()), Vec2::new(52.0, 16.0));
@@ -508,7 +520,7 @@ mod gui {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .anchor(Align2::CENTER_TOP, [0.0, 50.0])
             .fixed_size([440.0, 0.0])
             .show(ctx, |ui| {
                 ui.spacing_mut().slider_width = 200.0;
@@ -525,7 +537,8 @@ mod gui {
                 });
                 ui.label(
                     RichText::new(match p.reading {
-                        Some(r) => format!("Level {:.0} dB, peak {:.0} dB. Speak normally: the bar should reach the amber zone and stay out of red.", to_db(r.rms), to_db(p.peak_hold)),
+                        Some(r) if matches!(p.test_state, TestState::Playing { .. }) => format!("Playing back: output level {:.0} dB.", to_db(r.out_peak)),
+                        Some(r) => format!("Level {:.0} dB, peak {:.0} dB. Speak normally: the bar should reach the amber zone and stay out of red. (0 dB is the loudest possible.)", to_db(r.rms), to_db(p.peak_hold)),
                         None if p.test_mode_hint() => "Starting the meter…".to_string(),
                         None => "Starting the meter… (it listens to the microphone while this window is open)".to_string(),
                     })

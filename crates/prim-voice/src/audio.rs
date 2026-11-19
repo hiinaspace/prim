@@ -166,7 +166,6 @@ pub struct Levels {
     /// that window (~33 ms), not one callback block, so it does not jitter with block size.
     in_sq: AtomicU64,
     in_n: AtomicU64,
-    last_rms: AtomicU32,
     /// Samples at or above full scale since start.
     clips: AtomicU32,
     out_peak: AtomicU32,
@@ -265,11 +264,10 @@ impl Audio {
         let sq = f64::from_bits(self.levels.in_sq.swap(0, Ordering::Relaxed));
         let rms = if n > 0 {
             let r = ((sq / n as f64) as f32).sqrt();
-            self.levels.last_rms.store(r.to_bits(), Ordering::Relaxed);
             r
         } else {
-            // No samples this window (the source stalled): hold the last value.
-            f32::from_bits(self.levels.last_rms.load(Ordering::Relaxed))
+            // No samples this window (no source is running): silence.
+            0.0
         };
         let clips = self.levels.clips.load(Ordering::Relaxed);
         let out = f32::from_bits(self.levels.out_peak.swap(0, Ordering::Relaxed));
