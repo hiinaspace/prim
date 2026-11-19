@@ -192,9 +192,19 @@ pub fn feed_gated<F: FnMut(VoicePacket) -> bool>(
             }
             Gated::Muted => {
                 counts.muted_frames += 1;
-                if let Some(end) = enc.finish_talkspurt() {
-                    counts.end_markers += 1;
-                    if !emit(end) {
+                // Encode what is still queued (the tail of the fade, held back by the
+                // resampler at non-48 kHz capture) before the END marker.
+                let tail = enc.finish_talkspurt_flushed().unwrap_or_else(|_| {
+                    if let Some(st) = stats {
+                        st.bump("encode_errors");
+                    }
+                    enc.finish_talkspurt().into_iter().collect()
+                });
+                for p in tail {
+                    if p.payload.is_empty() {
+                        counts.end_markers += 1;
+                    }
+                    if !emit(p) {
                         return false;
                     }
                 }
@@ -473,9 +483,9 @@ mod tests {
     }
 
 
-    fn tone(n: usize, start: usize) -> Vec<f32> {
+    fn tone_at(rate: u32, n: usize, start: usize) -> Vec<f32> {
         (0..n)
-            .map(|k| 0.5 * (std::f32::consts::TAU * 440.0 * (start + k) as f32 / 48_000.0).sin())
+            .map(|k| 0.5 * (std::f32::consts::TAU * 440.0 * (start + k) as f32 / rate as f32).sin())
             .collect()
     }
 
@@ -517,7 +527,21 @@ mod tests {
     /// takes one), the timestamp counts the muted time, and the encoder is never rebuilt.
     #[test]
     fn the_packet_clock_runs_across_a_mute() {
-        let rate = 48_000u32;
+        packet_clock_across_mute(48_000);
+    }
+
+    #[test]
+    fn the_packet_clock_runs_across_a_mute_at_44k1() {
+        packet_clock_across_mute(44_100);
+    }
+
+    #[test]
+    fn the_packet_clock_runs_across_a_mute_at_16k() {
+        packet_clock_across_mute(16_000);
+    }
+
+    fn packet_clock_across_mute(rate: u32) {
+        let frame = (rate / 50) as usize;
         let mut enc = VoiceEncoder::new(VoiceEncoderConfig {
             input_sample_rate: rate,
             enable_dtx: true,
@@ -530,8 +554,8 @@ mod tests {
         let mut pos = 0usize;
         let mut feed = |live: bool, frames: usize, pos: &mut usize, pkts: &mut Vec<VoicePacket>| {
             for _ in 0..frames {
-                let pcm = tone(960, *pos);
-                *pos += 960;
+                let pcm = tone_at(rate, frame, *pos);
+                *pos += frame;
                 feed_gated(&mut enc, &mut gate, &pcm, || live, true, None, &mut counts, |p| {
                     pkts.push(p);
                     true
@@ -556,6 +580,12 @@ mod tests {
             .collect();
         assert_eq!(ends.len(), 1, "one END marker, got {ends:?}");
         assert_eq!(counts.end_markers, 1);
+        // The faded frame is encoded, not discarded with the resampler's backlog: all
+        // 10 voiced frames plus the faded one are on the wire before the END.
+        let voiced_before_end = pkts[..ends[0]].iter().filter(|p| !p.payload.is_empty()).count();
+        assert_eq!(voiced_before_end, 11, "fade tail encoded at {rate} Hz");
+        // END carries the capture clock at that point (11 frames), not a slipped one.
+        assert_eq!(pkts[ends[0]].timestamp, 11 * 960, "END timestamp at {rate} Hz");
         // 24 frames muted after the fade frame (25 fed, the first goes through faded).
         assert_eq!(counts.muted_frames, 24);
         // First packet after the mute is a new talkspurt whose timestamp skipped the gap:
