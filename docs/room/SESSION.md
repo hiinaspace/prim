@@ -25,24 +25,26 @@ Godot / prim ctl / prim ui / tray     (clients; any may come and go)
 - **Requests** (`{"op": ...}`): `status`, `create{name,args}`, `join{token,args}`,
   `resume{room,args}`, `leave`, `cancel`, `voice{on}`, `set_mic{on}`, `set_deafen{on}`,
   `quit`. The control surface is "set mic on/off, set deafen on/off, read the state":
-  a change is a `voice_control(mic, deaf, tray_live)` request to the running voice client
-  (one function, `Control::set_voice_state`): nothing restarts, the incarnation stays, peers'
-  receivers do not reset. Voice is started once (`--start-muted`, `--start-deaf`, `--tray-live`
-  as needed) and restarted only when `voice_status`/`voice_control` says `NotRunning`;
-  `voice_reconnecting` means wait and retry. Exit 4 (takeover or policy) is not fought: the
-  state becomes `busy` until the person turns voice on again (which takes the lease over).
-  **Fail-safe:** every start the session makes (first start, relaunch after a crash, a session
-  restart) is `--start-muted`; only an explicit request opens the mic, so a crashed voice
-  never comes back live. `status.voice.mic/deaf` are what voice last reported, never what was
-  asked for; an unacknowledged request stays pending (retried every 250 ms, `detail` says so).
-  A live process is never replaced for a toggle (so no new incarnation). The session never
-  talks to the voice client while holding its state lock. Open decision: `prim ctl session
-  mic on` with no window and no tray is honoured (an explicit request; refusing needs the
-  session to know a front end is attached, which only `tray_live` says today).
+  a change writes the **desired** state (`gen` bumped) and wakes the supervisor, the only thread
+  that talks to the voice client; it always sends the *full* desired state (`voice_control(mic,
+  deaf, tray_live)`), so requests cannot overtake each other. The call waits up to 3 s for voice's
+  acknowledgement; `status.voice.mic/deaf` are what voice last reported, never what was asked for,
+  and `voice.pending` is "still applying". Nothing restarts: same process, same incarnation, peers'
+  receivers do not reset. A toggle with no voice process only records the desired state; it never
+  starts voice or takes the lease (only `voice on` and the room coming up do). If voice mutes itself
+  (no tracker, no tray) that becomes the desired state, so the session does not unmute it again.
+  **Fail-safe:** every start the session makes (first start, relaunch, session restart) is
+  `--start-muted` with `--start-deaf` following the desired deafen; only an explicit request opens
+  the mic. Exit 4 (takeover or policy) is not fought: state `busy` until the person turns voice on
+  (which takes the lease over). The session never talks to the voice client while holding its
+  state lock. (The room-daemon calls for leave/cancel/quit in `daemon.rs` still run under it;
+  they are short and not changed here.) Open decision: `prim ctl session mic on` with no window and
+  no tray is honoured (an explicit request); refusing needs a front-end-attached signal, which only
+  `tray_live` gives and it is false until T1.
   The voice client mutes itself if Godot's tracking lease goes away and `tray_live` is false;
   the session reads that back (about once a second) so `status.voice.mic` is what voice does.
 - **Status**: `{pid, room: none|starting|up|failed, kind: found|join|resume|attached,
-  error, voice: {running, wanted, mic, deaf, state, detail, pid, starts}}`.
+  error, voice: {running, wanted, mic, deaf, state, detail, pid, starts, pending}}`.
 - **Joining**: `join` returns once the daemon is up; whether the room answers is read from
   `status.join` (ROOM.md). The session never gives up by itself; `cancel` does.
 - **Voice** starts muted and hearing when a room comes up. "Voice on" while another program

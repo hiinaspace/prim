@@ -73,6 +73,10 @@ pub struct VoiceState {
     pub pid: Option<u32>,
     /// How many voice clients this session has started (adoption does not count).
     pub starts: u32,
+    /// A mic/deafen change was asked for and voice has not acknowledged it yet ("applying").
+    /// `mic`/`deaf` above are what voice last reported, never what was asked for.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]

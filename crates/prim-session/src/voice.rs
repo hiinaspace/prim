@@ -1,18 +1,23 @@
-//! `prim voice` as a child of the session: kept running while a room is up. Mic and
-//! deafen are requests to the running client (round VC: `Client::voice_control`); the
-//! process is never restarted for them, so the stream and its incarnation are unchanged.
-//! A lost lease is retried inside the voice process, so the session only starts voice when
-//! none is running (`VoiceError::NotRunning`). Exit 4 now means another program took the
-//! lease over (or policy ended it): the session does not fight back, the person decides.
+//! `prim voice` as a child of the session: kept running while a room is up.
 //!
-//! Fail-safe rules (a live microphone with nothing visible is the one thing never to do):
-//! - every start the session makes is `--start-muted`; the mic goes live only through an
-//!   explicit request (`voice_control`) from an attached client;
-//! - `mic`/`deaf` in the view are what voice last reported, never what was asked for;
-//! - a request that cannot be applied yet (voice starting, reconnecting, no ack) stays
-//!   `pending` and is retried by the supervisor until voice acknowledges it;
-//! - no IPC with the voice client happens while the session state lock is held: the
-//!   supervisor takes a [`Plan`] under the lock, talks unlocked, and applies the outcome.
+//! Mic and deafen are **level-triggered**: a request only writes `desired` (with a
+//! monotonic `gen`); one thread, the supervisor, owns every conversation with the voice
+//! client and always sends the *full* desired state. Nothing is replayed from an older
+//! request, so a late mute cannot be overtaken by an older unmute.
+//!
+//! - `desired` / `gen`: what the person asked for last. Requests never talk to voice.
+//! - `mic` / `deaf` / `reported_gen`: what voice last acknowledged, and for which `gen`.
+//!   `reported_gen < gen` is "applying" (the `pending` flag in the status).
+//! - A reply counts only for the process it was sent to, and a status read counts only if
+//!   no request or ack happened since it was taken.
+//! - Every start the session makes is `--start-muted` and sets `desired.mic = false`;
+//!   `--start-deaf` follows `desired.deaf`. Only an explicit request opens the mic.
+//! - A toggle never starts, replaces or takes over a voice process; only `Voice{on}`
+//!   (`turn_on`) and the room coming up (`poll`) start one.
+//! - The process is never restarted for a toggle, so the stream and incarnation stay. Exit 4
+//!   means another program took the lease over (or policy ended it): not fought.
+//! - No IPC happens while the session state lock is held: the supervisor takes a [`Job`]
+//!   under the lock, talks to voice unlocked, and hands the [`JobResult`] back to `finish`.
 
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -20,51 +25,99 @@ use std::time::{Duration, Instant};
 
 use prim_client::client::{Client, VoiceError};
 use prim_client::paths;
+use prim_client::session::VoiceState;
 use prim_client::transport::UnixTransport;
 use prim_client::wire::VoiceStatus;
-use prim_client::session::VoiceState;
 
 use crate::procs;
 
-/// A change of mic and/or deafen that was asked for.
+/// What the person wants voice to do. Always sent whole.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Req {
-    pub mic: Option<bool>,
-    pub deaf: Option<bool>,
+pub struct Desired {
+    pub mic: bool,
+    pub deaf: bool,
 }
 
-impl Req {
-    fn merge(self, newer: Req) -> Req {
-        Req { mic: newer.mic.or(self.mic), deaf: newer.deaf.or(self.deaf) }
+/// The one way to talk to a running voice client (faked in tests).
+pub trait Link {
+    fn status(&self, sock: &Path) -> Result<VoiceStatus, VoiceError>;
+    fn control(&self, sock: &Path, want: Desired) -> Result<VoiceStatus, VoiceError>;
+}
+
+/// The real thing: the room daemon's local API (`voice_control` / `voice_status`).
+pub struct Daemon;
+
+impl Link for Daemon {
+    fn status(&self, sock: &Path) -> Result<VoiceStatus, VoiceError> {
+        connect(sock)?.voice_status()
+    }
+
+    fn control(&self, sock: &Path, want: Desired) -> Result<VoiceStatus, VoiceError> {
+        let tray = crate::tray::live();
+        let c = connect(sock)?;
+        // `voice_reconnecting` is wait-and-retry, never a restart. One short wait here; the
+        // supervisor comes back for more.
+        for _ in 0..3 {
+            match c.voice_control(Some(want.mic), Some(want.deaf), Some(tray)) {
+                Err(VoiceError::Reconnecting) => std::thread::sleep(Duration::from_millis(300)),
+                r => return r,
+            }
+        }
+        Err(VoiceError::Reconnecting)
     }
 }
 
-/// What the supervisor does with the voice client without holding the state lock.
-pub struct Plan {
-    pending: Option<Req>,
+fn connect(sock: &Path) -> Result<Client, VoiceError> {
+    let c = Client::start(UnixTransport::new(sock));
+    for _ in 0..50 {
+        if c.is_connected() {
+            return Ok(c);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(VoiceError::Other("room daemon not reachable".into()))
 }
 
-/// The outcome of a [`Plan`].
-pub struct Probe {
-    status: Result<VoiceStatus, VoiceError>,
-    applied: Option<(Req, Result<VoiceStatus, VoiceError>)>,
+/// One conversation with the voice client, planned under the lock.
+pub struct Job {
+    pid: i32,
+    gen: u64,
+    acks: u64,
+    want: Desired,
+    /// Send `want` (true) or only read the status (false).
+    send: bool,
+}
+
+pub struct JobResult {
+    job: Job,
+    res: Result<VoiceStatus, VoiceError>,
+}
+
+/// Unlocked: do the conversation.
+pub fn run_job(link: &dyn Link, sock: &Path, job: Job) -> JobResult {
+    let res = if job.send { link.control(sock, job.want) } else { link.status(sock) };
+    JobResult { job, res }
 }
 
 pub struct Voice {
     /// The session starts voice by itself once a room is up.
     pub wanted: bool,
+    /// What voice last reported (never what was asked for).
     pub mic: bool,
     pub deaf: bool,
+    desired: Desired,
+    gen: u64,
+    reported_gen: u64,
+    /// Bumped on every acknowledgement and every start: a status read taken before is stale.
+    acks: u64,
     child: Option<Child>,
     /// A voice client left by an earlier session (we have no `Child`, only its pid).
     adopted: Option<i32>,
     state: &'static str,
     detail: String,
     starts: u32,
-    /// A mic/deafen request that voice has not acknowledged yet (still starting, reconnecting).
-    pending: Option<Req>,
-    pending_since: Option<Instant>,
     last_probe: Option<Instant>,
+    retry_at: Option<Instant>,
     /// Private-sink mode for tests: a tone "microphone" and a null output, never real devices.
     test: bool,
 }
@@ -76,14 +129,17 @@ impl Voice {
             // The mic starts muted: being in the room without talking is the default.
             mic: false,
             deaf: false,
+            desired: Desired::default(),
+            gen: 0,
+            reported_gen: 0,
+            acks: 0,
             child: None,
             adopted: None,
             state: "off",
             detail: String::new(),
             starts: 0,
-            pending: None,
-            pending_since: None,
             last_probe: None,
+            retry_at: None,
             test: std::env::var_os("PRIM_SESSION_VOICE_TEST").is_some()
                 || std::env::var_os("PRIM_UI_VOICE_TEST").is_some(),
         }
@@ -97,6 +153,15 @@ impl Voice {
         self.pid().is_some()
     }
 
+    /// Voice has acknowledged everything asked so far (or there is nothing to apply it to).
+    pub fn settled(&self) -> bool {
+        !self.running() || self.reported_gen >= self.gen
+    }
+
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+
     pub fn view(&self) -> VoiceState {
         VoiceState {
             running: self.running(),
@@ -107,6 +172,7 @@ impl Voice {
             detail: self.detail.clone(),
             pid: self.pid().map(|p| p as u32),
             starts: self.starts,
+            pending: self.running() && self.reported_gen < self.gen,
         }
     }
 
@@ -120,10 +186,10 @@ impl Voice {
             format!("--levels={}", paths::voice_levels(sock).display()),
             format!("--capture={capture}"),
             format!("--output={output}"),
+            // Always muted: only an explicit request from an attached client opens the mic.
+            "--start-muted".to_string(),
         ];
-        // Always muted: only an explicit request from an attached client opens the mic.
-        a.push("--start-muted".into());
-        if self.deaf {
+        if self.desired.deaf {
             a.push("--start-deaf".into());
         }
         if crate::tray::live() {
@@ -145,17 +211,24 @@ impl Voice {
                 self.state = "running";
                 self.detail.clear();
                 self.starts += 1;
-                // The new process is muted whatever the last one was doing; an old unapplied
-                // request must not unmute a relaunch.
-                self.mic = false;
-                self.pending = None;
-                self.pending_since = None;
+                self.started_as_desired();
             }
             Err(e) => {
                 self.state = "failed";
                 self.detail = e.to_string();
             }
         }
+    }
+
+    /// A new process starts muted and with `desired.deaf`: that is also what is desired now.
+    fn started_as_desired(&mut self) {
+        self.desired.mic = false;
+        self.gen += 1;
+        self.reported_gen = self.gen;
+        self.mic = false;
+        self.deaf = self.desired.deaf;
+        self.acks += 1;
+        self.retry_at = None;
     }
 
     fn kill_running(&mut self, sock: &Path) {
@@ -185,9 +258,11 @@ impl Voice {
         self.kill_running(sock);
         self.state = "off";
         self.detail.clear();
-        self.pending = None;
-        self.pending_since = None;
         // Next time voice is turned on it starts muted and hearing, as documented.
+        self.desired = Desired::default();
+        self.gen += 1;
+        self.reported_gen = self.gen;
+        self.acks += 1;
         self.mic = false;
         self.deaf = false;
     }
@@ -205,87 +280,111 @@ impl Voice {
         }
     }
 
-    /// A request for mic/deafen. With no voice process, start one (muted) and keep the request
-    /// pending until it has a lease. With a process (leased or not) return the request for the
-    /// caller to send unlocked: a live process is never replaced for a toggle.
-    pub fn request(&mut self, req: Req, room_up: bool, sock: &Path) -> Option<Req> {
-        if self.running() {
-            return Some(req);
+    /// A request for mic and/or deafen: write `desired` and bump `gen`, nothing else. It never
+    /// starts, replaces or takes over a voice process and never talks to voice. Returns the
+    /// new `gen`; the supervisor applies it.
+    pub fn set_desired(&mut self, mic: Option<bool>, deaf: Option<bool>) -> u64 {
+        if let Some(m) = mic {
+            self.desired.mic = m;
         }
-        if self.wanted && room_up {
-            self.start(sock, true);
-            self.set_pending(req);
+        if let Some(d) = deaf {
+            self.desired.deaf = d;
+        }
+        self.gen += 1;
+        self.gen
+    }
+
+    /// Under the lock: what should the supervisor say to the voice client next, if anything?
+    pub fn next_job(&mut self, room_up: bool) -> Option<Job> {
+        let pid = self.pid()?;
+        if !room_up {
+            return None;
+        }
+        let now = Instant::now();
+        if self.reported_gen < self.gen {
+            if self.retry_at.is_some_and(|t| now < t) {
+                return None;
+            }
+            return Some(Job { pid, gen: self.gen, acks: self.acks, want: self.desired, send: true });
+        }
+        if self.last_probe.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            self.last_probe = Some(now);
+            return Some(Job { pid, gen: self.gen, acks: self.acks, want: self.desired, send: false });
         }
         None
     }
 
-    fn set_pending(&mut self, req: Req) {
-        self.pending = Some(self.pending.map_or(req, |p| p.merge(req)));
-        self.pending_since.get_or_insert_with(Instant::now);
-    }
-
-    /// What voice reports is the truth (it may have muted itself); requests don't edit it.
-    pub fn learn(&mut self, st: &VoiceStatus) {
-        if st.voice_running {
-            self.mic = st.mic;
-            self.deaf = st.deaf;
+    /// Under the lock again: fold in the outcome of a conversation.
+    pub fn finish(&mut self, r: JobResult) {
+        let JobResult { job, res } = r;
+        // A reply for another process (voice was replaced meanwhile) says nothing about this one.
+        if self.pid() != Some(job.pid) {
+            return;
         }
-    }
-
-    /// Fold in the outcome of a request sent to the voice client.
-    pub fn applied(&mut self, req: Req, r: Result<VoiceStatus, VoiceError>) {
-        match r {
-            Ok(st) => {
-                self.learn(&st);
-                self.pending = None;
-                self.pending_since = None;
+        match (job.send, res) {
+            (true, Ok(st)) => {
+                // Voice applied the full state that was sent for `job.gen`. If a newer request
+                // arrived meanwhile, `reported_gen < gen` and the next job sends that one.
+                self.acks += 1;
+                self.retry_at = None;
                 self.detail.clear();
+                if st.voice_running {
+                    self.mic = st.mic;
+                    self.deaf = st.deaf;
+                }
+                self.reported_gen = self.reported_gen.max(job.gen);
             }
-            Err(e) => {
-                // Not acknowledged (starting, reconnecting, no ack): keep it and retry.
-                self.set_pending(req);
+            (true, Err(e)) => {
+                // Changes nothing but the note and the retry timer.
+                self.retry_at = Some(Instant::now() + Duration::from_millis(250));
                 self.detail = format!("mic/deafen change not applied yet ({e}); retrying");
             }
-        }
-    }
-
-    /// Under the lock: should the supervisor talk to the voice client now?
-    pub fn plan(&mut self, room_up: bool) -> Option<Plan> {
-        let every = if self.pending.is_some() { Duration::from_millis(250) } else { Duration::from_secs(1) };
-        if !(self.running() && room_up && self.last_probe.is_none_or(|t| t.elapsed() >= every)) {
-            return None;
-        }
-        self.last_probe = Some(Instant::now());
-        Some(Plan { pending: self.pending })
-    }
-
-    /// Under the lock again: apply what the unlocked probe found.
-    pub fn finish_probe(&mut self, p: Probe) {
-        if let Ok(st) = &p.status {
-            self.learn(st);
-        }
-        if let Some((req, r)) = p.applied {
-            self.applied(req, r);
-        }
-        if self.pending.is_some() && self.pending_since.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
-            self.detail = "voice process is up but holds no lease; mic/deafen change is waiting".into();
+            (false, Ok(st)) => {
+                // Only a read taken with nothing in flight and nothing acked since is current.
+                if st.voice_running && st.reported && job.gen == self.gen && job.acks == self.acks && self.reported_gen >= self.gen {
+                    self.mic = st.mic;
+                    self.deaf = st.deaf;
+                    if st.mic != self.desired.mic {
+                        if !st.mic {
+                            // Voice muted itself (its safety rule): that is now what is wanted,
+                            // or the session would unmute it again.
+                            self.desired.mic = false;
+                            self.gen += 1;
+                            self.reported_gen = self.gen;
+                        } else {
+                            // A live mic that should be muted: send the desired state again.
+                            self.gen += 1;
+                        }
+                    }
+                    if st.deaf != self.desired.deaf {
+                        self.gen += 1;
+                    }
+                }
+            }
+            (false, Err(_)) => {}
         }
     }
 
     /// Find a voice client for this room that is already running and treat it as ours.
-    /// Its mic and deafen state is read from its own command line.
-    pub fn adopt(&mut self, sock: &Path) {
+    /// Its mic and deafen state is read from its own report.
+    pub fn adopt(&mut self, link: &dyn Link, sock: &Path) {
         let found = procs::find("voice", "rt-socket", &[paths::rt_socket(sock)], false);
         if let Some((pid, argv)) = found.into_iter().next() {
-            // Mic and deafen come from the client's own report; the command line only
-            // says how it started, which is stale once it has been muted at run time.
-            match status(sock) {
-                Ok(st) if st.voice_running => self.learn(&st),
+            match link.status(sock) {
+                Ok(st) if st.voice_running && st.reported => {
+                    self.mic = st.mic;
+                    self.deaf = st.deaf;
+                }
                 _ => {
-                    self.mic = false; // unknown: report muted until its own report arrives
+                    // Unknown: report muted until its own report arrives.
+                    self.mic = false;
                     self.deaf = argv.iter().any(|a| a == "--start-deaf");
                 }
             }
+            self.desired = Desired { mic: self.mic, deaf: self.deaf };
+            self.gen += 1;
+            self.reported_gen = self.gen;
+            self.acks += 1;
             self.adopted = Some(pid);
             self.state = "running";
             self.wanted = true;
@@ -328,105 +427,185 @@ impl Voice {
         if self.wanted && room_up && !self.running() && self.state == "off" {
             self.start(sock, false);
         }
-        if !room_up && self.running() && self.child.is_some() {
-            // Voice exits by itself (code 5) when the daemon is gone; nothing to do.
-        }
     }
-}
-
-fn connect(sock: &Path) -> Option<Client> {
-    let c = Client::start(UnixTransport::new(sock));
-    let end = Instant::now() + Duration::from_millis(500);
-    for _ in 0..50 {
-        if c.is_connected() || Instant::now() >= end {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    c.is_connected().then_some(c)
-}
-
-fn status(sock: &Path) -> Result<VoiceStatus, VoiceError> {
-    match connect(sock) {
-        Some(c) => c.voice_status(),
-        None => Err(VoiceError::Other("room daemon not reachable".into())),
-    }
-}
-
-/// Ask the running voice client to change mic/deafen. `voice_reconnecting` is wait-and-retry,
-/// never a restart (a process that is really gone is started again by `poll`).
-pub fn control(sock: &Path, req: Req, tries: u32) -> Result<VoiceStatus, VoiceError> {
-    let tray = crate::tray::live();
-    let c = connect(sock).ok_or_else(|| VoiceError::Other("room daemon not reachable".into()))?;
-    for _ in 0..tries.max(1) {
-        match c.voice_control(req.mic, req.deaf, Some(tray)) {
-            Err(VoiceError::Reconnecting) => std::thread::sleep(Duration::from_millis(300)),
-            r => return r,
-        }
-    }
-    Err(VoiceError::Reconnecting)
-}
-
-/// Unlocked: read what voice does and, when a request is pending and voice is up, send it
-/// (one try; the supervisor comes back in 250 ms).
-pub fn probe(sock: &Path, plan: Plan) -> Probe {
-    let status = status(sock);
-    let applied = match (&status, plan.pending) {
-        (Ok(st), Some(req)) if st.voice_running => Some((req, control(sock, req, 1))),
-        _ => None,
-    };
-    Probe { status, applied }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     fn st(mic: bool, deaf: bool) -> VoiceStatus {
-        VoiceStatus { voice_running: true, mic, deaf, ..Default::default() }
+        VoiceStatus { voice_running: true, reported: true, mic, deaf, ..Default::default() }
+    }
+
+    /// A voice that is "up": any live pid will do; no process is touched.
+    fn up() -> Voice {
+        let mut v = Voice::new(true);
+        v.adopted = Some(std::process::id() as i32);
+        v.state = "running";
+        v
+    }
+
+    struct Fake {
+        sent: RefCell<Vec<Desired>>,
+        status: RefCell<VoiceStatus>,
+    }
+
+    impl Link for Fake {
+        fn status(&self, _: &Path) -> Result<VoiceStatus, VoiceError> {
+            Ok(self.status.borrow().clone())
+        }
+        fn control(&self, _: &Path, want: Desired) -> Result<VoiceStatus, VoiceError> {
+            self.sent.borrow_mut().push(want);
+            *self.status.borrow_mut() = st(want.mic, want.deaf);
+            Ok(self.status.borrow().clone())
+        }
+    }
+
+    fn fake() -> Fake {
+        Fake { sent: RefCell::new(vec![]), status: RefCell::new(st(false, false)) }
+    }
+
+    const SOCK: &str = "/nonexistent/room.sock";
+
+    #[test]
+    fn a_mute_after_an_unmute_while_voice_reconnects_ends_muted_with_nothing_outstanding() {
+        let mut v = up();
+        v.set_desired(Some(true), None);
+        let j1 = v.next_job(true).unwrap();
+        // The first send hits a reconnect and fails; the person mutes meanwhile.
+        v.set_desired(Some(false), None);
+        v.finish(JobResult { job: j1, res: Err(VoiceError::Reconnecting) });
+        assert!(v.view().pending && v.view().detail.contains("not applied"));
+        v.retry_at = None; // the 250 ms timer elapsed
+        let link = fake();
+        let j2 = v.next_job(true).unwrap();
+        let r2 = run_job(&link, Path::new(SOCK), j2);
+        v.finish(r2);
+        // What voice was last told is the muted state; the old unmute is never replayed.
+        assert_eq!(link.sent.borrow().as_slice(), &[Desired { mic: false, deaf: false }]);
+        assert!(!v.mic && !v.view().pending && v.settled());
+        assert!(v.next_job(true).is_none_or(|j| !j.send), "nothing left to send");
     }
 
     #[test]
-    fn a_running_process_is_never_replaced_for_a_toggle() {
-        let mut v = Voice::new(true);
-        v.adopted = Some(std::process::id() as i32); // any live pid: "a voice that is up"
-        let req = Req { mic: Some(true), deaf: None };
-        assert_eq!(v.request(req, true, Path::new("/nonexistent/room.sock")), Some(req));
-        assert_eq!(v.starts, 0, "no start was made");
+    fn two_requests_in_either_order_leave_the_last_write_at_voice() {
+        let mut v = up();
+        let link = fake();
+        // Two ctl threads write under the lock; whichever lands last is `desired`.
+        v.set_desired(Some(true), Some(true));
+        v.set_desired(Some(false), None);
+        let j = v.next_job(true).unwrap();
+        let r = run_job(&link, Path::new(SOCK), j);
+        v.finish(r);
+        assert_eq!(link.sent.borrow().as_slice(), &[Desired { mic: false, deaf: true }], "full state, last write wins");
+        assert!(v.settled());
     }
 
     #[test]
-    fn an_unacknowledged_request_stays_pending_and_status_does_not_run_ahead() {
-        let mut v = Voice::new(true);
-        let mute = Req { mic: Some(false), deaf: None };
-        v.mic = true; // voice reports a live mic
-        v.applied(mute, Err(VoiceError::NoAck));
-        assert!(v.mic, "status still shows what voice reported, not what was asked");
-        assert_eq!(v.pending, Some(mute), "the mute is kept for retry");
-        assert!(v.detail.contains("not applied"), "{}", v.detail);
-        // A later probe's status read must not erase the pending mute.
-        v.learn(&st(true, false));
-        assert_eq!(v.pending, Some(mute));
-        // Acknowledged: now it clears and the report is adopted.
-        v.applied(mute, Ok(st(false, false)));
-        assert!(!v.mic && v.pending.is_none() && v.detail.is_empty());
+    fn a_request_made_during_a_send_is_sent_next_not_lost_and_not_marked_acked() {
+        let mut v = up();
+        let link = fake();
+        v.set_desired(Some(true), None);
+        let j1 = v.next_job(true).unwrap();
+        v.set_desired(Some(false), None); // arrives while j1 is in flight
+        let r1 = run_job(&link, Path::new(SOCK), j1);
+        v.finish(r1);
+        assert!(!v.settled(), "the reply was for the older gen");
+        let j2 = v.next_job(true).unwrap();
+        assert!(j2.send);
+        let r2 = run_job(&link, Path::new(SOCK), j2);
+        v.finish(r2);
+        assert_eq!(link.sent.borrow().last(), Some(&Desired { mic: false, deaf: false }));
+        assert!(v.settled() && !v.mic);
     }
 
     #[test]
-    fn pending_requests_merge_newest_wins() {
-        let mut v = Voice::new(true);
-        v.applied(Req { mic: Some(true), deaf: Some(true) }, Err(VoiceError::Reconnecting));
-        v.applied(Req { mic: Some(false), deaf: None }, Err(VoiceError::Reconnecting));
-        assert_eq!(v.pending, Some(Req { mic: Some(false), deaf: Some(true) }));
+    fn a_reply_for_an_old_process_is_ignored() {
+        let mut v = up();
+        v.set_desired(Some(true), None);
+        let j = v.next_job(true).unwrap();
+        // The process is replaced before the reply arrives.
+        v.adopted = Some(std::process::id() as i32 + 1_000_000);
+        let before = (v.mic, v.reported_gen);
+        v.finish(JobResult { job: j, res: Ok(st(true, false)) });
+        assert_eq!((v.mic, v.reported_gen), before, "the new process was not credited with the old reply");
     }
 
     #[test]
-    fn start_args_are_always_muted() {
+    fn a_stale_status_read_does_not_flip_reported_after_a_newer_ack() {
+        let mut v = up();
+        let link = fake();
+        // A read is taken (voice says muted), then a request is sent and acknowledged.
+        v.reported_gen = v.gen;
+        let probe = v.next_job(true).unwrap();
+        assert!(!probe.send);
+        let stale = run_job(&link, Path::new(SOCK), probe); // reads mic=false
+        v.set_desired(Some(true), None);
+        let j = v.next_job(true).unwrap();
+        let r = run_job(&link, Path::new(SOCK), j);
+        v.finish(r); // acked: mic live
+        v.finish(stale); // the old read arrives late
+        assert!(v.mic, "the older read must not report muted while the mic is live");
+        assert!(v.settled());
+    }
+
+    #[test]
+    fn voice_muting_itself_is_not_undone_by_the_session() {
+        let mut v = up();
+        let link = fake();
+        v.set_desired(Some(true), None);
+        let j = v.next_job(true).unwrap();
+        let r = run_job(&link, Path::new(SOCK), j);
+        v.finish(r);
+        assert!(v.mic);
+        // Voice's safety rule mutes it with no request outstanding.
+        *link.status.borrow_mut() = st(false, false);
+        v.last_probe = None;
+        let p = v.next_job(true).unwrap();
+        assert!(!p.send);
+        let r = run_job(&link, Path::new(SOCK), p);
+        v.finish(r);
+        assert!(!v.mic && !v.desired.mic && v.settled(), "adopted as the wanted state");
+        v.last_probe = None;
+        assert!(v.next_job(true).is_none_or(|j| !j.send), "nothing is sent to unmute it again");
+    }
+
+    #[test]
+    fn a_live_mic_that_should_be_muted_is_sent_the_desired_state_again() {
+        let mut v = up();
+        let link = fake();
+        *link.status.borrow_mut() = st(true, false); // voice is live, desired is muted
+        v.last_probe = None;
+        let p = v.next_job(true).unwrap();
+        let r = run_job(&link, Path::new(SOCK), p);
+        v.finish(r);
+        let j = v.next_job(true).unwrap();
+        assert!(j.send && !j.want.mic, "resend the muted state");
+    }
+
+    #[test]
+    fn a_deafen_before_the_room_is_up_starts_voice_deaf_and_always_muted() {
         let mut v = Voice::new(true);
-        v.mic = true; // a stale "live" belief must not reach a relaunch
-        v.deaf = true;
-        let a = v.args(Path::new("/x/room.sock"), false);
-        assert!(a.iter().any(|x| x == "--start-muted"), "{a:?}");
+        v.set_desired(Some(true), Some(true)); // before any voice process exists
+        let a = v.args(Path::new(SOCK), false);
         assert!(a.iter().any(|x| x == "--start-deaf"), "{a:?}");
+        assert!(a.iter().any(|x| x == "--start-muted"), "{a:?}");
+        // The start itself makes "muted" the desired mic and settles what it started with.
+        v.started_as_desired();
+        assert!(!v.desired.mic && v.desired.deaf && v.deaf && !v.mic);
+        assert_eq!(v.reported_gen, v.gen);
+    }
+
+    #[test]
+    fn a_toggle_with_no_voice_process_starts_nothing_and_takes_nothing_over() {
+        let mut v = Voice::new(true);
+        v.state = "busy"; // another program holds the lease
+        let g = v.set_desired(Some(false), Some(true));
+        assert_eq!(g, v.gen());
+        assert!(v.next_job(true).is_none(), "no process: nothing to talk to");
+        assert!(!v.running() && v.starts == 0, "no start");
+        assert_eq!(v.state, "busy", "no takeover");
     }
 }

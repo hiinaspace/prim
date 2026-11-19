@@ -312,8 +312,9 @@ async fn roster_chat_voice_and_non_members() {
 
     // The lease expires when the client is frozen; the client reconnects itself.
     call(SessionRequest::Voice { on: true });
-    // A mute pressed while voice is still starting must not be lost: unmute then mute at once,
-    // before the new client has a lease. It must end muted, with the status never ahead of voice.
+    // Unmute then mute straight after turning voice on, while the new client may not have a
+    // lease yet (each call waits up to 3 s for voice's acknowledgement). It must end muted.
+    // The ordering guarantees themselves are unit-tested in prim-session's voice.rs.
     call(SessionRequest::SetMic { on: true });
     call(SessionRequest::SetMic { on: false });
     b.win.wait_until_a(10, "voice back", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();

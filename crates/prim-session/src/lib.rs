@@ -21,7 +21,7 @@ mod voice;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -50,6 +50,9 @@ pub(crate) struct State {
 #[derive(Clone)]
 pub struct Control {
     state: Arc<Mutex<State>>,
+    /// Signalled when a request is written and when voice acknowledges one: the supervisor
+    /// (the only sender to the voice client) wakes on it, request callers wait on it.
+    changed: Arc<Condvar>,
 }
 
 impl Control {
@@ -116,28 +119,24 @@ impl Control {
         Ok(status_of(&s))
     }
 
-    /// The one place mic and deafen change: a request to the running voice client, which
-    /// changes in place (no restart, same incarnation). A process is never replaced for a
-    /// toggle; a request that cannot be applied yet stays pending (see `voice.rs`) and the
-    /// returned status shows what voice actually reports, never what was asked for.
+    /// The one place mic and deafen change. It writes the desired state and wakes the
+    /// supervisor, which alone talks to the voice client (always sending the whole desired
+    /// state, so requests cannot overtake each other). The call waits up to 3 s for voice to
+    /// acknowledge; the returned status shows what voice reports, and `voice.pending` says
+    /// whether the change is still being applied. A toggle never starts or replaces voice.
     pub fn set_voice_state(&self, mic: Option<bool>, deaf: Option<bool>) -> Result<SessionStatus, String> {
-        let req = voice::Req { mic, deaf };
-        let (sock, remote) = {
-            let mut s = self.lock();
-            if mic == Some(true) || deaf.is_some() {
-                s.voice.wanted = true;
+        let mut s = self.lock();
+        s.voice.set_desired(mic, deaf);
+        self.changed.notify_all();
+        let end = Instant::now() + Duration::from_secs(3);
+        while !s.voice.settled() {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
             }
-            let room_up = s.room.phase() == "up";
-            let sock = s.room_socket.clone();
-            let remote = s.voice.request(req, room_up, &sock);
-            (sock, remote)
-        };
-        if let Some(req) = remote {
-            // Unlocked: the voice client may take a second to acknowledge.
-            let r = voice::control(&sock, req, 12);
-            self.lock().voice.applied(req, r);
+            s = self.changed.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
         }
-        Ok(status_of(&self.lock()))
+        Ok(status_of(&s))
     }
 
     pub fn quit(&self) -> SessionStatus {
@@ -198,34 +197,38 @@ pub fn run(opts: Options) -> Result<()> {
     let mut voice = Voice::new(opts.voice);
     // Adopt whatever an earlier session (or Godot of an older build) left running.
     room.adopt(&opts.room_socket);
-    voice.adopt(&opts.room_socket);
+    voice.adopt(&voice::Daemon, &opts.room_socket);
     let state = Arc::new(Mutex::new(State {
         room_socket: opts.room_socket.clone(),
         room,
         voice,
         quit: false,
     }));
-    let control = Control { state: state.clone() };
+    let control = Control { state: state.clone(), changed: Arc::new(Condvar::new()) };
     println!("session {} on {}", std::process::id(), ctl_path.display());
     {
         let c = control.clone();
         std::thread::Builder::new()
             .name("supervise".into())
             .spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(250));
-                let plan = {
+                // The only thread that talks to the voice client: plan under the lock,
+                // talk unlocked (status calls, ctl and accept never wait for voice), fold
+                // the answer in, and go round again at once if a newer request arrived.
+                let job = {
                     let mut s = c.lock();
                     tick(&mut s);
                     let room_up = s.room.phase() == "up";
                     let sock = s.room_socket.clone();
-                    s.voice.plan(room_up).map(|p| (sock, p))
+                    s.voice.next_job(room_up).map(|j| (sock, j))
                 };
-                // Talk to the voice client with the state unlocked (status calls, ctl and
-                // accept must not wait for it).
-                if let Some((sock, plan)) = plan {
-                    let out = voice::probe(&sock, plan);
-                    c.lock().voice.finish_probe(out);
+                if let Some((sock, job)) = job {
+                    let r = voice::run_job(&voice::Daemon, &sock, job);
+                    c.lock().voice.finish(r);
+                    c.changed.notify_all();
+                    continue;
                 }
+                let s = c.lock();
+                let _ = c.changed.wait_timeout(s, Duration::from_millis(250));
             })?;
     }
     tray::start(control.clone());
