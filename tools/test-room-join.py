@@ -68,7 +68,7 @@ if dst.is_symlink() or dst.exists():
 dst.symlink_to(lib)
 
 godot = a.godot or os.environ.get("PRIM_GODOT")
-for c in (godot, ROOT / ".local/godot/bin/godot", Path.home() / "code/prim-l0/.local/godot/bin/godot", shutil.which("godot")):
+for c in (godot, ROOT / ".local/godot/bin/godot", Path.home() / "code/prim-gw/.local/godot/bin/godot", Path.home() / "code/prim-l0/.local/godot/bin/godot", shutil.which("godot")):
     if c and Path(c).exists():
         godot = str(c)
         break
