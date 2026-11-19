@@ -1,6 +1,7 @@
-//! Round GW oracle: the client layer the room window uses, against real daemons over
-//! loopback iroh. No window is opened; `prim_ui::client` is the same code the window
-//! reads every frame. Voice uses the private test sinks (a tone "microphone", a null
+//! Round GW oracle (ported to `prim-client` in round A1): the client layer every front
+//! end uses (the Godot client, the dev window, `prim ctl`), against real daemons over
+//! loopback iroh. No window is opened; `prim_client::room::Handle` is the same code Godot
+//! reads every frame, and voice runs under a real `prim session` process. Voice uses the private test sinks (a tone "microphone", a null
 //! output): never real speakers or a real microphone.
 
 use std::net::SocketAddr;
@@ -11,10 +12,25 @@ use std::time::Duration;
 use prim_room::daemon::{Daemon, DaemonOpts, Start};
 use prim_room::local::{Client, ReplyJson, Request};
 use prim_room::transport::iroh::{IrohConfig, IrohTransport, PeerAddrs, RelaySetting};
-use prim_ui::chat::Clients;
-use prim_ui::client::{attach, send_chat_once, AttachOpts, Cmd, Handle, Presence};
-use prim_ui::supervise::{self, ProcState, Voice};
+use prim_client::chat::Clients;
+use prim_client::room::{send_chat_once, Cmd, Delivery, Handle, Model, Presence, RoomOpts};
+use prim_client::session::{SessionClient, SessionRequest};
+use prim_client::transport::UnixTransport;
 use room_core::api::Timing;
+
+/// The blocking waits of `Handle`, usable from async tests without stalling the runtime.
+trait WaitAsync {
+    async fn wait_for_a(&self, secs: u64, what: &str, f: impl FnMut(&Model) -> bool) -> Result<(), String>;
+    async fn wait_until_a(&self, secs: u64, what: &str, f: impl FnMut() -> bool) -> Result<(), String>;
+}
+impl WaitAsync for Handle {
+    async fn wait_for_a(&self, secs: u64, what: &str, f: impl FnMut(&Model) -> bool) -> Result<(), String> {
+        tokio::task::block_in_place(|| self.wait_for(secs, what, f))
+    }
+    async fn wait_until_a(&self, secs: u64, what: &str, f: impl FnMut() -> bool) -> Result<(), String> {
+        tokio::task::block_in_place(|| self.wait_until(secs, what, f))
+    }
+}
 
 struct Node {
     daemon: Daemon,
@@ -29,11 +45,13 @@ struct Fleet {
 
 impl Fleet {
     fn new() -> Fleet {
-        // The window spawns the real `prim` binary for voice.
-        std::env::set_var("PRIM_UI_EXE", env!("CARGO_BIN_EXE_prim"));
-        std::env::set_var("PRIM_UI_VOICE_TEST", "1");
+        // The session spawns the real `prim` binary for voice.
+        std::env::set_var("PRIM_BIN", env!("CARGO_BIN_EXE_prim"));
+        std::env::set_var("PRIM_SESSION_VOICE_TEST", "1");
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path().join("xdg-state"));
         Fleet {
-            dir: tempfile::tempdir().unwrap(),
+            dir,
             addrs: Arc::new(Mutex::new(Default::default())),
         }
     }
@@ -74,16 +92,14 @@ impl Fleet {
         })
         .await
         .unwrap();
-        let win = attach(
-            &socket,
-            AttachOpts {
+        let win = Handle::attach(
+            UnixTransport::new(&socket),
+            RoomOpts {
                 chat: true,
                 default_name: Some(name.to_string()),
                 ..Default::default()
             },
-        )
-        .await
-        .unwrap();
+        );
         Node {
             daemon,
             socket,
@@ -101,7 +117,7 @@ impl Fleet {
         let before = via.win.lock().invite.as_ref().map(|i| i.0).unwrap_or(0);
         via.win.send(Cmd::Invite);
         via.win
-            .wait_for(5, "invite", |m| m.invite.as_ref().is_some_and(|i| i.0 > before))
+            .wait_for_a(5, "invite", |m| m.invite.as_ref().is_some_and(|i| i.0 > before))
             .await
             .unwrap();
         let token = via.win.lock().invite.clone().unwrap().1;
@@ -134,9 +150,9 @@ async fn roster_chat_voice_and_non_members() {
     let f = Fleet::new();
     let a = f.found("alice").await;
     // Founding gives the window a room with only you in it.
-    a.win.wait_for(5, "alice alone", |m| m.in_room()).await.unwrap();
+    a.win.wait_for_a(5, "alice alone", |m| m.in_room()).await.unwrap();
     a.win
-        .wait_for(5, "alice named", |m| m.members().iter().any(|r| r.is_me && r.name == "alice"))
+        .wait_for_a(5, "alice named", |m| m.members().iter().any(|r| r.is_me && r.name == "alice"))
         .await
         .unwrap();
     assert_eq!(online_names(&a.win), ["alice"]);
@@ -144,12 +160,12 @@ async fn roster_chat_voice_and_non_members() {
     // Create + invite + join: both rosters converge, with names and a route.
     let b = f.join("bob", &a).await;
     for (who, h) in [("alice", &a.win), ("bob", &b.win)] {
-        h.wait_until(15, &format!("{who} sees both"), || online_names(h) == ["alice", "bob"])
+        h.wait_until_a(15, &format!("{who} sees both"), || online_names(h) == ["alice", "bob"])
             .await
             .unwrap();
     }
     a.win
-        .wait_for(10, "route to bob", |m| {
+        .wait_for_a(10, "route to bob", |m| {
             m.members().iter().any(|r| r.name == "bob" && r.route.as_ref().is_some_and(|rt| rt.path != ""))
         })
         .await
@@ -159,31 +175,31 @@ async fn roster_chat_voice_and_non_members() {
 
     // Chat both ways, with delivery results.
     a.win.chat("test");
-    b.win.wait_until(5, "bob gets test", || lines(&b.win).contains(&("alice".into(), "test".into()))).await.unwrap();
+    b.win.wait_until_a(5, "bob gets test", || lines(&b.win).contains(&("alice".into(), "test".into()))).await.unwrap();
     b.win.chat("something's not working");
     a.win
-        .wait_until(5, "alice gets reply", || lines(&a.win).contains(&("bob".into(), "something's not working".into())))
+        .wait_until_a(5, "alice gets reply", || lines(&a.win).contains(&("bob".into(), "something's not working".into())))
         .await
         .unwrap();
     a.win
-        .wait_for(5, "delivery receipt", |m| {
+        .wait_for_a(5, "delivery receipt", |m| {
             m.chat.iter().any(|l| {
                 l.text == "test"
-                    && matches!(&l.delivery, Some(prim_ui::client::Delivery::Done { ok: 1, total: 1, failed }) if failed.is_empty())
+                    && matches!(&l.delivery, Some(Delivery::Done { ok: 1, total: 1, failed }) if failed.is_empty())
             })
         })
         .await
         .unwrap();
 
     // `prim ctl chat send` reaches the other member and this machine's own window.
-    let (ok, total, failed) = send_chat_once(&a.socket, "from a script", Duration::from_secs(5)).await.unwrap();
+    let (ok, total, failed) = tokio::task::block_in_place(|| send_chat_once(UnixTransport::new(&a.socket), "from a script", Duration::from_secs(5))).unwrap();
     assert_eq!((ok, total, failed.len()), (1, 1, 0));
-    b.win.wait_until(5, "script line at bob", || lines(&b.win).contains(&("alice".into(), "from a script".into()))).await.unwrap();
-    a.win.wait_until(5, "script line at own window", || lines(&a.win).contains(&("alice".into(), "from a script".into()))).await.unwrap();
+    b.win.wait_until_a(5, "script line at bob", || lines(&b.win).contains(&("alice".into(), "from a script".into()))).await.unwrap();
+    a.win.wait_until_a(5, "script line at own window", || lines(&a.win).contains(&("alice".into(), "from a script".into()))).await.unwrap();
 
     // A late joiner sees nothing from before it joined.
     let c = f.join("carol", &a).await;
-    c.win.wait_until(15, "carol sees roster", || online_names(&c.win).len() == 3).await.unwrap();
+    c.win.wait_until_a(15, "carol sees roster", || online_names(&c.win).len() == 3).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         lines(&c.win).iter().all(|(_, t)| t != "test" && t != "from a script"),
@@ -192,12 +208,12 @@ async fn roster_chat_voice_and_non_members() {
     );
     c.win.chat("hi from carol");
     for h in [&a.win, &b.win] {
-        h.wait_until(5, "carol's line", || lines(h).contains(&("carol".into(), "hi from carol".into()))).await.unwrap();
+        h.wait_until_a(5, "carol's line", || lines(h).contains(&("carol".into(), "hi from carol".into()))).await.unwrap();
     }
 
     // A stranger with a room of their own cannot post into ours.
     let d = f.found("mallory").await;
-    d.win.wait_for(5, "mallory in own room", |m| m.in_room()).await.unwrap();
+    d.win.wait_for_a(5, "mallory in own room", |m| m.in_room()).await.unwrap();
     d.win.chat("let me in");
     tokio::time::sleep(Duration::from_millis(800)).await;
     for h in [&a.win, &b.win, &c.win] {
@@ -212,7 +228,7 @@ async fn roster_chat_voice_and_non_members() {
         other => panic!("revoke: {other:?}"),
     }
     a.win
-        .wait_until(10, "carol gone from alice's roster", || !online_names(&a.win).contains(&"carol".to_string()))
+        .wait_until_a(10, "carol gone from alice's roster", || !online_names(&a.win).contains(&"carol".to_string()))
         .await
         .unwrap();
     c.win.chat("still here?");
@@ -221,50 +237,75 @@ async fn roster_chat_voice_and_non_members() {
         assert!(lines(h).iter().all(|(_, t)| t != "still here?"), "removed member's chat delivered");
     }
 
-    // Voice: launching sets the member voice indicator, muting and stopping change/clear it.
-    let mut voice = Voice::new(&a.socket);
-    voice.start(false);
+    // Voice: a real `prim session` adopts alice's daemon and runs voice for it. Starting
+    // voice sets the member indicator; mic and stop change/clear it.
+    let mut session = std::process::Command::new(env!("CARGO_BIN_EXE_prim"))
+        .args(["session", "--socket"])
+        .arg(&a.socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let sc = SessionClient::new(&a.socket);
+    let mut tries = 0;
+    let st = loop {
+        match tokio::task::block_in_place(|| sc.status()) {
+            Ok(st) => break st,
+            Err(e) if tries > 100 => panic!("session did not come up: {e}"),
+            Err(_) => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert_eq!(st.room, "up");
+    assert_eq!(st.kind, "attached", "the session adopts a daemon that is already running");
+    let call = |r: SessionRequest| tokio::task::block_in_place(|| sc.call(&r)).unwrap();
     let voice_of = |h: &Handle, name: &str| h.lock().members().into_iter().find(|r| r.name == name).and_then(|r| r.voice);
-    b.win.wait_until(10, "alice listening, mic muted", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
-    a.win.wait_until(5, "lease visible in status", || a.win.lock().voice_lease_held()).await.unwrap();
-    voice.restart_with(true, false);
-    b.win.wait_until(10, "alice mic live", || voice_of(&b.win, "alice") == Some((true, true))).await.unwrap();
+    call(SessionRequest::Voice { on: true });
+    b.win.wait_until_a(10, "alice listening, mic muted", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    a.win.wait_until_a(5, "lease visible in status", || a.win.lock().voice_lease_held()).await.unwrap();
+    let st = call(SessionRequest::SetMic { on: true });
+    assert!(st.voice.mic && !st.voice.deaf);
+    b.win.wait_until_a(10, "alice mic live", || voice_of(&b.win, "alice") == Some((true, true))).await.unwrap();
     // Deafen is carried by the window's own `clients` key.
     a.win.send(Cmd::SetClients(Clients { deaf: true, ..Default::default() }));
-    b.win.wait_for(5, "alice deafened", |m| m.members().iter().any(|r| r.name == "alice" && r.clients.deaf)).await.unwrap();
+    b.win.wait_for_a(5, "alice deafened", |m| m.members().iter().any(|r| r.name == "alice" && r.clients.deaf)).await.unwrap();
     // Muting again replaces the client; the indicator must follow (live -> muted).
-    voice.restart_with(false, false);
-    b.win.wait_until(10, "alice muted again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
-    voice.stop();
+    call(SessionRequest::SetMic { on: false });
+    b.win.wait_until_a(10, "alice muted again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    call(SessionRequest::Voice { on: false });
     b.win
-        .wait_until(10, "alice voice cleared", || voice_of(&b.win, "alice").is_none_or(|(l, m)| !l && !m))
+        .wait_until_a(10, "alice voice cleared", || voice_of(&b.win, "alice").is_none_or(|(l, m)| !l && !m))
         .await
         .unwrap();
-    a.win.wait_until(5, "lease released in status", || !a.win.lock().voice_lease_held()).await.unwrap();
+    a.win.wait_until_a(5, "lease released in status", || !a.win.lock().voice_lease_held()).await.unwrap();
 
-    // The lease expires when the client is frozen; the supervisor relaunches it.
-    let mut voice = Voice::new(&a.socket);
-    voice.start(false);
-    b.win.wait_until(10, "voice back", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
-    let pids = supervise::find_procs("voice", "rt-socket", &a.socket);
-    assert_eq!(pids.len(), 1, "one voice client: {pids:?}");
-    // SAFETY: signalling our own child.
-    unsafe { libc::kill(pids[0], libc::SIGSTOP) };
+    // The lease expires when the client is frozen; the session relaunches it.
+    let st = call(SessionRequest::Voice { on: true });
+    b.win.wait_until_a(10, "voice back", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    let st2 = call(SessionRequest::Status);
+    let pid = st2.voice.pid.expect("voice pid") as i32;
+    let starts = st2.voice.starts;
+    let _ = st;
+    // SAFETY: signalling the voice client this test's session started.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
     tokio::time::sleep(Duration::from_millis(3_000)).await;
-    unsafe { libc::kill(pids[0], libc::SIGCONT) };
+    unsafe { libc::kill(pid, libc::SIGCONT) };
     let mut relaunched = false;
     for _ in 0..100 {
-        voice.tick();
-        let now = supervise::find_procs("voice", "rt-socket", &a.socket);
-        if matches!(voice.sup.state, ProcState::Running) && now.len() == 1 && now[0] != pids[0] {
+        let now = call(SessionRequest::Status);
+        if now.voice.running && now.voice.state == "running" && now.voice.pid != Some(pid as u32) && now.voice.starts > starts {
             relaunched = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(relaunched, "voice was not relaunched after lease expiry: {:?}", voice.sup.state);
-    b.win.wait_until(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
-    voice.stop();
+    assert!(relaunched, "voice was not relaunched after lease expiry: {:?}", call(SessionRequest::Status).voice);
+    b.win.wait_until_a(10, "voice listening again", || voice_of(&b.win, "alice") == Some((true, false))).await.unwrap();
+    call(SessionRequest::Quit);
+    let _ = session.wait();
 
     for n in [a, b, c, d] {
         n.daemon.shutdown().await;

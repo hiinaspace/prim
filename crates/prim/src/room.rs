@@ -151,9 +151,11 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
     let _ = std::io::stdout().flush();
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let quit = daemon.quit.clone();
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+        _ = quit.notified() => {}
         _ = daemon.wait() => {}
     }
     daemon.shutdown().await;

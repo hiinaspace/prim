@@ -22,6 +22,10 @@ prim ctl [--socket PATH] <subcommand>
   send TO CHANNEL TEXT [--reliable]                TO: all, coordinator or a member key
   listen CHANNEL [--count N] [--timeout SECS]      register the channel, print messages
   chat send TEXT...                    post a line to the room chat (channel 100; see docs/room/WINDOW.md)
+  shutdown                             stop the room daemon (saves state; same as the supervisor's quit)
+  session [status|ensure|create [NAME]|join TOKEN|resume ROOM|leave|cancel|voice on|off|mic on|off|deafen on|off|quit]
+                                       (create/join/resume: other --flags go to `prim room`, e.g. --relay=none)
+                                       the session supervisor (`prim session`); the Godot menu's actions
   chat tail [--count N] [--timeout SECS]  print chat lines as they arrive (nothing from before you started)
 ";
 
@@ -37,7 +41,10 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
         .or_else(|| std::env::var_os("PRIM_SOCKET").map(PathBuf::from))
         .unwrap_or_else(local::default_socket_path);
     if args.positional[0] == "chat" {
-        return chat(&socket, &args).await;
+        return chat(&socket, &args);
+    }
+    if args.positional[0] == "session" {
+        return session(&socket, &args);
     }
     let mut c = Client::connect(&socket)
         .await
@@ -111,6 +118,7 @@ pub async fn run(args: Vec<String>) -> Result<ExitCode> {
         "close" => reply_result(c.call(|req| Request::Close { req }).await?),
         "reopen" => reply_result(c.call(|req| Request::Reopen { req }).await?),
         "leave" => reply_result(c.call(|req| Request::Leave { req }).await?),
+        "shutdown" => reply_result(c.call(|req| Request::Shutdown { req }).await?),
         "write" => {
             let scope = arg(1, "scope")?;
             let name = arg(2, "name")?;
@@ -385,6 +393,12 @@ fn print_status(s: &local::StatusJson) {
             .unwrap_or_else(|| "-".into())
     );
     println!("me {}", s.me);
+    println!(
+        "name {} join={}{}",
+        s.name.as_deref().unwrap_or("-"),
+        s.join,
+        s.join_refused.as_deref().map(|w| format!(" refused={w}")).unwrap_or_default()
+    );
     match &s.coordinator {
         Some(c) => println!("coordinator {} epoch={}.{}", c.holder, c.generation, c.term),
         None => println!("coordinator -"),
@@ -453,9 +467,10 @@ fn print_status(s: &local::StatusJson) {
 }
 
 /// `prim ctl chat send|tail`: room chat for scripts and agents. The same channel and
-/// message format the window uses (docs/room/WINDOW.md).
-async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
-    use prim_ui::client::{self, AttachOpts};
+/// message format Godot uses (docs/room/WINDOW.md); the code is `prim_client::room`.
+fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
+    use prim_client::room::{send_chat_once, Handle, RoomOpts};
+    use prim_client::transport::UnixTransport;
     let p = &args.positional;
     match p.get(1).map(String::as_str) {
         Some("send") => {
@@ -464,8 +479,7 @@ async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
                 bail!("chat send needs some text");
             }
             let (ok, total, failed) =
-                client::send_chat_once(socket, &text, Duration::from_secs(5))
-                    .await
+                send_chat_once(UnixTransport::new(socket), &text, Duration::from_secs(5))
                     .with_context(|| format!("sending via {}", socket.display()))?;
             for (who, status) in &failed {
                 eprintln!("not delivered to {} ({status})", &who[..8.min(who.len())]);
@@ -478,15 +492,15 @@ async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
             })
         }
         Some("tail") => {
-            let h = client::attach(
-                socket,
-                AttachOpts {
+            let h = Handle::attach(
+                UnixTransport::new(socket),
+                RoomOpts {
                     chat: true,
                     ..Default::default()
                 },
-            )
-            .await
-            .with_context(|| format!("connecting to {}", socket.display()))?;
+            );
+            h.wait_for(5, "the room daemon", |m| m.attached)
+                .map_err(|e| anyhow::anyhow!("{e} at {}", socket.display()))?;
             let want = count(args)?;
             let timeout = args.value("timeout").map(str::parse::<u64>).transpose()?;
             let start = std::time::Instant::now();
@@ -515,10 +529,10 @@ async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
                     seen_id = id + 1;
                     match who {
                         Some(w) => {
-                            println!("[{}] {w}: {text}", prim_ui::chat::clock(at, true));
+                            println!("[{}] {w}: {text}", prim_client::chat::clock(at, true));
                             printed += 1;
                         }
-                        None => println!("[{}] * {text}", prim_ui::chat::clock(at, true)),
+                        None => println!("[{}] * {text}", prim_client::chat::clock(at, true)),
                     }
                 }
                 if want.is_some_and(|n| printed >= n) {
@@ -527,10 +541,68 @@ async fn chat(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
                 if timeout.is_some_and(|t| start.elapsed() >= Duration::from_secs(t)) {
                     return Ok(if want.is_some() { ExitCode::FAILURE } else { ExitCode::SUCCESS });
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::thread::sleep(Duration::from_millis(100));
             }
             Ok(ExitCode::FAILURE)
         }
         _ => bail!("chat: use `chat send TEXT` or `chat tail`"),
     }
+}
+
+/// `prim ctl session ...`: the supervisor's control socket (`prim_client::session`).
+/// Every action the Godot menu has is one of these.
+fn session(socket: &std::path::Path, args: &Args) -> Result<ExitCode> {
+    use prim_client::session::{SessionClient, SessionRequest as R};
+    let p = &args.positional;
+    let sc = SessionClient::new(socket);
+    let onoff = |i: usize| -> Result<bool> {
+        match p.get(i).map(String::as_str) {
+            Some("on") => Ok(true),
+            Some("off") => Ok(false),
+            _ => bail!("session: say `on` or `off`"),
+        }
+    };
+    // Flags other than --socket go to `prim room` (`create NAME --relay=none --bind=ADDR`).
+    let flags = |_from: usize| -> Vec<String> {
+        args.flags
+            .iter()
+            .filter(|(n, _)| n != "socket")
+            .map(|(n, v)| match v {
+                Some(v) => format!("--{n}={v}"),
+                None => format!("--{n}"),
+            })
+            .collect()
+    };
+    let req = match p.get(1).map(String::as_str) {
+        Some("ensure") => {
+            let st = sc.ensure_running(socket)?;
+            println!("{}", serde_json::to_string_pretty(&st)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some("status") | None => R::Status,
+        Some("create") => R::Create {
+            name: p[2..].iter().cloned().collect::<Vec<_>>().join(" "),
+            args: flags(2),
+        },
+        Some("join") => R::Join {
+            token: p.get(2).cloned().context("session join needs an invite token")?,
+            args: flags(3),
+        },
+        Some("resume") => R::Resume {
+            room: p.get(2).cloned().context("session resume needs a room id")?,
+            args: flags(3),
+        },
+        Some("leave") => R::Leave,
+        Some("cancel") => R::Cancel,
+        Some("voice") => R::Voice { on: onoff(2)? },
+        Some("mic") => R::SetMic { on: onoff(2)? },
+        Some("deafen") => R::SetDeafen { on: onoff(2)? },
+        Some("quit") => R::Quit,
+        Some(other) => bail!("session: unknown action {other:?}"),
+    };
+    let st = sc
+        .call(&req)
+        .with_context(|| format!("no session on {} (start one: `prim session`)", sc.socket.display()))?;
+    println!("{}", serde_json::to_string_pretty(&st)?);
+    Ok(ExitCode::SUCCESS)
 }

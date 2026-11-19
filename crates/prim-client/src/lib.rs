@@ -8,7 +8,11 @@
 //! daemon (and later on Windows); `tests/daemon.rs` runs it against the real daemon, so
 //! drift fails a test.
 
+pub mod chat;
 pub mod client;
+pub mod paths;
+pub mod room;
+pub mod session;
 pub mod transport;
 pub mod wire;
 

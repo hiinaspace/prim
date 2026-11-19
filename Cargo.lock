@@ -4048,7 +4048,9 @@ dependencies = [
  "anyhow",
  "hound",
  "libc",
+ "prim-client",
  "prim-room",
+ "prim-session",
  "prim-ui",
  "prim-voice",
  "prim-watch",
@@ -4064,6 +4066,7 @@ name = "prim-client"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "libc",
  "prim-events",
  "prim-room",
  "room-core",
@@ -4116,12 +4119,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "prim-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "prim-client",
+ "serde_json",
+]
+
+[[package]]
 name = "prim-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
  "libc",
+ "prim-client",
  "prim-room",
  "prim-voice",
  "room-core",

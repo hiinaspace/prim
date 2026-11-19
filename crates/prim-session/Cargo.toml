@@ -1,0 +1,13 @@
+[package]
+name = "prim-session"
+version = "0.1.0"
+edition = "2021"
+license = "Unlicense"
+publish = false
+description = "The session supervisor (`prim session`): starts and keeps the room daemon and the voice client, and answers create/join/leave/voice requests on session.sock. No GUI; Godot, `prim ctl` and a later tray are its clients."
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+prim-client = { path = "../prim-client" }
+serde_json = "1"
