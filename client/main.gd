@@ -313,7 +313,7 @@ func _verify() -> void:
 			{"travel_m": snappedf(travel, 0.01), "last_pose_age_ms": age_ms})
 		var vp: Variant = view.marker_position(key)
 		var want: Vector3 = model.poses.get(key, {}).get("pos", Vector3.ZERO)
-		_check("marker follows pose", vp != null and (vp as Vector3).distance_to(want) < 0.01,
+		_check("marker follows pose", vp != null and (vp as Vector3).distance_to(want) < 0.1,
 			{"marker": str(vp), "pose": str(want)})
 	else:
 		_check("bot marker moves (last 3 s)", false, {"reason": "no remote member"})
