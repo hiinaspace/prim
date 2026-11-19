@@ -34,11 +34,20 @@ pub const VALUED_FLAGS: &[&str] = &[
     "test-drop-every",
     "test-drop-burst",
     "test-reorder",
+    "input-device",
+    "output-device",
+    "gain-db",
+    "volume",
+    "levels",
+    "seconds",
 ];
 
 pub const HELP: &str = "\
 prim voice [options]            the voice client (one per daemon)
 prim voice track [options]      send head poses as the tracking source
+prim voice devices              list microphones and speakers (JSON, opens nothing)
+prim voice meter --levels PATH  publish the microphone level without joining a room
+prim voice test [--seconds N]   record, send through Opus, play back through the receive path
 
 options:
   --rt-socket PATH      realtime socket (default $XDG_RUNTIME_DIR/prim/rt.sock)
@@ -56,6 +65,11 @@ options:
   --test-drop-burst N,M TEST ONLY: of every N media packets drop M consecutive ones
   --test-reorder N,K    TEST ONLY: hold every Nth media packet and send it after K more (K=1 swaps)
   --test-no-idle-skip   TEST ONLY: mixer renders silent peers too (A/B for the idle skip)
+  --input-device ID     microphone to use instead of the saved choice or the system default
+  --output-device ID    speakers, likewise
+  --gain-db N           microphone gain before the encoder and the meter
+  --volume X            output volume (1.0 = unchanged)
+  --levels PATH         publish the live mic level here (for the room window)
   --duration SECS       exit after this long (default: run until SIGINT/SIGTERM)
   SIGUSR1               reopen the audio devices on the current default
 
@@ -119,6 +133,8 @@ pub struct Config {
     pub test_reorder: Option<(u64, u64)>,
     /// Test-only: the mixer pulls and renders idle peers too (the pre-skip behaviour).
     pub test_no_idle_skip: bool,
+    /// Per-computer audio settings, gain and meter (None in library tests).
+    pub audio: Option<Arc<crate::audio::Audio>>,
 }
 
 impl Default for Config {
@@ -139,11 +155,12 @@ impl Default for Config {
             test_drop_burst: None,
             test_reorder: None,
             test_no_idle_skip: false,
+            audio: None,
         }
     }
 }
 
-fn parse_capture(s: &str) -> Result<CaptureSpec> {
+pub(crate) fn parse_capture(s: &str) -> Result<CaptureSpec> {
     Ok(match s {
         "none" => CaptureSpec::None,
         "device" => CaptureSpec::Device,

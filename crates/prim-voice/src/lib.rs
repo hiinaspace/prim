@@ -5,6 +5,7 @@
 //! packets from a capture source, and renders everyone else's voice through NetEq and
 //! prim-hrtf onto an output. `prim voice` is a thin wrapper over [`run`].
 
+pub mod audio;
 pub mod capture;
 pub mod client;
 pub mod clock;
@@ -32,7 +33,8 @@ pub use shared::ExitReason;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -85,6 +87,9 @@ pub fn run(f: &dyn Flags) -> Result<ExitCode> {
             eprintln!("prim voice track: sent {sent} poses");
             Ok(ExitCode::SUCCESS)
         }
+        Some("devices") => audio::run_devices(f).map(|_| ExitCode::SUCCESS),
+        Some("meter") => audio::run_meter(f).map(|_| ExitCode::SUCCESS),
+        Some("test") => audio::run_test(f).map(|_| ExitCode::SUCCESS),
         None => run_client(f, &socket, duration),
         Some(other) => {
             eprintln!("prim voice: unknown subcommand {other:?}\n{HELP}");
@@ -98,7 +103,11 @@ fn run_client(
     socket: &std::path::Path,
     duration: Option<Duration>,
 ) -> Result<ExitCode> {
-    let cfg = Config::from_flags(f)?;
+    let mut cfg = Config::from_flags(f)?;
+    let audio = audio::from_flags(f)?;
+    cfg.audio = Some(audio.clone());
+    let levels_stop = Arc::new(AtomicBool::new(false));
+    audio::spawn_levels_writer(audio, f.value("levels").map(PathBuf::from), levels_stop.clone());
     let conn =
         RtConn::connect(socket).with_context(|| format!("connecting to {}", socket.display()))?;
     let client = match Client::start(conn, cfg) {
@@ -137,6 +146,7 @@ fn run_client(
         std::thread::sleep(Duration::from_millis(50));
     };
     client.stop();
+    levels_stop.store(true, Ordering::SeqCst);
     Ok(match reason {
         ExitReason::Stopped => ExitCode::SUCCESS,
         ExitReason::Revoked(r) => {

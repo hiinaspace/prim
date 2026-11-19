@@ -120,10 +120,15 @@ pub struct App {
     /// A background daemon start or stop in progress, with what the user sees.
     busy: Option<(String, Receiver<Result<(), String>>)>,
     voice: Voice,
+    audio: crate::audio::Panel,
+    audio_test_pending: Option<Instant>,
     sent_clients: Option<Clients>,
     name_edit: String,
     join_text: String,
     editing_name: Option<String>,
+    /// The rename box takes focus once, on the frame it opens; asking every frame would
+    /// swallow the Enter that ends the edit (and keep focus away from the chat box).
+    editing_name_focus: bool,
     chat_input: String,
     advanced: bool,
     invite: Option<(u64, String)>,
@@ -146,6 +151,8 @@ impl App {
             act: std::env::var("PRIM_UI_ACT").map(|v| v.split(';').map(str::to_string).collect()).unwrap_or_default(),
             adopted: false,
             voice: Voice::new(&socket),
+            audio_test_pending: None,
+            audio: crate::audio::Panel::new(&socket, std::env::var_os("PRIM_UI_VOICE_TEST").is_some()),
             socket,
             handle: None,
             attaching: None,
@@ -155,6 +162,7 @@ impl App {
             name_edit: default_name,
             join_text: String::new(),
             editing_name: None,
+            editing_name_focus: false,
             chat_input: String::new(),
             advanced: std::env::var_os("PRIM_UI_ADVANCED").is_some(),
             invite: None,
@@ -221,6 +229,24 @@ impl App {
 
     fn tick(&mut self, ctx: &egui::Context) {
         self.voice.tick();
+        // The panel reads the level from voice when its microphone is live, else runs its own meter.
+        let mic_live = self.voice.sup.running() && self.voice.mic;
+        self.audio.tick(mic_live);
+        if let Some(d) = self.demo.clone() {
+            // Screenshot runs on a display with no pointer: `audio` opens the panel,
+            // `audiotest` starts the loopback test.
+            if d.contains("audio") && !self.audio.open {
+                self.audio.open();
+                self.demo = Some(d.replace("audiotest", "").replace("audio", ""));
+                if d.contains("audiotest") {
+                    self.audio_test_pending = Some(Instant::now() + Duration::from_millis(1500));
+                }
+            }
+        }
+        if self.audio_test_pending.is_some_and(|t| Instant::now() >= t) {
+            self.audio_test_pending = None;
+            self.audio.start_test();
+        }
         if !self.adopted && self.handle.as_ref().is_some_and(|h| h.lock().in_room()) {
             self.adopted = true;
             if !self.voice.sup.running() && !supervise::find_procs("voice", "rt-socket", &self.socket).is_empty() {
@@ -353,6 +379,11 @@ impl eframe::App for App {
             _ => self.empty_ui(ui, model_snapshot.is_some()),
         }
         self.dialogs(ctx);
+        if self.audio.open && crate::audio::show(ctx, &mut self.audio) && self.voice.sup.running() {
+            // Voice reads its devices when it starts: replace it, as the mute button does.
+            let (m, d) = (self.voice.mic, self.voice.deaf);
+            self.voice.restart_with(m, d);
+        }
     }
 }
 
@@ -661,6 +692,14 @@ impl App {
                         let m = self.voice.mic && !d;
                         self.voice.restart_with(m, d);
                     }
+                    if tool_button(ui, Icon::Mic, "Audio", self.audio.open.then_some(ACCENT), true, "Pick your microphone and speakers, set gain, and test how you sound").clicked() {
+                        if self.audio.open {
+                            self.audio.open = false;
+                            self.audio.shutdown();
+                        } else {
+                            self.audio.open();
+                        }
+                    }
                     ui.add_space(10.0);
                     ui.separator();
                     ui.add_space(10.0);
@@ -799,9 +838,11 @@ impl App {
                 let mut done = None;
                 if let Some(buf) = &mut self.editing_name {
                     let r = ui.add(egui::TextEdit::singleline(buf).desired_width(130.0).char_limit(chat::MAX_NAME));
-                    r.request_focus();
-                    if r.lost_focus() {
-                        done = Some(ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if std::mem::take(&mut self.editing_name_focus) {
+                        r.request_focus();
+                    } else if r.lost_focus() || !r.has_focus() {
+                        // Enter or clicking elsewhere keeps the new name; Escape drops it.
+                        done = Some(!ui.input(|i| i.key_pressed(egui::Key::Escape)));
                     }
                 }
                 if let Some(commit) = done {
@@ -821,6 +862,7 @@ impl App {
                     let resp = ui.add(egui::Label::new(RichText::new("rename").size(11.0).color(DIM).underline()).sense(Sense::click()));
                     if resp.on_hover_text("Change your name").clicked() {
                         self.editing_name = Some(m.name.clone());
+                        self.editing_name_focus = true;
                     }
                 }
                 if m.keyholder {
@@ -906,6 +948,9 @@ impl App {
                                 ui.add_enabled(false, egui::Button::new("Unavailable"));
                             }
                             (ClientKind::Voice, None) => {
+                                if ui.button("Audio settings").on_hover_text("Microphone, speakers, gain and a test recording").clicked() {
+                                    self.audio.open();
+                                }
                                 if self.voice.sup.state == ProcState::Busy {
                                     if ui.button("Take over").on_hover_text("Stop the other voice program and use this one").clicked() {
                                         self.voice.start(true);
