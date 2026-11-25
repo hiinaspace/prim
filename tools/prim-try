@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""prim-try: run a Prim commit from a CI-built bundle, with no checkout on this machine.
+
+  prim-try [REF] [-- client args]      fetch (building on CI if needed) and start the room client
+  prim-try REF --xr                    start it in VR instead of on the desktop
+  prim-try REF --tool cowatch-loop -- --desktop
+                                       run tools/<name> from that commit instead of the client
+  prim-try REF --check                 fetch, then only check that it can load here (no window)
+  prim-try REF --fetch                 fetch only
+  prim-try --list                      what is cached
+
+REF is a branch, tag or sha of the public repository (default: main). `c2-pose-avatars`
+also finds `claude/c2-pose-avatars`. `--mirror` looks in the private CI mirror instead
+(also tries `ci/REF`), for commits that are not public yet.
+
+Needs on PATH: gh (logged in, with access to the CI mirror) and nix (for the engine's
+store path). Bundles are kept under ~/.cache/prim-try (newest 5; --keep N).
+
+The same file is meant to be copied to ~/.local/bin on each test machine: it depends on
+nothing in a checkout.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path
+
+OWNER = "hiinaspace"
+PUBLIC = "prim"
+MIRROR = os.environ.get("PRIM_TRY_MIRROR", "prim-ci")
+WORKFLOW = "try.yml"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "prim-try"
+BUILDS = CACHE / "builds"
+ROOTS = CACHE / "roots"
+
+
+def say(msg: str) -> None:
+    print(f"prim-try: {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
+    say(msg)
+    sys.exit(code)
+
+
+def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    p = subprocess.run(["gh", *args], text=True, capture_output=True)
+    if check and p.returncode != 0:
+        die(f"gh {' '.join(args)} failed:\n{p.stderr.strip()}")
+    return p
+
+
+def resolve(ref: str, mirror: bool) -> tuple[str, str, str]:
+    """-> (sha, repo, the ref name that matched)"""
+    repo = MIRROR if mirror else PUBLIC
+    candidates = [ref, f"claude/{ref}"] + ([f"ci/{ref}"] if mirror else [])
+    for c in candidates:
+        p = gh("api", f"repos/{OWNER}/{repo}/commits/{c}", "--jq", ".sha", check=False)
+        sha = p.stdout.strip()
+        if p.returncode == 0 and len(sha) == 40:
+            return sha, repo, c
+    hint = "" if mirror else " (not pushed to the public repository? try --mirror)"
+    die(f"no commit found for '{ref}' in {OWNER}/{repo}{hint}")
+
+
+def find_artifact(sha: str) -> int | None:
+    """Run id that holds an unexpired bundle for sha, if any."""
+    p = gh("api", f"repos/{OWNER}/{MIRROR}/actions/artifacts?name=prim-try-{sha}&per_page=10")
+    for a in json.loads(p.stdout).get("artifacts", []):
+        if not a.get("expired"):
+            return a["workflow_run"]["id"]
+    return None
+
+
+def find_run(sha: str) -> dict | None:
+    p = gh("run", "list", "-R", f"{OWNER}/{MIRROR}", "--workflow", WORKFLOW, "-L", "40",
+           "--json", "databaseId,displayTitle,status,conclusion,createdAt")
+    runs = [r for r in json.loads(p.stdout) if r["displayTitle"] == f"try {sha}"]
+    return runs[0] if runs else None  # newest first
+
+
+def build_on_ci(sha: str, repo: str) -> int:
+    run = find_run(sha)
+    if run is None or (run["status"] == "completed" and run["conclusion"] != "success"):
+        say(f"no bundle for {sha[:12]} yet; asking CI to build it (a few minutes when its caches are warm)")
+        gh("workflow", "run", WORKFLOW, "-R", f"{OWNER}/{MIRROR}", "-f", f"sha={sha}", "-f", f"repo={repo}")
+        previous = run["databaseId"] if run else None
+        for _ in range(30):
+            time.sleep(2)
+            run = find_run(sha)
+            if run and run["databaseId"] != previous:
+                break
+        else:
+            die("CI did not register the build request; look at: "
+                f"gh run list -R {OWNER}/{MIRROR} --workflow {WORKFLOW}")
+    else:
+        say(f"a build for {sha[:12]} is already running on CI; waiting for it")
+    rid = run["databaseId"]
+    started = time.time()
+    last = ""
+    while True:
+        p = gh("run", "view", str(rid), "-R", f"{OWNER}/{MIRROR}", "--json", "status,conclusion")
+        r = json.loads(p.stdout)
+        if r["status"] == "completed":
+            if r["conclusion"] != "success":
+                die(f"the CI build ended as '{r['conclusion']}'. Log: "
+                    f"gh run view {rid} -R {OWNER}/{MIRROR} --log-failed")
+            return rid
+        if r["status"] != last:
+            last = r["status"]
+            say(f"CI run {rid}: {last}")
+        if time.time() - started > 3600:
+            die(f"gave up after an hour; run {rid} is still '{last}'")
+        time.sleep(10)
+
+
+def fetch(sha: str, repo: str, ref: str) -> Path:
+    dest = BUILDS / sha[:12]
+    if (dest / ".complete").exists():
+        os.utime(dest)
+        return dest
+    BUILDS.mkdir(parents=True, exist_ok=True)
+    tag = CACHE / "CACHEDIR.TAG"
+    if not tag.exists():
+        tag.write_text("Signature: 8a477f597d28d172789f06886806bc55\n# prim-try: bundles re-fetchable from CI\n")
+    rid = find_artifact(sha) or build_on_ci(sha, repo)
+    tmp = BUILDS / f".{sha[:12]}.{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "dl").mkdir(parents=True)
+    say(f"downloading the bundle for {sha[:12]}")
+    gh("run", "download", str(rid), "-R", f"{OWNER}/{MIRROR}", "-n", f"prim-try-{sha}", "-D", str(tmp / "dl"))
+    with tarfile.open(tmp / "dl" / "bundle.tar.gz") as t:
+        t.extractall(tmp / "tree", filter="tar")
+    shutil.rmtree(dest, ignore_errors=True)
+    (tmp / "tree").rename(dest)
+    shutil.rmtree(tmp, ignore_errors=True)
+    (dest / "prim-try-local.json").write_text(json.dumps({"ref": ref, "fetched": time.strftime("%F %T")}))
+    (dest / ".complete").write_text("")
+    return dest
+
+
+def manifest(build: Path) -> dict:
+    return json.loads((build / "prim-try.json").read_text())
+
+
+def gc_root(name: str, store_path: str) -> None:
+    """Keep a store path this tool depends on from being garbage-collected."""
+    ROOTS.mkdir(parents=True, exist_ok=True)
+    link = ROOTS / name
+    if link.is_symlink() and os.readlink(link) == store_path:
+        return
+    p = subprocess.run(["nix-store", "--add-root", str(link), "--realise", store_path],
+                       text=True, capture_output=True)
+    if p.returncode != 0:
+        say(f"could not register a GC root for {store_path} (continuing): {p.stderr.strip()[:200]}")
+
+
+def engine(build: Path) -> Path:
+    path = os.environ.get("PRIM_GODOT")
+    if path and os.access(path, os.X_OK):
+        return Path(path)
+    store = manifest(build)["engine"]
+    exe = Path(store) / "bin/godot"
+    if not exe.exists():
+        die(f"this build wants the engine at {store}, which is not on this machine.\n"
+            f"  Either copy it from a machine that has it:  nix copy --from ssh-ng://HOST {store}\n"
+            f"  or build it here (about 16 cores for many minutes):  {build}/tools/build-godot.sh\n"
+            f"  or point PRIM_GODOT at another engine binary.")
+    gc_root("godot-" + Path(store).name[:12], store)
+    return exe
+
+
+def mesa() -> str | None:
+    """Off NixOS the engine needs Mesa from the same package set (see tools/run-client)."""
+    try:
+        if "ID=nixos" in Path("/etc/os-release").read_text().split():
+            return None
+    except OSError:
+        pass
+    icd = "share/vulkan/icd.d/radeon_icd.x86_64.json"
+    candidates = [os.environ.get("PRIM_MESA")]
+    candidates += sorted(str(p) for p in ROOTS.glob("mesa-*")) if ROOTS.exists() else []
+    candidates += [str(Path.home() / "code/prim-gw/.local/mesa")]
+    for c in candidates:
+        if c and (Path(c) / icd).exists():
+            real = os.path.realpath(c)
+            if real.startswith("/nix/store/"):
+                gc_root("mesa-" + Path(real).name[:12], real)
+            return real
+    say("no Mesa found for the engine (set PRIM_MESA); using the system Vulkan driver, which may crash at start")
+    return None
+
+
+def other_sessions(build: Path) -> list[tuple[int, str]]:
+    """`prim session` processes of this user on the default socket that are not from this build.
+    Sessions started with --socket are test fixtures the client would not attach to."""
+    found = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+            exe = os.readlink(proc / "exe")
+        except OSError:
+            continue
+        if exe.endswith(" (deleted)"):
+            exe = exe[: -len(" (deleted)")]
+        if (len(argv) > 1 and argv[1] == b"session" and b"--socket" not in argv
+                and Path(exe).name.startswith("prim")):
+            if not exe.startswith(str(build) + "/"):
+                found.append((int(proc.name), exe))
+    return found
+
+
+def stop_stale_sessions(build: Path) -> None:
+    for pid, exe in other_sessions(build):
+        if exe.startswith(str(BUILDS) + "/"):
+            say(f"stopping the session left by another tried build (pid {pid}, {Path(exe).parents[2].name})")
+            subprocess.run([exe, "ctl", "session", "quit"], capture_output=True, timeout=20)
+            for _ in range(50):
+                if not Path(f"/proc/{pid}").exists():
+                    break
+                time.sleep(0.1)
+            else:
+                say(f"it did not exit; the client may attach to it. Stop it with: {exe} ctl session quit")
+        else:
+            say(f"a Prim session from elsewhere is already running (pid {pid}, {exe}).\n"
+                f"  The client will attach to THAT session, not this build's. To test this build alone, stop it first:\n"
+                f"  {exe} ctl session quit")
+
+
+def env_for(build: Path) -> dict:
+    env = dict(os.environ)
+    env["PRIM_GODOT"] = str(engine(build))
+    env["PRIM_BIN"] = str(build / "target/debug/prim")
+    env["PRIM_LOCAL_DEV_SHELL"] = "1"  # never start a nix build from a bundle
+    m = mesa()
+    if m:
+        env["PRIM_MESA"] = m
+        env["VK_DRIVER_FILES"] = f"{m}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+        env["VK_LOADER_LAYERS_DISABLE"] = "~implicit~"
+    return env
+
+
+def stage(build: Path, env: dict, quiet: bool = True) -> subprocess.CompletedProcess | None:
+    """Put the native library where the client loads it; import once."""
+    if not (build / "client/project.godot").exists():
+        die("this commit has no client/ (it predates the Godot room client)")
+    lib = build / "client/bin/linux/libprim_native.so"
+    lib.parent.mkdir(parents=True, exist_ok=True)
+    if not lib.exists():
+        shutil.copy2(build / "target/debug/libprim_native.so", lib)
+    if (build / "client/.godot/extension_list.cfg").exists():
+        return None
+    return subprocess.run([env["PRIM_GODOT"], "--headless", "--path", "client", "--import"],
+                          cwd=build, env=env, text=True, capture_output=quiet)
+
+
+def check(build: Path) -> int:
+    env = env_for(build)
+    ok = True
+
+    def line(good: bool, what: str, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'} {what}{(': ' + detail) if detail else ''}")
+
+    print(f"check of {manifest(build)['sha'][:12]} on {os.uname().nodename} (no window opened):")
+    p = subprocess.run([env["PRIM_BIN"], "--help"], text=True, capture_output=True)
+    line("prim session" in (p.stdout + p.stderr), "prim binary runs and has `session`")
+    p = subprocess.run([env["PRIM_GODOT"], "--version"], text=True, capture_output=True)
+    line(p.returncode == 0, "engine runs", p.stdout.strip())
+    shutil.rmtree(build / "client/.godot", ignore_errors=True)
+    p = stage(build, env)
+    out = (p.stdout + p.stderr) if p else ""
+    listed = (build / "client/.godot/extension_list.cfg")
+    line(listed.exists() and "prim" in listed.read_text(), "headless import lists the native extension")
+    bad = [l for l in out.splitlines() if "Can't open dynamic library" in l or "SCRIPT ERROR" in l or "Parse Error" in l]
+    line(not bad, "import log has no library or script errors", "; ".join(bad[:3]))
+    line((build / "tools/run-client").exists(), "tools/run-client present (else prim-try starts the client itself)")
+    print("  not checked: a real window, Vulkan on this GPU, voice, a headset, joining a room")
+    return 0 if ok else 1
+
+
+def prune(keep: int, current: Path | None) -> None:
+    builds = sorted((b for b in BUILDS.iterdir() if (b / ".complete").exists()),
+                    key=lambda b: b.stat().st_mtime, reverse=True)
+    running = {exe for _, exe in other_sessions(Path("/nonexistent"))}
+    for b in builds[keep:]:
+        if b == current or any(e.startswith(str(b) + "/") for e in running):
+            continue
+        shutil.rmtree(b, ignore_errors=True)
+    for stale in BUILDS.glob(".*"):
+        if stale.is_dir() and time.time() - stale.stat().st_mtime > 3600:
+            shutil.rmtree(stale, ignore_errors=True)
+
+
+def listing() -> int:
+    if not BUILDS.exists():
+        print("nothing cached")
+        return 0
+    for b in sorted(BUILDS.iterdir(), key=lambda b: b.stat().st_mtime, reverse=True):
+        if not (b / ".complete").exists():
+            continue
+        local = json.loads((b / "prim-try-local.json").read_text())
+        m = manifest(b)
+        print(f"{b.name}  {local['ref']:<32} fetched {local['fetched']}  built {m['built']}")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    rest: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, rest = argv[:i], argv[i + 1:]
+    ap = argparse.ArgumentParser(prog="prim-try", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ref", nargs="?", default="main")
+    ap.add_argument("--xr", action="store_true")
+    ap.add_argument("--tool")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--fetch", action="store_true")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--mirror", action="store_true")
+    ap.add_argument("--keep", type=int, default=5)
+    a = ap.parse_args(argv)
+    if a.list:
+        return listing()
+    for tool in ("gh", "nix-store"):
+        if not shutil.which(tool):
+            die(f"`{tool}` is not on PATH")
+
+    sha, repo, matched = resolve(a.ref, a.mirror)
+    build = fetch(sha, repo, matched)
+    prune(max(a.keep, 1), build)
+    say(f"{matched} = {sha[:12]} in {build}")
+    if a.fetch:
+        return 0
+    if a.check:
+        return check(build)
+
+    env = env_for(build)
+    if a.tool:
+        tool = build / "tools" / a.tool
+        if not os.access(tool, os.X_OK):
+            die(f"this commit has no executable tools/{a.tool}")
+        stage(build, env)
+        os.chdir(build)
+        os.execve(tool, [str(tool), *rest], env)
+    stop_stale_sessions(build)
+    stage(build, env)
+    os.chdir(build)
+    runner = build / "tools/run-client"
+    if runner.exists():
+        os.execve(runner, [str(runner), *(["--xr"] if a.xr else []), "--", *rest], env)
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY") and Path("/tmp/.X11-unix/X0").exists():
+        env["DISPLAY"] = ":0"
+    godot = env["PRIM_GODOT"]
+    os.execve(godot, [godot, "--path", "client", "--", *([] if a.xr else ["--desktop"]), *rest], env)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
