@@ -87,7 +87,9 @@ def find_run(sha: str) -> dict | None:
 
 def build_on_ci(sha: str, repo: str) -> int:
     run = find_run(sha)
-    if run is None or (run["status"] == "completed" and run["conclusion"] != "success"):
+    # Called only when no bundle exists: a completed run is a failed one, or one whose
+    # bundle has expired, so it is built again either way.
+    if run is None or run["status"] == "completed":
         say(f"no bundle for {sha[:12]} yet; asking CI to build it (a few minutes when its caches are warm)")
         gh("workflow", "run", WORKFLOW, "-R", f"{OWNER}/{MIRROR}", "-f", f"sha={sha}", "-f", f"repo={repo}")
         previous = run["databaseId"] if run else None
@@ -275,7 +277,8 @@ def check(build: Path) -> int:
 
     print(f"check of {manifest(build)['sha'][:12]} on {os.uname().nodename} (no window opened):")
     p = subprocess.run([env["PRIM_BIN"], "--help"], text=True, capture_output=True)
-    line("prim session" in (p.stdout + p.stderr), "prim binary runs and has `session`")
+    helptext = p.stdout + p.stderr
+    line("prim room" in helptext, "prim binary runs")
     p = subprocess.run([env["PRIM_GODOT"], "--version"], text=True, capture_output=True)
     line(p.returncode == 0, "engine runs", p.stdout.strip())
     shutil.rmtree(build / "client/.godot", ignore_errors=True)
@@ -285,7 +288,10 @@ def check(build: Path) -> int:
     line(listed.exists() and "prim" in listed.read_text(), "headless import lists the native extension")
     bad = [l for l in out.splitlines() if "Can't open dynamic library" in l or "SCRIPT ERROR" in l or "Parse Error" in l]
     line(not bad, "import log has no library or script errors", "; ".join(bad[:3]))
-    line((build / "tools/run-client").exists(), "tools/run-client present (else prim-try starts the client itself)")
+    if "prim session" not in helptext:
+        print("  note this commit predates `prim session`; the client starts its own daemon")
+    if not (build / "tools/run-client").exists():
+        print("  note no tools/run-client in this commit; prim-try starts the client itself")
     print("  not checked: a real window, Vulkan on this GPU, voice, a headset, joining a room")
     return 0 if ok else 1
 
